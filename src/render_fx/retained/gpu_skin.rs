@@ -170,9 +170,12 @@ fn skin_meta()->ShaderMeta {
     m.uniforms.uniforms.extend([UniformDesc::new("Bones",UniformType::Float4).array(BONES*2),UniformDesc::new("SkinOrigin",UniformType::Float4),UniformDesc::new("SkinEye",UniformType::Float4)]);m
 }
 struct Buffers { _input:Rc<Input>, vertex:BufferId,index:BufferId,bindings:Option<Bindings> }
-/// Fragment program variants, indexed like `variant()`: 0 full, 1 discard-free,
-/// 2 lean, 3 lean discard-free. A missing variant draws with the full program.
-pub(crate) const VARIANTS: [&str; 4] = ["retained-gpu-skin-ants","retained-gpu-skin-discard-free","retained-gpu-skin-lean","retained-gpu-skin-lean-opaque"];
+/// Full, discard-free, lean pair and lean-lit pair, in retained route order.
+const VARIANTS: [&str; 6] = [
+    "retained-gpu-skin-ants", "retained-gpu-skin-discard-free",
+    "retained-gpu-skin-lean", "retained-gpu-skin-lean-opaque",
+    "retained-gpu-skin-lean-lit", "retained-gpu-skin-lean-lit-opaque",
+];
 /// The uniform state one skin program holds. GL keeps uniforms per program, so a CPU
 /// program's draws between two skin draws leave it intact.
 struct Uniforms {
@@ -192,10 +195,10 @@ impl Uniforms {
 /// GL context holds from the last skin draw. Any other draw or GL user clears it.
 #[derive(Default)]
 struct State { pipeline: Option<(usize,usize,bool,bool)>, bindings: Option<(usize,TextureId,BufferId)> }
-pub(crate) struct Gpu { shaders:[Option<ShaderId>;4],pipelines:BTreeMap<(usize,usize,bool),Pipeline>,buffers:BTreeMap<usize,Buffers>,
-    uniforms:[Uniforms;4], state:State }
+pub(crate) struct Gpu { shaders:[Option<ShaderId>; VARIANTS.len()],pipelines:BTreeMap<(usize,usize,bool),Pipeline>,buffers:BTreeMap<usize,Buffers>,
+    uniforms:[Uniforms; VARIANTS.len()], state:State }
 impl Gpu {
-    pub(super) fn new(fragments:[Option<String>;4])->Result<Self> {
+    pub(super) fn new(fragments:[Option<String>; VARIANTS.len()])->Result<Self> {
         let mut attributes=0;let mut uniforms=0;
         unsafe {gl::glGetIntegerv(0x8869,&mut attributes);}
         #[cfg(target_os="vita")]
@@ -206,7 +209,7 @@ impl Gpu {
         ensure!(attributes>=9 && uniforms as usize>=VERTEX_UNIFORM_VECTORS,"insufficient queried limits");
         let ctx=unsafe{get_internal_gl()}.quad_context;
         let vertex=vertex();
-        let mut shaders=[None;4];
+        let mut shaders=[None; VARIANTS.len()];
         for (i,fragment) in fragments.iter().enumerate() {
             let Some(fragment)=fragment else {continue;};
             crate::frame_profile::shader_creation();
@@ -222,6 +225,10 @@ impl Gpu {
         let uniforms=std::array::from_fn(|_|Uniforms {fields:crate::render::uniform_fields::Cache::new(meta()),locations:None,occurrence:None,eye:None});
         Ok(Self {shaders,pipelines:BTreeMap::new(),buffers:BTreeMap::new(),uniforms,state:State::default()})
     }
+    pub(super) fn supports(&self, variant: usize) -> bool {
+        self.shaders[variant].is_some()
+    }
+
     /// Another program, pipeline, binding or depth mask may have been applied since the
     /// last skin draw: apply them again. Uniform values stay (they belong to the program).
     pub(super) fn interrupt_state(&mut self) {self.state=State::default();}
@@ -239,11 +246,12 @@ impl Gpu {
     /// One GPU-skinned packet. `variant` is the fragment program the CPU twin would use.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(&mut self,p:&Pass,skin:&Skin,variant:usize,u:&[f32;UNIFORM_FLOATS],depth_write:bool,
-        white:&Texture2D,cull:bool,zero_glow:bool,subset:Option<&zero_glow::Subset>) -> bool {
+        white:&Texture2D,cull:bool,zero_glow:bool,subset:Option<&zero_glow::Subset>) {
         let _span=crate::frame_profile::span("gpu_skin_upload_draw");
         let _clock=Clock::new(1);
         let variant=if self.shaders[variant].is_some() {variant} else {count("vita_gpu_skin_variant_fallbacks",1);0};
-        count(["vita_gpu_skin_full_draws","vita_gpu_skin_discard_free_draws","vita_gpu_skin_lean_draws","vita_gpu_skin_lean_opaque_draws"][variant],1);
+        count(["vita_gpu_skin_full_draws","vita_gpu_skin_discard_free_draws","vita_gpu_skin_lean_draws","vita_gpu_skin_lean_opaque_draws",
+            "vita_gpu_skin_lean_lit_draws", "vita_gpu_skin_lean_lit_opaque_draws"][variant],1);
         let occurrence=&skin.occurrence;
         let texture=p.mesh.texture.as_ref().unwrap_or(white).raw_miniquad_id();let white=white.raw_miniquad_id();
         let ctx=unsafe{get_internal_gl()}.quad_context;
@@ -259,7 +267,7 @@ impl Gpu {
         let b=self.buffers.get_mut(&id).unwrap();
         let bindings=b.bindings.get_or_insert_with(||Bindings {vertex_buffers:vec![b.vertex],index_buffer:b.index,images:vec![texture,white,white]});
         bindings.images[0]=texture;
-        let subset = subset.filter(|_| variant == 2);
+        let subset = subset.filter(|_| matches!(variant, 2 | 4));
         let (index, index_count) = subset.map_or((b.index, occurrence.input.source.indices.len() as i32),
             |subset| subset.draw_count(b.index));
         // `fx_submit_state_cache`: the CPU programs' rule. A pipeline change reapplies the
@@ -288,7 +296,6 @@ impl Gpu {
             unsafe { if cull { gl::glDisable(0x0B44); } }
         }
         count("gpu_skin_draws",1);count("gpu_skin_logical_palette_bytes",(occurrence.bones()*32) as u64);count("gpu_skin_uniform_upload_bytes",bytes);
-        variant == 2
     }
     /// Uploads what this program does not hold yet; returns the bytes sent. With
     /// `uniform_field_cache` the base payload goes per changed field, the bones only for a

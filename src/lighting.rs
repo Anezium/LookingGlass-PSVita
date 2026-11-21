@@ -106,16 +106,20 @@ pub fn uniforms() -> Vec<UniformDesc> {
         .collect()
 }
 pub fn fragment(source: &str) -> String {
+    fragment_slots(source, 8)
+}
+
+pub(crate) fn fragment_slots(source: &str, slots: usize) -> String {
     #[cfg(feature = "vita_renderer")]
     if crate::render::vita_renderer::config().simple_dynamic_lights {
         return source.replace("// LIGHTS", "vec3 dynamicLight(vec3 position){return vec3(0.0);}\n");
     }
     let mut s = String::new();
-    for i in 0..8 {
+    for i in 0..slots {
         s += &format!("uniform vec4 FxLight{i}; uniform vec4 FxColor{i};\n");
     }
     s += "vec3 dynamicLight(vec3 position){vec3 light=vec3(0.0);\n";
-    for i in 0..8 {
+    for i in 0..slots {
         s+=&format!("if(FxColor{i}.w>0.5)light+=FxColor{i}.rgb*max(0.0,1.0-distance(position,FxLight{i}.xyz)/max(FxLight{i}.w,0.001));\n");
     }
     s += "return light;}\n";

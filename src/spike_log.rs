@@ -62,6 +62,8 @@ struct Frame {
     actor_zero_glow: u32,
     #[cfg(feature = "vita_renderer")]
     actor_glow_subset: u32,
+    #[cfg(feature = "vita_renderer")]
+    actor_routes: [u32; 3],
     /// The open simulation block and when it started.
     block: Option<(usize, Instant)>,
     sim_ms: [f64; SIM.len()],
@@ -195,6 +197,11 @@ impl Frame {
         if self.actor_glow_subset != 0 {
             let _ = write!(out, " actor_glow_subset_triangles={}", self.actor_glow_subset);
         }
+        #[cfg(feature = "vita_renderer")]
+        {
+            let [culled, lean_lit, full] = self.actor_routes;
+            let _ = write!(out, " actor_lights_culled_to_zero={culled} actor_lean_lit={lean_lit} actor_full={full}");
+        }
         if self.flight_work[0] > 0 {
             let [calls,tests,traversals,witnesses,short,free]=self.flight_work;
             let _=write!(out," flight_work={calls}/{tests}/{traversals}/{witnesses}/{short}/{free}");
@@ -302,6 +309,17 @@ pub(crate) fn actor_zero_glow() {
 pub(crate) fn actor_glow_subset(triangles: u32) {
     if on() {
         FRAME.with(|f| f.borrow_mut().actor_glow_subset += triangles);
+    }
+}
+#[cfg(feature = "vita_renderer")]
+pub(crate) fn actor_routes(culled: bool, lean_lit: bool, full: bool) {
+    if on() {
+        FRAME.with(|f| {
+            let mut f = f.borrow_mut();
+            f.actor_routes[0] += u32::from(culled);
+            f.actor_routes[1] += u32::from(lean_lit);
+            f.actor_routes[2] += u32::from(full);
+        });
     }
 }
 /// One NPC kind's update this frame, from `npc::profile`: actors updated and milliseconds in think,

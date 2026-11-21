@@ -24,7 +24,10 @@
 //! program, so it never widens the set of packets drawn without `discard`.
 use super::*;
 
-pub(super) const NAMES: [&str; 2] = ["retained-actor-lean", "retained-actor-lean-opaque"];
+pub(super) const NAMES: [&str; 4] = [
+    "retained-actor-lean", "retained-actor-lean-opaque",
+    "retained-actor-lean-lit", "retained-actor-lean-lit-opaque",
+];
 
 // Offsets into the retained uniform block (`UNIFORM_FIELDS`).
 const GAIN: usize = 39;
@@ -36,12 +39,12 @@ const LIGHTS: usize = 52;
 
 /// A `render::FRAGMENT` line that cannot run, or adds zero, for an admitted packet.
 fn unreachable_line(line: &str) -> bool {
-    ["FxAppearance.x", "FxAppearance.y", "LightAtlas,sampleUV", "dynamicLight(", "FxAppearance.z",
-     "FxAppearance.w", "// Multiplicative actor layers", "// LIGHTS",
+    ["FxAppearance.x", "FxAppearance.y", "LightAtlas,sampleUV", "FxAppearance.z",
+     "FxAppearance.w", "// Multiplicative actor layers",
      "uniform sampler2D SkyBackdrop;"].iter().any(|marker| line.contains(marker))
 }
 /// The lean source: `discard_free` also removes the two cutout lines.
-pub(super) fn fragment(discard_free: bool) -> String {
+fn fragment(discard_free: bool, lit: bool) -> String {
     let full = crate::render::FRAGMENT;
     // The backdrop block is the only multi-line statement that goes: two comment lines, the
     // test and its four body lines, up to the output write.
@@ -53,7 +56,9 @@ pub(super) fn fragment(discard_free: bool) -> String {
     let (head, rest) = source.split_once(" if(FogMode>3.5){").expect("source-colour fog branch");
     let (_, tail) = rest.split_once(" }else if(FogMode>=0.0)").expect("fog call");
     let source = format!("{head} if(FogMode>=0.0){tail}");
-    source.lines().filter(|line| !unreachable_line(line) && !(discard_free && line.contains("discard;")))
+    source.lines().filter(|line| !unreachable_line(line)
+        && (lit || !(line.contains("dynamicLight(") || line.contains("// LIGHTS")))
+        && !(discard_free && line.contains("discard;")))
         .map(|line| line.replace(" uniform sampler2D LightAtlas; uniform vec2 AtlasGrid;", "")
             .replace(" uniform vec4 FxAppearance;", ""))
         .collect::<Vec<_>>().join("\n")
@@ -68,29 +73,106 @@ pub(super) fn sources() -> [String; 2] {
             .unwrap_or_else(|e| panic!("LOOKING_GLASS_ACTOR_LEAN_SOURCES {name}: {e}"));
         return [read("lean.frag"), read("lean-opaque.frag")];
     }
-    [fragment(false), fragment(true)]
+    [fragment(false, false), fragment(true, false)]
+}
+
+pub(super) fn lit_source(discard_free: bool) -> String {
+    crate::lighting::fragment_slots(&fragment(discard_free, true), 2)
 }
 /// Every line the lean source leaves out is a no-op under payload `u`. Each test is the
 /// negation of the shader's own guard, so NaN fails the guard here as it does there.
 pub(super) fn admitted(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
+    !has_lights(u, 0) && lean_material(p, u)
+}
+
+pub(super) fn admitted_lit(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
+    p.lit && has_lights(u, 0) && !has_lights(u, 2) && lean_material(p, u)
+}
+
+fn has_lights(u: &[f32; UNIFORM_FLOATS], first: usize) -> bool {
+    u[LIGHTS + first * 8..LIGHTS + 64].chunks_exact(8).any(|slot| slot[7] > 0.5)
+}
+
+fn lean_material(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
     let a = &u[APPEARANCE..APPEARANCE + 4];
     !p.effect
         && !(a[0] > 0.) && !(a[1] > 0.5) && !(a[2] > 0.5) && !(a[3] > 0.) && !(a[3] < 0.)
         && !(u[FX_MODEL] < 0.5)
         && !(u[FOG_MODE] > 3.5)
         && !(u[SKY_FADE] > 0.5)
-        && (0..8).all(|light| !(u[LIGHTS + light * 8 + 7] > 0.5))
         && u[GAIN..GAIN + 3].iter().all(|gain| gain.is_finite())
 }
+// CPU positions are the identity-model vertex inputs. Perspective-correct
+// interpolation over the clipped triangle stays in the vertex box, up to
+// rounding. The Vita translator erases GLSL precision qualifiers; the same
+// deliberately wide guard also covers mediump rounding on a GLSL backend.
+// Keep finite, bounded inputs and require one axis alone to clear twice
+// max(radius, 0.001) plus a coordinate allowance. Never sit on the cutoff.
+fn outside_light(lo: Vec3, hi: Vec3, slot: &[f32]) -> bool {
+    if !slot[..7].iter().all(|x| x.abs() <= 8192.) || slot[3] <= 0. {
+        return false;
+    }
+    let light = Vec3::from_slice(slot);
+    let gap = (lo - light).max(light - hi).max_element();
+    let rounding = 1. + (lo.abs().max(hi.abs()).max(light.abs()).max_element() / 64.);
+    gap > 2. * slot[3].max(0.001) + rounding
+}
+
+/// Turn off zero terms and keep the surviving terms in their original order.
+/// GPU skinning has only frustum bounds, which are not a certificate for
+/// floating-point interpolation of the actual skinned positions.
+pub(super) fn cull_lights(p: &Pass, u: &mut [f32; UNIFORM_FLOATS]) -> bool {
+    if p.gpu_skin.is_some() || !p.lit || !has_lights(u, 0) || !lean_material(p, u)
+        || !u[GAIN..GAIN + 3].iter().all(|gain| gain.abs() <= 8192.) {
+        return false;
+    }
+    let mut lo = Vec3::splat(f32::INFINITY);
+    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    for vertex in &p.geometry().vertices {
+        let pos = vertex.position;
+        if !(pos.abs().max_element() <= 8192. && pos.is_finite()) {
+            return false;
+        }
+        lo = lo.min(pos);
+        hi = hi.max(pos);
+    }
+    if !lo.cmple(hi).all() { return false; }
+
+    let selected = &mut u[LIGHTS..LIGHTS + 64];
+    let removed = selected.chunks_exact(8).enumerate().fold(0u8, |mask, (i, slot)| {
+        mask | (u8::from(slot[7] > 0.5 && outside_light(lo, hi, slot)) << i)
+    });
+    if removed == 0 { return false; }
+    let mut kept = 0;
+    for i in 0..8 {
+        let start = i * 8;
+        if selected[start + 7] > 0.5 && removed & (1 << i) == 0 {
+            selected.copy_within(start..start + 8, kept * 8);
+            kept += 1;
+        }
+    }
+    selected[kept * 8..].fill(0.);
+    kept == 0
+}
+
+/// The certified glow samples are black before lighting. With the same
+/// bounded world positions and finite light terms, black remains exactly zero.
+pub(super) fn bounded_glow_lights(u: &[f32; UNIFORM_FLOATS]) -> bool {
+    u[LIGHTS..LIGHTS + 16].chunks_exact(8).all(|slot| {
+        slot[7] <= 0.5 || (slot[..7].iter().all(|x| x.abs() <= 8192.) && slot[3] > 0.)
+    })
+}
+
 /// Host census line for one actor draw: the payload facts the selector reads and the route.
 #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-pub(super) fn census(p: &Pass, u: &[f32; UNIFORM_FLOATS], depth_write: bool, route: Route) {
+pub(super) fn census(p: &Pass, u: &[f32; UNIFORM_FLOATS], depth_write: bool, route: Route, culled_to_zero: bool) {
     if p.effect || !crate::character::skinning::census::active() { return; }
     let surface = p.mesh.surface.as_ref();
     let mesh = p.geometry();
     println!("ACTOR_GPU2 {}", serde_json::json!({
         "frame": crate::sim_maps::probe::frame(), "label": surface.map(|s| s.label.clone()),
         "route": format!("{route:?}"), "admitted": admitted(p, u),
+        "culled_to_zero": culled_to_zero, "lean_lit": route.is_lean_lit(), "full": route == Route::Full,
         "blend": p.blend_index, "equal": p.depth_equal, "depth_write": depth_write,
         "lit": p.lit, "clamp": p.clamp, "cutout": p.cutout, "cutout_reference": p.cutout_reference,
         "gain": p.gain.to_array(), "fog_mode": p.fog, "model": p.model, "fullbright": u[34],
@@ -185,7 +267,7 @@ mod tests {
     #[test]
     fn the_lean_sources_are_the_full_program_minus_the_unreachable_lines() {
         let full = crate::render::FRAGMENT;
-        let [lean, opaque] = [fragment(false), fragment(true)];
+        let [lean, opaque] = [fragment(false, false), fragment(true, false)];
         assert_eq!(sources(), [lean.clone(), opaque.clone()]);
         // Every lean line is a full-program line, in the full program's order, except the two
         // uniform declarations that lose unused names and the fog call that loses its `else`.
@@ -246,9 +328,60 @@ mod tests {
         for source in [&lean, &opaque] { assert_eq!(varyings(&crate::environment::fragment(source)), expected); }
     }
     #[test]
+    fn lit_source_uses_the_exact_first_two_full_terms_and_original_cutouts() {
+        let source = fragment(false, true);
+        let expanded = crate::lighting::fragment_slots(&source, 2);
+        let full = crate::lighting::fragment_slots(crate::render::FRAGMENT, 8);
+        let mut full_lines = full.lines();
+        for line in expanded.lines().filter(|line| line.contains("FxLight") || line.contains("dynamicLight(")) {
+            assert!(full_lines.any(|full| line == full));
+        }
+        assert!(!expanded.contains("FxLight2"));
+        assert_eq!(expanded.matches("discard;").count(), 2);
+        assert!(!lit_source(true).contains("discard;"));
+
+        let p = pass();
+        let mut u = payload(&p);
+        u[LIGHTS + 15] = 1.;
+        assert!(admitted_lit(&p, &u));
+        u[LIGHTS + 23] = 1.;
+        assert!(!admitted_lit(&p, &u));
+    }
+
+    #[test]
+    fn culling_keeps_cutoff_contacts_and_compacts_only_zero_terms_stably() {
+        let mut p = pass();
+        let mut u = payload(&p);
+        let put = |u: &mut [f32], index: usize, x: f32, red: f32| {
+            u[LIGHTS + index * 8..][..8].copy_from_slice(&[x, 0., 0., 10., red, 1., 1., 1.]);
+        };
+        put(&mut u, 0, 100., 1.);
+        put(&mut u, 1, 10., 2.);
+        put(&mut u, 2, -100., 3.);
+        put(&mut u, 3, -10., 4.);
+        assert!(!cull_lights(&p, &mut u));
+        assert_eq!((u[LIGHTS + 4], u[LIGHTS + 12]), (2., 4.));
+        assert!(admitted_lit(&p, &u));
+        assert!(!admitted(&p, &u));
+
+        let mut u = payload(&p);
+        put(&mut u, 0, 100., 1.);
+        p.mesh.vertices[0].position.x = f32::NAN;
+        assert!(!cull_lights(&p, &mut u));
+        assert_eq!(u[LIGHTS + 7], 1.);
+        p.mesh.vertices[0].position = Vec3::ZERO;
+        assert!(cull_lights(&p, &mut u));
+        assert!(admitted(&p, &u));
+    }
+
+    #[test]
     fn the_key_is_off_by_default_and_strict() {
         let c = crate::render::vita_renderer::Config::default();
-        assert!(!c.actor_lean_shader);
+        assert!(!c.actor_lean_shader && !c.actor_light_cull && !c.actor_lean_lights);
+        for key in ["actor_light_cull", "actor_lean_lights"] {
+            assert!(serde_json::from_value::<crate::render::vita_renderer::Config>(
+                serde_json::json!({(key): 1})).is_err());
+        }
         assert!(serde_json::from_value::<crate::render::vita_renderer::Config>(serde_json::json!({"actor_lean_shader": 1})).is_err());
         assert!(serde_json::from_value::<crate::render::vita_renderer::Config>(serde_json::json!({"actor_lean_shader": true})).unwrap().actor_lean_shader);
     }
