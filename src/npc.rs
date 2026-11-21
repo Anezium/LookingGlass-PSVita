@@ -3813,7 +3813,7 @@ impl NpcSim {
         for (slot, actor) in self.actors.iter().enumerate().filter(|(_,a)| a.snapshot_resident()) {
             if inputs.overflow { break; }
             let p = actor.resident.as_ref().expect("selected resident");
-            // Reject malformed bite-only state before animation lookup or any copying.
+            // Check the model and bounded resident state before animation lookup or copying.
             if let resident::Body::Snark(b) = &p.body {
                 if b.validate().is_err() || b.kind.model()!=actor.spawn.model || !self.models[actor.model].clips.contains_key(b.clip()) { inputs.overflow=true; break; }
             }
@@ -3829,8 +3829,27 @@ impl NpcSim {
             { visible &= !actor.near_culled(camera, view.near_cull); }
             let d = self.models[actor.model].as_ref();
             let offset = actor.target() - camera;
-            let body_visible = visible && p.active && !(offset.length_squared() > 3500.*3500.
+            let body_in_view = !(offset.length_squared() > 3500.*3500.
                 || (offset.length_squared() > 200.*200. && offset.normalize().dot(direction) < -0.3));
+            if matches!(&p.body, resident::Body::Insect(_))
+                || matches!(&p.body, resident::Body::Snark(s) if s.kind == crate::snark::Kind::Water)
+            {
+                if let resident::Body::Insect(insect) = &p.body {
+                    if insect.kind.model() != actor.spawn.model || !d.clips.contains_key(insect.clip()) {
+                        inputs.overflow = true;
+                        break;
+                    }
+                }
+                inputs.residents.push(ResidentInput {
+                    slot, visible, preserve: actor.electric > 0., attached: true, body: None,
+                    effects: ResidentEffects::Flora {
+                        resident: (visible && p.active).then(|| Box::new(p.clone())),
+                        body_visible: body_in_view,
+                    },
+                });
+                continue;
+            }
+            let body_visible = visible && p.active && body_in_view;
             let (clip, time, looping, scale, attached, frozen, electric) = match &p.body {
                 resident::Body::Ladybug(b) => {
                     let (clip,time,loops) = b.clip(d.ladybug_timing.expect("resident Ladybug timing"));
@@ -3855,7 +3874,7 @@ impl NpcSim {
             // active residency; Plant projectiles precede that gate in the legacy path.
             let effect_input = match &p.body {
                 // BiteOnly has no projectiles, tongue, or smoke. Validation above
-                // excludes ranged states; other Snark kinds retain the live fence.
+                // excludes ranged states.
                 resident::Body::Snark(_) => ResidentEffects::BiteOnly,
                 resident::Body::Wildlife(b) => ResidentEffects::Wildlife { active:p.active, input:wildlife_art::Input::capture(b,d) },
                 resident::Body::Ladybug(b) => {

@@ -822,7 +822,8 @@ impl Config {
         if self.sim_overlap_live {
             ensure!(self.replay_play.is_empty() && self.replay_record.is_empty(),
                 "sim_overlap_live requires live input without playback or recording");
-            ensure!(self.replay_start == "chapter:potears2"
+            let start = crate::replay::parse_start(&self.replay_start)?;
+            ensure!(start.kind == "chapter" && start.map == "potears2"
                 && self.sim_overlap_maps.iter().all(|map| map == "potears2"),
                 "sim_overlap_live is available only with chapter:potears2");
             ensure!(!self.sim_overlap || !self.sim_overlap_maps.is_empty(),

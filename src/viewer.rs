@@ -1258,6 +1258,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let mut sim_worker = sim_overlap.then(|| blocked_step::Worker::new(&sim_audit)).transpose()?;
     let mut worker_generation = 0u64;
     let mut dispatched_frames = 0u64;
+    let mut retained_frames = 0u64;
     let mut sim_trace = sim_timing::Trace::new();
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     let force_checkpoint_frame = std::env::var("LOOKING_GLASS_SIM_FORCE_CHECKPOINT")
@@ -4359,6 +4360,7 @@ interactions
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         let lag_free = lag_free && steam_poison_frame != Some(frame);
         if lag_free {
+            retained_frames += 1;
             assert!(pending.is_none(), "pending frame was not drawn before publication");
             // The next pulse consumes this frame's already complete seal.
             if let Some((stamp, probe, path)) = worker_seal {
@@ -5374,7 +5376,7 @@ interactions
     sim_audit.finish(frame);
     if sim_overlap {
         drop(sim_worker.take());
-        println!("[lg/sim-overlap] dispatched_frames={dispatched_frames}");
+        println!("[lg/sim-overlap] dispatched_frames={dispatched_frames} retained_frames={retained_frames}");
     }
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     crate::collision::lazy_profile::report();

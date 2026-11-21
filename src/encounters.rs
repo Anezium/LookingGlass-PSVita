@@ -475,7 +475,7 @@ impl Art {
         if s.actors.len() > MAX_ACTORS || s.actors.iter().any(|actor| match &actor.enemy {
             Enemy::Guard(g) => g.shots.len() > 32,
             Enemy::Ladybug(_) => true,
-            Enemy::Boojum(_) => false,
+            Enemy::Boojum(b) => b.waves.len() > 256,
         }) {
             return;
         }
@@ -496,7 +496,8 @@ impl Art {
             return std::mem::size_of::<SchoolInput>() + s.actors.len() * std::mem::size_of::<Actor>()
                 + s.actors.iter().map(|a| match &a.enemy {
                     Enemy::Guard(g) => std::mem::size_of_val(g.shots.as_slice()),
-                    _ => 0,
+                    Enemy::Boojum(b) => std::mem::size_of_val(b.waves.as_slice()),
+                    Enemy::Ladybug(_) => 0,
                 } + a.name.len()).sum::<usize>();
         }
         self.input.as_ref().map_or(0, |i| std::mem::size_of::<RenderInput>()
