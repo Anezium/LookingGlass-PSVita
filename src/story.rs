@@ -325,6 +325,17 @@ pub struct Story {
     finished: Vec<String>,
 }
 impl Story {
+    /// Warm first lines across all registered beats before later replies. Some
+    /// owners queue and start the first line on the same gameplay frame.
+    pub(crate) fn voice_paths(&self) -> impl Iterator<Item = &str> {
+        let longest = self.available.values().map(|s| s.lines.len()).max().unwrap_or(0);
+        (0..longest).flat_map(move |index| {
+            self.available.values().filter_map(move |s| {
+                s.lines.get(index).map(|line| line.path.as_str())
+            })
+        })
+    }
+
     pub fn has_seen(&self, event: &str) -> bool {
         self.seen.contains(event)
     }

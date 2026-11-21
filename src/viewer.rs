@@ -1210,6 +1210,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         environment_clock = 0.;
         audio.load(&mut assets, &maps[current], &scene.map);
         story = crate::story::Story::load(&mut assets, &maps[current]);
+        audio.prefetch_story_voices(&mut assets, &story, &maps[current]);
         crate::loading_screen::between("sound").await;
         let mut entry_timing = crate::startup::Phase::new("entry_after_story");
         eprintln!("[lg/startup] entry owner=engine map={} opening_roq_requested={opening_requested}", maps[current]);

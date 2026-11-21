@@ -131,28 +131,28 @@ impl Assets {
     pub fn read(&mut self, name: &str) -> Result<Vec<u8>> {
         let _timing = crate::startup::WorkTimer::new(crate::startup::Work::AssetRead);
         let late = (crate::spike_log::on() && !crate::startup::in_phase()).then(std::time::Instant::now);
-        let result = self.read_entry(name);
+        let result = self.read_limited(name, MAX_ENTRY);
         if let Some(start) = late {
             crate::spike_log::late(crate::startup::Work::AssetRead as usize, start.elapsed().as_secs_f64() * 1000.,
                 Some(name), result.as_ref().ok().map(Vec::len));
         }
         result
     }
-    fn read_entry(&mut self, name: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read_limited(&mut self, name: &str, limit: u64) -> Result<Vec<u8>> {
         let &(p, i, _, _) = self
             .entries
             .get(&normalize(name))
             .with_context(|| format!("Asset not found: {name}"))?;
         let entry = self.packs[p].by_index(i)?;
-        if entry.size() > MAX_ENTRY {
-            bail!("Asset exceeds 128 MiB limit: {name}");
+        if entry.size() > limit {
+            bail!("Asset exceeds read limit: {name}");
         }
         let mut data = Vec::with_capacity(entry.size() as usize);
         entry
-            .take(MAX_ENTRY + 1)
+            .take(limit + 1)
             .read_to_end(&mut data)
             .with_context(|| format!("Reading {name}"))?;
-        if data.len() as u64 > MAX_ENTRY {
+        if data.len() as u64 > limit {
             bail!("Expanded asset exceeds limit: {name}");
         }
         Ok(data)
