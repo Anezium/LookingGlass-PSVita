@@ -62,6 +62,12 @@ struct Frame {
     actor_zero_glow: u32,
     #[cfg(feature = "vita_renderer")]
     actor_glow_subset: u32,
+    #[cfg(feature = "vita_renderer")]
+    actor_routes: [u32; 4],
+    #[cfg(target_os = "vita")]
+    scissor: [u32; 3],
+    #[cfg(target_os = "vita")]
+    submit_cpu_ms: f64,
     /// The open simulation block and when it started.
     block: Option<(usize, Instant)>,
     sim_ms: [f64; SIM.len()],
@@ -192,8 +198,23 @@ impl Frame {
             let _ = write!(out, " actor_zero_glow={}", self.actor_zero_glow);
         }
         #[cfg(feature = "vita_renderer")]
-        if self.actor_glow_subset != 0 {
-            let _ = write!(out, " actor_glow_subset_triangles={}", self.actor_glow_subset);
+        {
+            let [lean, lean_opaque, full, corpse_opaque] = self.actor_routes;
+            let _ = write!(out, " actor_glow_subset_triangles={} actor_lean={lean} actor_lean_opaque={lean_opaque} actor_full={full} actor_corpse_opaque={corpse_opaque}", self.actor_glow_subset);
+        }
+        #[cfg(target_os = "vita")]
+        {
+            let [updates, masks, resets] = self.scissor;
+            let _ = write!(out, " vgl_scissor_updates={updates} vgl_scissor_masks={masks} vgl_scissor_resets={resets}");
+            if gxm.is_some() {
+                let end_ms = |regions: &[u32]| f64::from(regions.iter().sum::<u32>()) / 1000.;
+                let sim = (ms(begin, render) - end_ms(&self.end_us[..RENDER])).max(0.);
+                let render_cpu = (ms(render, hud) - end_ms(&self.end_us[RENDER..HUD])).max(0.);
+                let submit = self.submit_cpu_ms.min(render_cpu);
+                let build = render_cpu - submit;
+                let other = (ms(hud, now) - end_ms(&self.end_us[HUD..])).max(0.);
+                let _ = write!(out, " cpu_sim={sim:.2} cpu_render_build={build:.2} cpu_submit={submit:.2} cpu_other={other:.2}");
+            }
         }
         if self.flight_work[0] > 0 {
             let [calls,tests,traversals,witnesses,short,free]=self.flight_work;
@@ -216,6 +237,8 @@ pub(crate) fn begin_frame() {
         let mut f = f.borrow_mut();
         f.close_block(now);
         f.gxm_switch(0);
+        #[cfg(target_os = "vita")]
+        { f.scissor = crate::gpu_timing::take_scissor_diagnostics(); }
         // The new frame starts at `now`, so formatting the previous line is charged to it (`log=`).
         let mut log_ms = 0.;
         if let (Some(begin), Some(render), Some(hud), Some(cpu_end)) = (f.begin, f.render, f.hud, f.cpu_end) {
@@ -304,6 +327,39 @@ pub(crate) fn actor_glow_subset(triangles: u32) {
         FRAME.with(|f| f.borrow_mut().actor_glow_subset += triangles);
     }
 }
+#[cfg(feature = "vita_renderer")]
+pub(crate) fn actor_route(route: usize) {
+    if on() {
+        FRAME.with(|f| f.borrow_mut().actor_routes[route] += 1);
+    }
+}
+
+/// Wall time of an existing render submission scope, excluding its EndScene wait.
+#[cfg(target_os = "vita")]
+pub(crate) struct SubmitScope(Instant, u32);
+
+#[cfg(target_os = "vita")]
+pub(crate) fn submit_scope() -> Option<SubmitScope> {
+    if !on() { return None; }
+    gxm_now().map(|mark| SubmitScope(Instant::now(), mark[1]))
+}
+
+#[cfg(target_os = "vita")]
+impl Drop for SubmitScope {
+    fn drop(&mut self) {
+        let elapsed = self.0.elapsed().as_secs_f64() * 1000.;
+        if let Some(mark) = gxm_now() {
+            let wait = f64::from(mark[1].wrapping_sub(self.1)) / 1000.;
+            FRAME.with(|f| {
+                let mut f = f.borrow_mut();
+                if f.render.is_some() && f.hud.is_none() {
+                    f.submit_cpu_ms += (elapsed - wait).max(0.);
+                }
+            });
+        }
+    }
+}
+
 /// One NPC kind's update this frame, from `npc::profile`: actors updated and milliseconds in think,
 /// movement, animation and combat.
 pub(crate) fn npc(name: &'static str, updated: u64, ms: [f64; 4]) {
@@ -407,8 +463,11 @@ mod tests {
         f.close_block(t(12));
         f.npc[0] = Some(Npc { name: "ant", updated: 11, ms: [1., 2., 3., 4.] });
         let line = f.line(t(40), [t(0), t(12), t(30), t(31)]);
-        assert_eq!(line, "[lg/spike] frame=7 ms=40.00 sim=12.00 render=18.00 hud=1.00 present=9.00 \
-            sim_split=input:2.00,npcs:10.00 npc=ant:11/10.00/1.00/2.00/3.00/4.00");
+        let prefix = "[lg/spike] frame=7 ms=40.00 sim=12.00 render=18.00 hud=1.00 present=9.00 \
+            sim_split=input:2.00,npcs:10.00 npc=ant:11/10.00/1.00/2.00/3.00/4.00";
+        assert!(line.starts_with(prefix));
+        #[cfg(feature = "vita_renderer")]
+        assert!(line.contains(" actor_glow_subset_triangles=0 actor_lean=0 actor_lean_opaque=0 actor_full=0 actor_corpse_opaque=0"));
         f.gxm_start = Some([0, 1000, 1]);
         f.gxm_mark = Some([70, 46000, 3]);
         f.end_us[Sim::Scene as usize] = 44_500;

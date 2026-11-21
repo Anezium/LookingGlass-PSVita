@@ -73,13 +73,17 @@ pub(super) fn sources() -> [String; 2] {
 /// Every line the lean source leaves out is a no-op under payload `u`. Each test is the
 /// negation of the shader's own guard, so NaN fails the guard here as it does there.
 pub(super) fn admitted(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
+    admitted_with_lights(p, u, crate::render::vita_renderer::config().diag_actor_lean_ignore_lights)
+}
+
+fn admitted_with_lights(p: &Pass, u: &[f32; UNIFORM_FLOATS], ignore_lights: bool) -> bool {
     let a = &u[APPEARANCE..APPEARANCE + 4];
     !p.effect
         && !(a[0] > 0.) && !(a[1] > 0.5) && !(a[2] > 0.5) && !(a[3] > 0.) && !(a[3] < 0.)
         && !(u[FX_MODEL] < 0.5)
         && !(u[FOG_MODE] > 3.5)
         && !(u[SKY_FADE] > 0.5)
-        && (0..8).all(|light| !(u[LIGHTS + light * 8 + 7] > 0.5))
+        && (ignore_lights || (0..8).all(|light| !(u[LIGHTS + light * 8 + 7] > 0.5)))
         && u[GAIN..GAIN + 3].iter().all(|gain| gain.is_finite())
 }
 /// Host census line for one actor draw: the payload facts the selector reads and the route.
@@ -176,7 +180,10 @@ mod tests {
         for light in 0..8 {
             let mut u = payload(&p);
             u[LIGHTS + light * 8 + 7] = 1.;
-            assert!(!admitted(&p, &u), "light {light}");
+            assert!(!admitted_with_lights(&p, &u, false), "light {light}");
+            assert!(admitted_with_lights(&p, &u, true), "light {light} diagnostic");
+            u[SKY_FADE] = 1.;
+            assert!(!admitted_with_lights(&p, &u, true), "backdrop fade with light {light}");
         }
         let mut u = payload(&p);
         u[SKY_FADE] = 1.;

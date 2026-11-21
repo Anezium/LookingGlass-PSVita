@@ -289,7 +289,13 @@ pub(crate) fn accept(accepted:bool,measured:bool) {
         if !accepted && s.pending {s.accepted-=1;}
         s.pending=accepted;s.current.measured=measured;});
 }
-pub(crate) struct Timer {start:Option<Instant>, region:usize, level:usize}
+pub(crate) struct Timer {
+    start: Option<Instant>,
+    region: usize,
+    level: usize,
+    #[cfg(target_os = "vita")]
+    _spike_submit: Option<crate::spike_log::SubmitScope>,
+}
 /// Publish disjoint Totals intervals. Only the full profiler owns reused reads.
 pub(crate) fn world_publish(ns:&[u64;3], calls:&[u32;3], reused:bool) {
     publish_leaves(Region::WorldSubmit,
@@ -358,7 +364,15 @@ pub(crate) fn calibrate() {
     println!("[lg/phase-census] calibration clock_read_ns_median={clock_median} clock_read_ns_p95={clock_p95} empty_bracket_ns_median={span_median} empty_bracket_ns_p95={span_p95} samples=1024 batch=16 repetitions=16384 span_active=false scope=before_window includes_outer_clock_pair=true");
 }
 pub(crate) fn span(region:Region) -> Timer {
-    let mut timer=Timer{start:None,region:region as usize,level:0};
+    let mut timer = Timer {
+        start: None, region: region as usize, level: 0,
+        #[cfg(target_os = "vita")]
+        _spike_submit: match region {
+            Region::WorldSubmit | Region::AlphaSubmit | Region::ActorSubmit | Region::FxSubmit =>
+                crate::spike_log::submit_scope(),
+            _ => None,
+        },
+    };
     if region==Region::Other || !active() {return timer;}
     STATE.with(|s| {let mut s=s.borrow_mut();
         // These are actor_gather subdivisions, not whole-frame pose/FX totals.

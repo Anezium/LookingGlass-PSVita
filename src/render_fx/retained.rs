@@ -802,6 +802,14 @@ impl Gpu {
             || actor_lean::admitted(p, u));
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         actor_lean::census(p, u, depth_write, program);
+        if !p.effect {
+            crate::spike_log::actor_route(match program {
+                Route::ActorLean => 0,
+                Route::ActorLeanOpaque => 1,
+                Route::CorpseOpaque => 3,
+                _ => 2,
+            });
+        }
         let lite = program == Route::Lite;
         if lite { count(if crate::render::vita_renderer::config().fx_unlit_exact {
             "vita_fx_unlit_exact_draws"

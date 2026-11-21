@@ -254,6 +254,8 @@ mod vita {
         fn vglSetDisplayCallback(callback: extern "C" fn(*mut c_void));
         fn vglSetupRenderTargetScenesNum(display: u8, fbo: u8);
         fn vglSetParamBufferSize(bytes: u32);
+        pub(super) fn vglSetScissorDiagnostics(guard: u8, count: u8);
+        pub(super) fn vglTakeScissorDiagnostics(counts: *mut u32);
     }
     /// CPU0 is the game, CPU1 and CPU2 the workers, and CPU2 also the audio producer at priority 161.
     const THREAD_AFFINITY: i32 = 0x40000;
@@ -365,6 +367,13 @@ mod vita {
     pub(super) fn delay(microseconds: u32) { unsafe { sceKernelDelayThread(microseconds); } }
 }
 
+#[cfg(target_os = "vita")]
+pub(crate) fn take_scissor_diagnostics() -> [u32; 3] {
+    let mut counts = [0; 3];
+    unsafe { vita::vglTakeScissorDiagnostics(counts.as_mut_ptr()); }
+    counts
+}
+
 /// Before vglInit, from the config alone. Off leaves vitaGL's defaults untouched.
 pub(crate) fn before_gl_init() {
     #[cfg(feature = "vita_renderer")]
@@ -375,6 +384,11 @@ pub(crate) fn before_gl_init() {
         if let Some([display, fbo]) = config.rt_scenes { vita::set_render_target_scenes(display, fbo); }
         #[cfg(target_os = "vita")]
         if let Some(mib) = config.param_buffer_mib { vita::set_param_buffer(mib); }
+        #[cfg(target_os = "vita")]
+        unsafe {
+            vita::vglSetScissorDiagnostics(config.diag_vgl_scissor_guard.into(),
+                (config.spike_log_ms > 0.).into());
+        }
     }
 }
 /// When the survey opens. All of the log's memory is taken here, never in a frame.

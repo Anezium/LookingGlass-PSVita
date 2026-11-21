@@ -29,6 +29,23 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+#[cfg(test)]
+#[test]
+fn jlair2_diagnostic_keys_default_off_and_require_booleans() {
+    for key in ["diag_actor_lean_ignore_lights", "diag_vgl_scissor_guard"] {
+        let raw = |value| serde_json::from_value::<Config>(serde_json::json!({(key): value}));
+        let defaults = serde_json::from_str::<Config>("{}").unwrap();
+        assert!(!defaults.diag_actor_lean_ignore_lights && !defaults.diag_vgl_scissor_guard);
+        let config = raw(serde_json::json!(true)).unwrap();
+        assert_eq!(config.diag_actor_lean_ignore_lights, key == "diag_actor_lean_ignore_lights");
+        assert_eq!(config.diag_vgl_scissor_guard, key == "diag_vgl_scissor_guard");
+        assert!(raw(serde_json::json!(false)).is_ok());
+        for invalid in [serde_json::json!(1), serde_json::json!("true"), serde_json::Value::Null] {
+            assert!(raw(invalid).is_err());
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Clocks {
@@ -468,6 +485,10 @@ pub struct Config {
     pub draw_distance_cap: Option<f32>,
     pub simple_fog: bool,
     pub simple_dynamic_lights: bool,
+    /// Diagnostic: allow otherwise eligible lit actors to lose their dynamic light terms.
+    pub diag_actor_lean_ignore_lights: bool,
+    /// Vita-only diagnostic: skip redundant scissor invalidations.
+    pub diag_vgl_scissor_guard: bool,
     pub gpu_state_probe: bool,
     pub gpu_index_dedupe: bool,
     pub gpu_uniform_dedupe: bool,
@@ -747,6 +768,7 @@ impl Default for Config {
             water_stage_merge: "off".into(), world_alpha_lite: false, water_draw_join: false, alpha_model_pvs: false, fx_lite: false, fx_unlit_exact: false, fx_add_lean: false, fx_add_fog_free: false, fx_add_zero_alpha_cut: false, fx_add_max_area: 0.,
             flat_actor_light: false, max_texture_dimension: None,
             draw_distance_cap: None, simple_fog: false, simple_dynamic_lights: false,
+            diag_actor_lean_ignore_lights: false, diag_vgl_scissor_guard: false,
             gpu_state_probe: false,
             gpu_index_dedupe: false, gpu_uniform_dedupe: false,
             startup_splash:false,
