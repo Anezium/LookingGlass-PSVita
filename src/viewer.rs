@@ -1475,7 +1475,15 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             }
         }};
     }
+    #[cfg(feature = "vita_renderer")]
+    let mut dynamic_resolution = crate::render::vita_renderer::dynamic_resolution::DynamicResolution::default();
     loop {
+        #[cfg(target_os = "vita")]
+        let scale_timing_map = current;
+        #[cfg(target_os = "vita")]
+        let scale_timing = (crate::render::vita_renderer::config()
+            .dynamic_render_scale_for_map(&maps[current]).is_some() && scene.retained_active())
+            .then(crate::gpu_timing::DynamicScaleTiming::start);
         #[cfg(feature = "vita_renderer")]
         if replay_census.is_some() {
             crate::phase_census::replay_window::ReplayWindow::export_if_due(
@@ -4071,7 +4079,16 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let display_clear = true;
         if display_clear { clear_background(scene.atmosphere.background()); }
         #[cfg(feature="vita_renderer")]
-        crate::render::vita_renderer::prepare_3d(scene.atmosphere.background());
+        let dynamic_scale = dynamic_resolution.frame(
+            if active && scene.retained_active() {
+                crate::render::vita_renderer::config().dynamic_render_scale_for_map(&maps[current])
+            } else {
+                None
+            },
+            current, frame, &maps[current],
+        );
+        #[cfg(feature = "vita_renderer")]
+        crate::render::vita_renderer::prepare_gameplay_3d(scene.atmosphere.background(), dynamic_scale);
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         crate::sim_maps::probe::sample_world_viewport();
         #[cfg(feature = "vita_renderer")]
@@ -5046,6 +5063,13 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             }
         }
         next_frame().await;
+        #[cfg(target_os = "vita")]
+        dynamic_resolution.observe(scale_timing.filter(|_| scale_timing_map == current)
+            .map(crate::gpu_timing::DynamicScaleTiming::finish));
+        #[cfg(all(feature = "vita_renderer", feature = "sim_maps_probe", not(target_os = "vita")))]
+        if dynamic_scale.is_some() {
+            dynamic_resolution.observe(crate::render::vita_renderer::dynamic_resolution::host_cost(frame - 1));
+        }
         #[cfg(feature = "vita_renderer")]
         crate::phase_census::replay_window::ReplayFrame::presented(census_frame);
         #[cfg(feature = "vita_renderer")]

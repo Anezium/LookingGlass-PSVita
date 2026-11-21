@@ -5,6 +5,7 @@ use crate::light_profile::InactiveInstant as MetricInstant;
 use std::time::Instant as MetricInstant;
 mod shader;
 mod scale;
+pub(crate) mod dynamic_resolution;
 mod depth_sentinel;
 mod pvs_cache;
 mod state_cache;
@@ -542,6 +543,14 @@ pub struct Config {
     pub gpu_experiment: String,
     pub world_viewport_scale: f32,
     pub render_scale:f32,
+    /// Adjust only the 3D raster resolution after a completed gameplay frame.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic_render_scale: bool,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_optional_map_list")]
+    pub dynamic_render_scale_maps: Option<Vec<String>>,
+    /// Defaults to 0.6 when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_render_scale_floor: Option<f32>,
     /// Readback diagnostic, excluded from production timing.
     pub depth_sentinel: bool,
     /// Preserve scaled world depth until the direct FX pass completes.
@@ -789,6 +798,9 @@ impl Default for Config {
             gpu_experiment: "gpu222".into(),
             world_viewport_scale: 1.,
             depth_sentinel: false, scaled_depth_fix: true, scaled_target: "resolve".into(),
+            dynamic_render_scale: false,
+            dynamic_render_scale_maps: None,
+            dynamic_render_scale_floor: None,
             render_scale:0.75,msaa_samples:1,quality:"low".into(),opaque_order:"front_to_back".into(),world_alpha:true,
         }
     }
@@ -817,6 +829,12 @@ impl Config {
     pub(super) fn actor_glow_subset_for_map(&self, name: &str) -> bool {
         self.actor_glow_subset
             && self.actor_glow_subset_maps.as_ref().is_none_or(|maps| maps.iter().any(|map| map == name))
+    }
+
+    pub(crate) fn dynamic_render_scale_for_map(&self, name: &str) -> Option<u8> {
+        (self.dynamic_render_scale
+            && self.dynamic_render_scale_maps.as_ref().is_some_and(|maps| maps.iter().any(|map| map == name)))
+            .then(|| if self.dynamic_render_scale_floor == Some(0.5) { 50 } else { 60 })
     }
 
     pub(super) fn selection(&self, name: &str) -> (bool, &'static str) {
@@ -895,6 +913,11 @@ impl Config {
         ensure!(self.world_viewport_scale.is_finite() && (0.25..=1.).contains(&self.world_viewport_scale),"world_viewport_scale must be between 0.25 and 1");
         ensure!(self.render_scale.is_finite()&&(0.25..=1.).contains(&self.render_scale),"invalid render_scale");
         ensure!(matches!(self.msaa_samples,1|2|4),"msaa_samples must be 1, 2 or 4");
+        ensure!(self.dynamic_render_scale_floor.is_none_or(|floor| floor == 0.5 || floor == 0.6),
+            "dynamic_render_scale_floor must be 0.5 or 0.6");
+        ensure!(!self.dynamic_render_scale || (self.dynamic_render_scale_maps.is_some()
+            && self.render_scale == 0.75 && self.scaled_target == "direct" && self.gpu_timing == "off"),
+            "dynamic_render_scale requires a map allowlist, render_scale 0.75, scaled_target direct and gpu_timing off");
         ensure!(self.render_scale==1. || self.msaa_samples==1,"scaled target requires msaa_samples=1");
         ensure!(!self.actor_glow_subset || self.msaa_samples==1,"actor_glow_subset requires msaa_samples=1");
         ensure!(!self.actor_glow_subset || self.actor_glow_subset_maps.is_some(),"actor_glow_subset requires actor_glow_subset_maps");
@@ -1149,7 +1172,11 @@ pub(crate) fn world_viewport() -> Option<(i32,i32,i32,i32)> {
 pub(crate) fn apply_world_viewport() {
     if let Some((x,y,w,h))=world_viewport() { unsafe { get_internal_gl().quad_context.apply_viewport(x,y,w,h); } }
 }
-pub(crate) fn prepare_3d(bg:Color){scale::prepare(bg);}
+pub(crate) fn prepare_3d(bg:Color){scale::prepare(bg, None);}
+pub(crate) fn prepare_gameplay_3d(bg: Color, dynamic_scale: Option<f32>) {
+    scale::prepare(bg, dynamic_scale);
+    crate::spike_log::render_scale(dynamic_scale.unwrap_or(config().render_scale));
+}
 pub(crate) fn display_clear_skipped() -> bool { config().display_clear_skip && config().render_scale < 1. }
 pub(crate) fn begin_3d_pass(action:PassAction){scale::begin(action);}
 pub(crate) fn set_3d_camera(camera:&Camera3D){scale::camera(camera);}
@@ -4329,6 +4356,38 @@ mod tests {
                 format!(r#"{{"actor_glow_subset_maps":{invalid}}}"#).as_bytes(),
             ).is_err());
         }
+    }
+
+    #[test]
+    fn dynamic_render_scale_requires_an_exact_allowlist_and_direct_target() {
+        let parse = |value: serde_json::Value| parse_runtime_config(value.to_string().as_bytes());
+        let defaults = parse(serde_json::json!({})).unwrap().0;
+        assert_eq!(defaults.dynamic_render_scale_for_map("jlair2"), None);
+        assert!(serde_json::to_value(defaults).unwrap().get("dynamic_render_scale").is_none());
+        let enabled = serde_json::json!({
+            "dynamic_render_scale": true, "scaled_target": "direct",
+            "dynamic_render_scale_maps": ["jlair2", "*"]
+        });
+        let config = parse(enabled.clone()).unwrap().0;
+        assert_eq!(config.dynamic_render_scale_for_map("jlair2"), Some(60));
+        assert_eq!(config.dynamic_render_scale_for_map("JLAIR2"), None);
+        assert_eq!(config.dynamic_render_scale_for_map("skool1"), None);
+        for (key, value) in [
+            ("dynamic_render_scale_maps", serde_json::json!(null)),
+            ("dynamic_render_scale_maps", serde_json::json!("jlair2")),
+            ("dynamic_render_scale_maps", serde_json::json!([1])),
+            ("dynamic_render_scale_floor", serde_json::json!(0.55)),
+            ("render_scale", serde_json::json!(0.5)),
+            ("scaled_target", serde_json::json!("resolve")),
+            ("gpu_timing", serde_json::json!("backlog")),
+        ] {
+            let mut invalid = enabled.clone();
+            invalid[key] = value;
+            assert!(parse(invalid).is_err(), "{key}");
+        }
+        let mut lower = enabled;
+        lower["dynamic_render_scale_floor"] = serde_json::json!(0.5);
+        assert_eq!(parse(lower).unwrap().0.dynamic_render_scale_for_map("jlair2"), Some(50));
     }
 
     fn historical_keys(v: &serde_json::Value) -> Vec<String> {

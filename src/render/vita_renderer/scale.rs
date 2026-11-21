@@ -1,7 +1,7 @@
 //! One reusable single-sample 3D target, composited before the native-resolution HUD.
 use super::*;
 use macroquad::camera::Camera;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 struct Target {
     rt: RenderTarget,
@@ -9,12 +9,21 @@ struct Target {
     width: u32,
     height: u32,
     upscale: Material,
+    cropped_upscale: Option<Material>,
 }
 // Macroquad's context is process-lived. Miniquad's host GL library/context is
 // already gone when main-thread TLS destructors run, so the final target must
 // share that process lifetime. Replacing **slot below still drops an old target
 // during a live frame (including its separately owned host depth attachment).
 thread_local! {static TARGET:RefCell<ManuallyDrop<Option<Target>>>=const{RefCell::new(ManuallyDrop::new(None))};}
+thread_local! {
+    static ACTIVE_VIEWPORT: Cell<Option<(i32, i32, i32, i32)>> = const { Cell::new(None) };
+}
+
+pub(super) fn active_viewport() -> Option<(i32, i32, i32, i32)> {
+    ACTIVE_VIEWPORT.get()
+}
+
 impl Drop for Target {
     fn drop(&mut self) {
         if let Some(depth) = self.depth {
@@ -31,7 +40,8 @@ pub(super) fn pass() -> Option<macroquad::miniquad::RenderPass> {
             .map(|t| t.rt.render_pass.raw_miniquad_id())
     })
 }
-pub(super) fn prepare(bg: Color) {
+pub(super) fn prepare(bg: Color, dynamic_scale: Option<f32>) {
+    ACTIVE_VIEWPORT.set(None);
     crate::render_tail::configure();
     crate::render_tail::end();
     log_framebuffer();
@@ -126,11 +136,16 @@ pub(super) fn prepare(bg: Color) {
                 width: w,
                 height: h,
                 upscale,
+                cropped_upscale: None,
             });
             println!(
                 "[lg/vita-renderer] 3d target {w}x{h} RGBA8/depth32 samples={} scale={} copy_v_inverted={invert} scaled_target={} resolve_blit={}",
                 if direct { 0 } else { 1 }, config().render_scale, config().scaled_target, !direct
             );
+        }
+        if dynamic_scale.is_some() {
+            let target = slot.as_mut().unwrap();
+            target.cropped_upscale.get_or_insert_with(cropped_upscale);
         }
     });
     begin(PassAction::Clear {
@@ -141,18 +156,32 @@ pub(super) fn prepare(bg: Color) {
     unsafe {
         get_internal_gl().quad_context.end_render_pass();
     }
+    if let Some(scale) = dynamic_scale.filter(|&scale| scale < config().render_scale) {
+        // VitaGL computes viewport half-extents with an integer shift.
+        let extent = |size: f32| ((size * scale / 2.).round() as i32) * 2;
+        ACTIVE_VIEWPORT.set(Some((0, 0, extent(screen_width()), extent(screen_height()))));
+    }
 }
 /// The 3D target's rectangle: what the world pass draws into, for a readback.
 #[cfg(target_os = "vita")]
 pub(super) fn target_rect() -> (i32, i32, i32, i32) {
-    TARGET.with(|t| t.borrow().as_ref().map_or((0, 0, screen_width() as i32, screen_height() as i32), |t| (0, 0, t.width as i32, t.height as i32)))
+    active_viewport().unwrap_or_else(|| {
+        TARGET.with(|t| t.borrow().as_ref().map_or(
+            (0, 0, screen_width() as i32, screen_height() as i32),
+            |t| (0, 0, t.width as i32, t.height as i32),
+        ))
+    })
 }
 pub(super) fn begin(action: PassAction) {
     unsafe {
         if matches!(action, PassAction::Clear { depth: Some(_), .. }) {
             macroquad::miniquad::gl::glDepthMask(1);
         }
-        get_internal_gl().quad_context.begin_pass(pass(), action);
+        let ctx = get_internal_gl().quad_context;
+        ctx.begin_pass(pass(), action);
+        if let Some((x, y, w, h)) = active_viewport() {
+            ctx.apply_viewport(x, y, w, h);
+        }
     }
 }
 struct ScaledCamera<'a>(&'a Camera3D);
@@ -167,7 +196,7 @@ impl Camera for ScaledCamera<'_> {
         TARGET.with(|t| t.borrow().as_ref().map(|t| t.rt.render_pass.clone()))
     }
     fn viewport(&self) -> Option<(i32, i32, i32, i32)> {
-        self.0.viewport
+        self.0.viewport.or_else(active_viewport)
     }
 }
 pub(super) fn camera(camera: &Camera3D) {
@@ -187,7 +216,18 @@ pub(super) fn present() {
             let texture = &target.rt.texture;
             // The bridge has finished all 3D packets; queue a single upscale before HUD.
             set_default_camera();
-            gl_use_material(&target.upscale);
+            if let Some((_, _, w, h)) = ACTIVE_VIEWPORT.take() {
+                let material = target.cropped_upscale.as_ref().unwrap();
+                material.set_uniform("Crop", vec4(
+                    w as f32 / target.width as f32,
+                    h as f32 / target.height as f32,
+                    0.5 / target.width as f32,
+                    0.5 / target.height as f32,
+                ));
+                gl_use_material(material);
+            } else {
+                gl_use_material(&target.upscale);
+            }
             draw_texture_ex(
                 texture,
                 0.,
@@ -227,6 +267,26 @@ void main(){gl_FragColor=vec4(texture2D(Texture,uv).rgb,1.);}"#;
 const UPSCALE_FRAGMENT_INVERT_V: &str = r#"#version 100
 varying mediump vec2 uv; uniform sampler2D Texture;
 void main(){gl_FragColor=vec4(texture2D(Texture,vec2(uv.x,1.-uv.y)).rgb,1.);}"#;
+
+// Both backends place the crop at GL origin. Vita's direct target stores those
+// rows at the end of the texture, so map local V to 1 - V just like the full copy.
+fn cropped_upscale() -> Material {
+    let v = if cfg!(target_os = "vita") { "1.-sample_uv.y" } else { "sample_uv.y" };
+    let fragment = format!(r#"#version 100
+varying mediump vec2 uv; uniform sampler2D Texture; uniform vec4 Crop;
+void main(){{
+    vec2 sample_uv=clamp(uv*Crop.xy,Crop.zw,Crop.xy-Crop.zw);
+    gl_FragColor=vec4(texture2D(Texture,vec2(sample_uv.x,{v})).rgb,1.);
+}}"#);
+    crate::frame_profile::load_material(
+        ShaderSource::Glsl { vertex: UPSCALE_VERTEX, fragment: &fragment },
+        MaterialParams {
+            uniforms: vec![UniformDesc::new("Crop", UniformType::Float4)],
+            pipeline_params: PipelineParams { color_blend: None, alpha_blend: None, ..Default::default() },
+            ..Default::default()
+        },
+    ).expect("cropped opaque upscale shader")
+}
 
 pub(super) fn log_depth(opaque: bool) {
     static OPAQUE: OnceLock<()> = OnceLock::new();

@@ -233,6 +233,36 @@ pub(crate) fn spike_peek() -> Option<[u32; 3]> {
 }
 
 #[cfg(target_os = "vita")]
+static DYNAMIC_SCALE_TIMING: AtomicBool = AtomicBool::new(false);
+
+/// Scope the existing EndScene meter to an eligible viewer frame.
+#[cfg(target_os = "vita")]
+pub(crate) struct DynamicScaleTiming {
+    begin: std::time::Instant,
+    end_us: u32,
+}
+
+#[cfg(target_os = "vita")]
+impl DynamicScaleTiming {
+    pub(crate) fn start() -> Self {
+        DYNAMIC_SCALE_TIMING.store(true, Relaxed);
+        Self { begin: std::time::Instant::now(), end_us: SPIKE_END_US.load(Relaxed) }
+    }
+
+    pub(crate) fn finish(self) -> (u32, u32) {
+        (self.begin.elapsed().as_micros().min(u128::from(u32::MAX)) as u32,
+            SPIKE_END_US.load(Relaxed).wrapping_sub(self.end_us))
+    }
+}
+
+#[cfg(target_os = "vita")]
+impl Drop for DynamicScaleTiming {
+    fn drop(&mut self) {
+        DYNAMIC_SCALE_TIMING.store(false, Relaxed);
+    }
+}
+
+#[cfg(target_os = "vita")]
 mod vita {
     use super::*;
     use core::ffi::c_void;
@@ -287,7 +317,9 @@ mod vita {
     pub unsafe extern "C" fn __wrap_sceGxmEndScene(context: *mut c_void, vertex: *const Notification, fragment: *const Notification) -> i32 {
         let log_now = if armed() { log() } else { None };
         let Some(log) = log_now else {
-            if !SPIKE.load(Relaxed) { return __real_sceGxmEndScene(context, vertex, fragment); }
+            if !SPIKE.load(Relaxed) && !DYNAMIC_SCALE_TIMING.load(Relaxed) {
+                return __real_sceGxmEndScene(context, vertex, fragment);
+            }
             let enter = now();
             let result = __real_sceGxmEndScene(context, vertex, fragment);
             SPIKE_END_US.fetch_add(now().wrapping_sub(enter), Relaxed);

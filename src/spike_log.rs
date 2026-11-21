@@ -51,6 +51,7 @@ const NPC_ROWS: usize = 24;
 #[derive(Default)]
 struct Frame {
     number: u64,
+    render_scale: Option<f32>,
     flight_work: [u32;6],
     begin: Option<Instant>,
     render: Option<Instant>,
@@ -151,6 +152,7 @@ impl Frame {
         let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64() * 1000.;
         let _ = write!(out, "[lg/spike] frame={} ms={:.2} sim={:.2} render={:.2} hud={:.2} present={:.2}",
             self.number, ms(begin, now), ms(begin, render), ms(render, hud), ms(hud, cpu_end), ms(cpu_end, now));
+        if let Some(scale) = self.render_scale { let _ = write!(out, " render_scale={scale:.2}"); }
         if self.log_ms > 0. { let _ = write!(out, " log={:.2}", self.log_ms); }
         let gxm = self.gxm_start.zip(self.gxm_mark);
         if let Some((start, end)) = gxm {
@@ -239,9 +241,27 @@ pub(crate) fn begin_frame() {
     #[cfg(feature="vita_renderer")]
     crate::render_fx::retained::gpu_skin::census_begin();
 }
+#[cfg(feature = "vita_renderer")]
+pub(crate) fn render_scale(scale: f32) {
+    if on() {
+        FRAME.with(|f| f.borrow_mut().render_scale = Some(scale));
+    }
+}
+
+#[cfg(feature = "vita_renderer")]
+pub(crate) fn scale_change(frame: u64, map: &str, previous: u8, scale: u8) {
+    OUT.with(|o| o.borrow_mut().push(|text| {
+        let _ = write!(text, "[lg/dynres] frame={frame} map={map} from={:.2} scale={:.2}",
+            f32::from(previous) / 100., f32::from(scale) / 100.);
+    }));
+}
+
 /// Writes the buffered lines, one record each, then one `[lg/spike] flushed` line with the count,
 /// the drops and the time the writes took. `at` names the flush point. Called outside play.
 pub(crate) fn flush(at: &str) {
+    #[cfg(feature = "vita_renderer")]
+    if !on() && !crate::render::vita_renderer::config().dynamic_render_scale { return; }
+    #[cfg(not(feature = "vita_renderer"))]
     if !on() { return; }
     let (mut text, lines, dropped) = OUT.with(|o| {
         let mut o = o.borrow_mut();
@@ -259,8 +279,9 @@ pub(crate) fn flush(at: &str) {
 }
 /// The viewer loop ended: flush, and print later lines at once until the next `begin_frame`.
 pub(crate) fn end_play() {
-    if !on() { return; }
-    FRAME.with(|f| { let mut f = f.borrow_mut(); let number = f.number; *f = Frame { number, ..Frame::default() }; });
+    if on() {
+        FRAME.with(|f| { let mut f = f.borrow_mut(); let number = f.number; *f = Frame { number, ..Frame::default() }; });
+    }
     flush("viewer-end");
 }
 /// The simulation enters `block`.
