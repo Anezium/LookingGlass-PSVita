@@ -503,6 +503,9 @@ pub struct Config {
     /// Start a live chapter without a tape. Lag one also needs sim_overlap and a map list.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sim_overlap_live: bool,
+    /// Vita display queue interval of two vblanks (nominally 30 fps), for lag-one runs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sim_overlap_cap_30: bool,
     /// Buffer stamped simulation and presentation timings until viewer teardown.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub diag_sim_timing: bool,
@@ -741,6 +744,7 @@ impl Default for Config {
             sim_overlap: false,
             sim_overlap_maps: Vec::new(),
             sim_overlap_live: false,
+            sim_overlap_cap_30: false,
             diag_sim_timing: false,
             replay_play: String::new(),
             replay_start: String::new(),
@@ -823,8 +827,11 @@ impl Config {
             ensure!(!self.sim_overlap || !self.sim_overlap_maps.is_empty(),
                 "live lag one requires an explicit sim_overlap_maps allowlist");
         }
-        ensure!(self.sim_overlap_maps.iter().all(|map| map == "potears2"),
-            "lag-one overlap is available on potears2 only");
+        ensure!(self.sim_overlap_maps.iter().all(|map|
+            matches!(map.as_str(), "potears2" | "skool1" | "centipede1" | "hatter1")),
+            "lag-one overlap is available on potears2, skool1, centipede1 and hatter1");
+        ensure!(!self.sim_overlap_cap_30 || !self.sim_overlap_maps.is_empty(),
+            "sim_overlap_cap_30 requires an explicit lag-one map allowlist");
         crate::replay::validate_settings(&crate::replay::Settings { record: self.replay_record.clone(),
             play: self.replay_play.clone(), start: self.replay_start.clone(), check_every: self.replay_check_every,
             state_every: self.replay_state_every, stop_after: self.replay_stop_after })?;
@@ -4835,7 +4842,7 @@ mod tests {
     }
 
     #[test]
-    fn lag_one_requires_an_explicit_potears2_map_and_input_mode() {
+    fn lag_one_requires_an_explicit_supported_map_and_input_mode() {
         let mut config = Config {
             sim_overlap: true,
             skin_overlap: true,
@@ -4847,11 +4854,15 @@ mod tests {
         assert!(config.validate().is_err());
         config.replay_play = "a2-04.lgtape".into();
         assert!(config.validate().is_ok());
+        config.sim_overlap_maps.extend(["skool1", "centipede1", "hatter1"].map(String::from));
+        config.sim_overlap_cap_30 = true;
+        assert!(config.validate().is_ok());
         config.sim_overlap_maps.push("potears1".into());
         assert!(config.validate().is_err());
         let defaults = serde_json::to_value(Config::default()).unwrap();
         assert!(defaults.get("sim_overlap_maps").is_none());
         assert!(defaults.get("sim_overlap_live").is_none());
+        assert!(defaults.get("sim_overlap_cap_30").is_none());
 
         config.sim_overlap_maps.pop();
         config.sim_overlap_live = true;
@@ -4865,6 +4876,8 @@ mod tests {
         config.sim_overlap_maps.clear();
         assert!(config.validate().is_err()); // No implicit all-map overlap.
         config.sim_overlap = false;
+        assert!(config.validate().is_err()); // No cap without lag one.
+        config.sim_overlap_cap_30 = false;
         assert!(config.validate().is_ok()); // Live serial control.
         config.replay_start.clear();
         assert!(config.validate().is_err());
