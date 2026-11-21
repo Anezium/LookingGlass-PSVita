@@ -424,9 +424,15 @@ mod tests {
         f.block = Some((Sim::Npcs as usize, t(2)));
         f.close_block(t(12));
         f.npc[0] = Some(Npc { name: "ant", updated: 11, ms: [1., 2., 3., 4.] });
+        #[cfg(feature = "vita_renderer")]
+        { f.actor_routes = [2, 5, 9]; }
         let line = f.line(t(40), [t(0), t(12), t(30), t(31)]);
-        assert_eq!(line, "[lg/spike] frame=7 ms=40.00 sim=12.00 render=18.00 hud=1.00 present=9.00 \
-            sim_split=input:2.00,npcs:10.00 npc=ant:11/10.00/1.00/2.00/3.00/4.00");
+        let base = "[lg/spike] frame=7 ms=40.00 sim=12.00 render=18.00 hud=1.00 present=9.00 \
+            sim_split=input:2.00,npcs:10.00 npc=ant:11/10.00/1.00/2.00/3.00/4.00";
+        #[cfg(feature = "vita_renderer")]
+        assert_eq!(line, format!("{base} actor_lights_culled_to_zero=2 actor_lean_lit=5 actor_full=9"));
+        #[cfg(not(feature = "vita_renderer"))]
+        assert_eq!(line, base);
         f.gxm_start = Some([0, 1000, 1]);
         f.gxm_mark = Some([70, 46000, 3]);
         f.end_us[Sim::Scene as usize] = 44_500;
