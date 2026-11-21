@@ -2324,6 +2324,7 @@ struct ResidentInput {
 }
 enum ResidentEffects {
     BiteOnly,
+    Flora { resident: Option<Box<resident::Resident>>, body_visible: bool },
     Wildlife { active: bool, input: wildlife_art::Input },
     Ladybug { active: bool, acorns: Vec<(Vec3, f32)>, bursts: Vec<(Vec3, f32)> },
     Plant { kind: crate::plants::Kind, shots: Vec<crate::plants::Shot> },
@@ -2332,6 +2333,12 @@ impl ResidentEffects {
     fn bytes(&self) -> usize {
         match self {
             Self::BiteOnly => 0,
+            Self::Flora { resident, .. } => resident.as_ref().map_or(0, |p| {
+                std::mem::size_of::<resident::Resident>() + match &p.body {
+                    resident::Body::Snark(s) => std::mem::size_of_val(s.shots.as_slice()),
+                    _ => 0,
+                }
+            }),
             Self::Wildlife { .. } => std::mem::size_of::<wildlife_art::Input>(),
             Self::Ladybug { acorns, bursts, .. } => (acorns.len()+bursts.len())*std::mem::size_of::<(Vec3,f32)>(),
             Self::Plant { shots, .. } => shots.len()*std::mem::size_of::<crate::plants::Shot>(),
@@ -2341,7 +2348,8 @@ impl ResidentEffects {
 impl Actor {
     fn snapshot_resident(&self) -> bool {
         self.resident.as_ref().is_some_and(|p| matches!(&p.body, resident::Body::Ladybug(_) | resident::Body::Plant(_))
-            || matches!(&p.body, resident::Body::Snark(b) if b.kind == crate::snark::Kind::BiteOnly)
+            || matches!(&p.body, resident::Body::Snark(b) if matches!(b.kind, crate::snark::Kind::BiteOnly | crate::snark::Kind::Water))
+            || matches!(&p.body, resident::Body::Insect(_))
             || matches!(&p.body, resident::Body::Wildlife(b) if b.kind.rock()))
     }
 }
@@ -2435,7 +2443,14 @@ pub(crate) struct NpcSim {
 
 pub(crate) type NpcArt = owner_thread::NpcArt<NpcArtResources>;
 
+struct ResidentEffectsArt {
+    snark_art: BTreeMap<usize, snark_art::Art>,
+    burrow_art: BTreeMap<usize, burrow_art::Art>,
+    snark_props: BTreeMap<crate::snark::Kind, snark_art::Projectiles>,
+}
+
 pub(crate) struct NpcArtResources {
+    resident_effects: ResidentEffectsArt,
     snapshot_registry: SnapshotRegistry,
     actor_inputs: Option<ActorInputs>,
     // GPU-only state, discarded on restore/level change and never serialized.
@@ -2450,12 +2465,9 @@ pub(crate) struct NpcArtResources {
     clock_trail: Option<crate::particles::Attached>,
     clock_art: BTreeMap<usize, clock_art::Art>,
     card_art: BTreeMap<usize, card_art::Art>,
-    snark_art: BTreeMap<usize, snark_art::Art>,
     magma_art: BTreeMap<usize, magma_art::Art>,
     wildlife_art: BTreeMap<usize, wildlife_art::Art>,
     magma_fire: Option<crate::particles::Attached>,
-    burrow_art: BTreeMap<usize, burrow_art::Art>,
-    snark_props: BTreeMap<crate::snark::Kind, snark_art::Projectiles>,
     card_props: BTreeMap<crate::cards::Kind, card_art::Projectiles>,
     imp_debris: Vec<Prop>,
     ant_shots: Option<[crate::weapons::Prop; 2]>,
@@ -2582,8 +2594,8 @@ impl Npcs {
         self.art.resources.visual_lod.clear();
         if let Some(g) = &self.sim.garden { g.validate(s.garden.as_ref())?; }
         self.art.resources.card_art.clear();
-        self.art.resources.snark_art.clear();
-        self.art.resources.burrow_art.clear();
+        self.art.resources.resident_effects.snark_art.clear();
+        self.art.resources.resident_effects.burrow_art.clear();
         self.art.resources.magma_art.clear();
         self.art.resources.wildlife_art.clear();
         self.art.resources.clock_art.clear();
@@ -3067,12 +3079,10 @@ impl Npcs {
                 spores,
                 acorn,
                 card_art,
-                snark_art,
-                burrow_art,
+                resident_effects: ResidentEffectsArt { snark_art, burrow_art, snark_props },
                 magma_art,
                 wildlife_art,
                 magma_fire,
-                snark_props,
                 card_props,
                 clock_art,
                 clock_prop,
@@ -3160,6 +3170,31 @@ impl Npcs {
             if world_free { None } else { Some(&self.sim) });
     }
 }
+impl ResidentEffectsArt {
+    fn draw(
+        &mut self, id: usize, model: &ModelArt, p: &resident::Resident, camera: Vec3,
+        atmosphere: &Atmosphere, fullbright: bool, material: &crate::character::SkinMaterial,
+    ) {
+        if !p.active {
+            return;
+        }
+        match &p.body {
+            resident::Body::Insect(g) => self.burrow_art.entry(id)
+                .or_insert_with(|| burrow_art::Art::new(model.own_effect.as_ref()))
+                .draw(g, &model.data, camera, atmosphere),
+            resident::Body::Snark(g) => {
+                let art = self.snark_art.entry(id)
+                    .or_insert_with(|| snark_art::Art::new(model.own_effect.as_ref()));
+                if let Some(props) = self.snark_props.get_mut(&g.kind) {
+                    art.shots(g, props, camera, atmosphere, fullbright, material);
+                }
+                art.tongue(g, &model.data);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl NpcArtResources {
     fn publish_actors(
         &mut self,
@@ -3280,9 +3315,35 @@ impl NpcArtResources {
                 let (identity, model_slot) = self.snapshot_registry.slots[input.slot];
                 let _identity = identity.scope();
                 let _preserve = crate::character::skinning::CullGuard::preserve(input.preserve);
+                if let ResidentEffects::Flora { resident, body_visible } = &input.effects {
+                    let draw_effects = !crate::character::skinning::overlap::gather_only();
+                    if let Some(p) = resident {
+                        if draw_effects {
+                            self.resident_effects.draw(
+                                id, &self.models[model_slot], p, camera, atmosphere, fullbright, &self.material,
+                            );
+                        }
+                        if *body_visible {
+                            let model = &mut self.models[model_slot];
+                            p.draw(model, fullbright, &self.material);
+                            if draw_effects {
+                                if let resident::Body::Snark(g) = &p.body {
+                                    if let Some(art) = self.resident_effects.snark_art.get_mut(&id) {
+                                        art.smoke(g, &model.data, camera, atmosphere);
+                                    }
+                                }
+                            }
+                            self.material.bind();
+                        }
+                    } else if *body_visible {
+                        self.material.bind();
+                    }
+                    continue;
+                }
                 if !crate::character::skinning::overlap::gather_only() {
                     match &input.effects {
                         ResidentEffects::BiteOnly => {},
+                        ResidentEffects::Flora { .. } => unreachable!("handled resident draw"),
                         ResidentEffects::Wildlife { active, input } => {
                             if !*active { self.material.bind(); continue; }
                             let model=&self.models[model_slot];
@@ -3411,27 +3472,9 @@ impl NpcArtResources {
                             );
                     }
                 }
-                if let resident::Body::Insect(g) = &p.body {
-                    if p.active {
-                        self.burrow_art
-                            .entry(id)
-                            .or_insert_with(|| {
-                                burrow_art::Art::new(self.models[actor.model].own_effect.as_ref())
-                            })
-                            .draw(g, &self.models[actor.model].data, camera, atmosphere);
-                    }
-                }
-                if let resident::Body::Snark(g) = &p.body {
-                    if p.active {
-                        let art = self.snark_art.entry(id).or_insert_with(|| {
-                            snark_art::Art::new(self.models[actor.model].own_effect.as_ref())
-                        });
-                        if let Some(props) = self.snark_props.get_mut(&g.kind) {
-                            art.shots(g, props, camera, atmosphere, fullbright, &self.material);
-                        }
-                        art.tongue(g, &self.models[actor.model].data);
-                    }
-                }
+                self.resident_effects.draw(
+                    id, &self.models[actor.model], p, camera, atmosphere, fullbright, &self.material,
+                );
                 if let resident::Body::Plant(plant) = &p.body {
                     self.spores.retain(|(owner, serial), _| {
                         *owner != id || plant.shots.iter().any(|s| s.serial == *serial)
@@ -3516,7 +3559,7 @@ impl NpcArtResources {
                 p.draw(model, fullbright, &self.material);
                 if p.active && !crate::character::skinning::overlap::gather_only() {
                     if let resident::Body::Snark(g) = &p.body {
-                        if let Some(art) = self.snark_art.get_mut(&id) {
+                        if let Some(art) = self.resident_effects.snark_art.get_mut(&id) {
                             art.smoke(g, &model.data, camera, atmosphere);
                         }
                     }

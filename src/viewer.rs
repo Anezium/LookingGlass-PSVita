@@ -106,6 +106,7 @@ struct LevelDispatch {
     selected: [bool; 10],
     registered: Vec<bool>,
     school_staging: bool,
+    school: Option<(crate::school::FirstDraw, [f32; 3])>,
     cheshire: Option<crate::cheshire::Input>,
     overflow: bool,
 }
@@ -175,6 +176,7 @@ impl LevelDispatch {
     fn valid(&self, art: &LevelArt) -> bool {
         !self.overflow && self.visit == art.snapshot_visit.id()
             && self.registered.len() == art.levels.len()
+            && (self.school.is_none() || art.school.is_some())
             && self.cheshire.is_some() == art.cheshire.is_some()
             && self.cheshire.as_ref().is_none_or(|i| art.cheshire.as_ref()
                 .is_some_and(|a| a.valid_input(i, self.visit)))
@@ -346,10 +348,16 @@ impl LevelArt {
         if self.levels.len() > 1024 || self.levels.len() != i.levels.len() {
             for a in self.levels.iter_mut().take(1024).flatten() {a.clear_snapshot();}
             return LevelDispatch { visit: self.snapshot_visit.id(), selected: [false; 10],
-                registered: Vec::new(), school_staging: false, cheshire: None, overflow: true };
+                registered: Vec::new(), school_staging: false, school: None, cheshire: None, overflow: true };
         }
         match (&mut self.encounters, &i.encounters) {
-            (Some(a), Some(s)) => a.extract_snapshot(s),
+            (Some(a), Some(s)) => {
+                if i.school.as_ref().is_some_and(|school| school.return_visit.is_none()) {
+                    a.extract_school(s, i.school.as_ref().and_then(|s| s.scene_id()) == Some(crate::school::cinema::THEATRE));
+                } else {
+                    a.extract_snapshot(s);
+                }
+            },
             (Some(a), None) => a.clear_snapshot(),
             _ => {}
         }
@@ -369,6 +377,10 @@ impl LevelArt {
                 i.duchess.is_some(), i.school2.is_some(), i.encounters.is_some()],
             registered: self.levels.iter().map(Option::is_some).collect(),
             school_staging: i.school.as_ref().is_some_and(|s| s.scene_id() == Some(crate::school::cinema::THEATRE)),
+            school: i.school.as_ref().filter(|s| s.return_visit.is_none()).map(|s| (
+                crate::school::FirstDraw::capture(s),
+                crate::school::cinema::Art::capture_story_pose(story),
+            )),
             cheshire: self.cheshire.as_ref().map(|art| {
                 hints.capture(&art.capture_rig(), story, self.snapshot_visit.id())
             }),
@@ -426,7 +438,12 @@ impl LevelArt {
             } else { a.draw(hints, atmosphere, camera, fullbright); }
         }
         if selected[1] { if let (Some(a), Some(s)) = (&mut self.school, &i.school) {
-            a.draw(s, fullbright, atmosphere, camera);
+            if let Some((input, mouth)) = dispatch.and_then(|d| d.school.as_ref()) {
+                a.first.apply_story_pose(*mouth);
+                a.draw_first(input, fullbright, atmosphere, camera);
+            } else {
+                a.draw(s, fullbright, atmosphere, camera);
+            }
         }
         }
         if selected[2] { if let (Some(a), Some(v)) = (&mut self.village, &i.village) {
@@ -493,6 +510,11 @@ impl LevelArt {
     ) {
         if let (Some(art), Some(input)) = (&mut self.cheshire, &command.cheshire) {
             art.draw_input(input, atmosphere, camera, fullbright);
+        }
+        if let Some((input, mouth)) = &command.school {
+            let art = self.school.as_mut().expect("validated school art");
+            art.first.apply_story_pose(*mouth);
+            art.draw_first(input, fullbright, atmosphere, camera);
         }
         if command.selected[5] {
             if let Some(art) = &mut self.pool {
@@ -1085,6 +1107,10 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     };
     #[cfg(not(feature = "vita_renderer"))]
     let live_chapter = false;
+    let saves_enabled = saves_enabled && !live_chapter;
+    if live_chapter {
+        println!("[lg/sim-overlap] live_save_store=read_only");
+    }
     eprintln!("[lg/startup] route options ready; save store begin");
     let save_store_start = std::time::Instant::now();
     let fingerprint = assets.fingerprint()?;
@@ -1095,7 +1121,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     #[cfg(feature="vita_renderer")]
     anyhow::ensure!(!(replay.is_some() && route_session.is_some()), "replay and route diagnostics are exclusive");
     let replay_resume = replay.as_mut().and_then(|r| r.take_resume());
-    let store = if replay.as_ref().is_some_and(|r| r.replaying()) { store.discarding_writes() } else { store };
+    let store = if live_chapter || replay.as_ref().is_some_and(|r| r.replaying()) {
+        store.discarding_writes()
+    } else {
+        store
+    };
     let mut replay_end: Option<&'static str> = None;
     eprintln!("[lg/startup] save store ready elapsed_ms={:.3} store_construct_ms={:.3} viewer_elapsed_ms={:.3}",save_store_start.elapsed().as_secs_f64()*1000.,store_start.elapsed().as_secs_f64()*1000.,startup.elapsed().as_secs_f64()*1000.);
     #[cfg(feature="vita_renderer")]
@@ -2210,7 +2240,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         // The frontend remains interactive if the reference save could not load.
         // Inside the bench, retain physics with neutral input, including sticks.
         let mut step_guards = None;
-        let mut input_started = sim_trace.mark(frame);
+        let mut input_started = sim_trace.input(frame);
         let mut step_input = input.capture_step(
             replay.as_ref().filter(|r| r.running()).map_or(frame, |r| r.current_step() - 1),
             physical_input && window_focused() && !bench && !route_running,
@@ -4259,7 +4289,7 @@ interactions
 
             art(level_art.fortress.is_some(), "fortress");
             art(level_art.village.is_some(), "village");
-            art(level_art.school.is_some(), "school");
+            art(level_art.school.is_some() && level_dispatch.as_ref().is_none_or(|d| d.school.is_none()), "school");
             art(level_art.gym.is_some(), "gym");
             art(level_art.beyond.is_some(), "beyond");
             // Pool story values are resolved before its owned body extraction.
@@ -5314,7 +5344,11 @@ interactions
         }
         drop(step_guards.take());
         let present_started = sim_trace.mark(present_stamp.frame.frame);
+        #[cfg(target_os = "vita")]
+        let display = sim_trace.display_before_swap(present_stamp, input_started.as_ref());
         next_frame().await;
+        #[cfg(target_os = "vita")]
+        sim_trace.display_after_swap(display);
         sim_trace.owner(present_stamp, sim_timing::Scope::Present, None, present_started);
         sim_trace.owner(present_stamp, sim_timing::Scope::InputToPresent, None, input_started);
         sim_audit.event("present", present_stamp);
@@ -5758,7 +5792,7 @@ mod snapshot_dispatch_tests {
     fn dispatch_visit_overflow_and_registry_shape_reject_before_publication() {
         let art = LevelArt::default();
         let mut input = LevelDispatch { visit: art.snapshot_visit.id(), selected: [false; 10],
-            registered: vec![], school_staging: false, cheshire: None, overflow: false };
+            registered: vec![], school_staging: false, school: None, cheshire: None, overflow: false };
         assert!(input.valid(&art));
         input.overflow = true; assert!(!input.valid(&art)); input.overflow = false;
         input.registered.push(false); assert!(!input.valid(&art)); input.registered.clear();

@@ -8,6 +8,8 @@ mod allocation_census;
 mod r13_survey;
 mod tls_count;
 mod gpu_timing;
+#[cfg(target_os = "vita")]
+mod display_timing;
 mod pass_clock;
 mod sim_maps;
 #[allow(dead_code)] // The viewer wires the protocol in I2.

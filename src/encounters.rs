@@ -404,13 +404,20 @@ pub struct Snapshot {
     actors: Vec<Actor>,
     activated: BTreeSet<String>,
 }
-/// Owned encounter draw batch. Only complete Ladybug-only batches are accepted;
-/// any other species or shape rejects the whole frame to the serial live path.
+/// Owned encounter draw batch. Other visits keep the bounded Ladybug schema.
 struct RenderInput {
     visit: u64,
     actors: Vec<crate::ladybug::RenderInput>,
     rejected: bool,
 }
+
+struct SchoolInput {
+    actors: Vec<Actor>,
+    boojum: boojum::Timing,
+    ladybug: Option<crate::ladybug::Timing>,
+    staging: bool,
+}
+
 const MAX_ACTORS: usize = 1024;
 const MAX_BONES: usize = 65536;
 const MAX_ACORNS: usize = 16384;
@@ -423,6 +430,7 @@ pub struct Art {
     ladybug: crate::ladybug::Art,
     visit: crate::render_snapshot::RenderVisit,
     input: Option<RenderInput>,
+    school: Option<SchoolInput>,
     pub school_staging: bool,
 }
 impl Art {
@@ -431,6 +439,7 @@ impl Art {
         Ok(Self {
             visit: Default::default(),
             input: None,
+            school: None,
             school_staging: false,
             ladybug: crate::ladybug::Art::load(assets, &specs)?,
             club: crate::npc::Puppet::load(assets, "cardguard_club", &[], &specs)?,
@@ -456,17 +465,45 @@ impl Art {
             material: crate::character::skin_material()?,
         })
     }
-    pub(crate) fn clear_snapshot(&mut self) { self.input = None; }
+    pub(crate) fn clear_snapshot(&mut self) {
+        self.input = None;
+        self.school = None;
+    }
+
+    pub(crate) fn extract_school(&mut self, s: &Encounters, staging: bool) {
+        self.clear_snapshot();
+        if s.actors.len() > MAX_ACTORS || s.actors.iter().any(|actor| match &actor.enemy {
+            Enemy::Guard(g) => g.shots.len() > 32,
+            Enemy::Ladybug(_) => true,
+            Enemy::Boojum(_) => false,
+        }) {
+            return;
+        }
+        self.school = Some(SchoolInput {
+            actors: s.actors.iter().filter(|a| a.active && a.enabled).cloned().collect(),
+            boojum: s.boojum,
+            ladybug: s.ladybug,
+            staging,
+        });
+    }
     pub(crate) fn snapshot_ready(&self) -> bool {
-        self.input.as_ref().is_some_and(|i| !i.rejected && i.visit == self.visit.id()
+        self.school.is_some() || self.input.as_ref().is_some_and(|i| !i.rejected && i.visit == self.visit.id()
             && i.actors.len() <= MAX_ACTORS
             && i.actors.iter().all(|a| self.ladybug.valid_input(a)))
     }
     pub(crate) fn snapshot_bytes(&self) -> usize {
+        if let Some(s) = &self.school {
+            return std::mem::size_of::<SchoolInput>() + s.actors.len() * std::mem::size_of::<Actor>()
+                + s.actors.iter().map(|a| match &a.enemy {
+                    Enemy::Guard(g) => std::mem::size_of_val(g.shots.as_slice()),
+                    _ => 0,
+                } + a.name.len()).sum::<usize>();
+        }
         self.input.as_ref().map_or(0, |i| std::mem::size_of::<RenderInput>()
             + i.actors.iter().map(|a| a.bytes()).sum::<usize>())
     }
     pub(crate) fn extract_snapshot(&mut self, s: &Encounters) {
+        self.school = None;
         let mut input = RenderInput { visit: self.visit.id(), actors: Vec::new(), rejected: true };
         // Reject every unsupported shape/species and bound the whole batch before
         // any pose allocation or iteration over a malformed list.
@@ -516,6 +553,12 @@ impl Art {
         atmosphere: &crate::environment::Atmosphere,
         camera: Vec3,
     ) -> bool {
+        if let Some(input) = self.school.take() {
+            self.draw_actors(&input.actors, input.boojum, input.ladybug, input.staging,
+                fullbright, atmosphere, camera);
+            self.school = Some(input);
+            return true;
+        }
         if !self.snapshot_ready() { return false; }
         self.material.atmosphere(atmosphere, camera);
         self.material.bind();
@@ -532,20 +575,34 @@ impl Art {
         atmosphere: &crate::environment::Atmosphere,
         camera: Vec3,
     ) {
+        self.draw_actors(&s.actors, s.boojum, s.ladybug, self.school_staging,
+            fullbright, atmosphere, camera);
+    }
+
+    fn draw_actors(
+        &mut self,
+        actors: &[Actor],
+        boojum: boojum::Timing,
+        ladybug: Option<crate::ladybug::Timing>,
+        school_staging: bool,
+        fullbright: bool,
+        atmosphere: &crate::environment::Atmosphere,
+        camera: Vec3,
+    ) {
         self.material.atmosphere(atmosphere, camera);
         self.material.bind();
-        for a in s.actors.iter().filter(|a| a.active && a.enabled) {
+        for a in actors.iter().filter(|a| a.active && a.enabled) {
             let alive = match &a.enemy { Enemy::Ladybug(b)=>b.health>0., Enemy::Guard(g)=>g.health>0., Enemy::Boojum(b)=>b.health>0. };
             if alive && crate::draw_diagnostics::skip(crate::draw_diagnostics::Class::LiveActors) { continue; }
             match &a.enemy {
-                Enemy::Ladybug(b) => self.ladybug.draw(b, s.ladybug.unwrap(), fullbright),
+                Enemy::Ladybug(b) => self.ladybug.draw(b, ladybug.unwrap(), fullbright),
                 Enemy::Guard(g) => {
                     let art = if g.ranged {
                         &mut self.diamond
                     } else {
                         &mut self.club
                     };
-                    if self.school_staging
+                    if school_staging
                         && a.name.starts_with("play_guard")
                         && g.state == crate::combat::State::Chase
                     {
@@ -578,11 +635,11 @@ impl Art {
                     }
                 }
                 Enemy::Boojum(b) => {
-                    let (clip, time, looping) = b.clip(s.boojum);
+                    let (clip, time, looping) = b.clip(boojum);
                     let scale = if b.frozen {
                         (2.5 - b.time).clamp(0., 1.)
                     } else if b.health <= 0. {
-                        1. - ((b.time - s.boojum.death) / 1.4).clamp(0., 1.)
+                        1. - ((b.time - boojum.death) / 1.4).clamp(0., 1.)
                     } else {
                         1.
                     };

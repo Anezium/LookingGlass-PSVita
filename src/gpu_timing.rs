@@ -376,6 +376,10 @@ pub(crate) fn before_gl_init() {
         let config = crate::render::vita_renderer::config();
         set_mask(config.gpu_mask.iter().filter_map(|name| mask_bit(name)).fold(0, |all, bit| all | bit));
         #[cfg(target_os = "vita")]
+        if config.diag_sim_timing {
+            crate::display_timing::enable();
+        }
+        #[cfg(target_os = "vita")]
         if config.sim_overlap_cap_30 {
             vita::CAP_30.store(true, Relaxed);
             println!("[lg/display] cap_vblanks=2");

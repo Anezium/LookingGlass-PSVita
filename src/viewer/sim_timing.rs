@@ -33,12 +33,16 @@ pub(super) struct Clock(Instant);
 pub(super) struct Mark {
     start: Instant,
     _thread: PhantomData<Rc<()>>,
+    #[cfg(target_os = "vita")]
+    display_start: Option<u32>,
 }
 
 pub(super) fn mark(enabled: bool) -> Option<Mark> {
     enabled.then(|| Mark {
         start: Instant::now(),
         _thread: PhantomData,
+        #[cfg(target_os = "vita")]
+        display_start: None,
     })
 }
 
@@ -106,6 +110,14 @@ pub(super) struct WorkerRows {
     pub details: Option<Box<Details>>,
 }
 
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy)]
+pub(super) struct DisplaySample {
+    stamp: Stamp,
+    input_us: u32,
+    ticket: u32,
+}
+
 pub(super) struct Trace {
     clock: Option<Clock>,
     first: u64,
@@ -113,6 +125,10 @@ pub(super) struct Trace {
     rows: Vec<Timing>,
     details: Vec<Box<Details>>,
     dropped: u64,
+    #[cfg(target_os = "vita")]
+    display_pending: Vec<DisplaySample>,
+    #[cfg(target_os = "vita")]
+    display_rows: Vec<(DisplaySample, u32)>,
 }
 
 impl Trace {
@@ -139,6 +155,10 @@ impl Trace {
             rows: Vec::new(),
             details: Vec::new(),
             dropped: 0,
+            #[cfg(target_os = "vita")]
+            display_pending: Vec::with_capacity(4),
+            #[cfg(target_os = "vita")]
+            display_rows: Vec::new(),
         }
     }
 
@@ -149,6 +169,53 @@ impl Trace {
 
     pub(super) fn mark(&self, frame: u64) -> Option<Mark> {
         mark(self.clock(frame).is_some())
+    }
+
+    pub(super) fn input(&self, frame: u64) -> Option<Mark> {
+        #[cfg(target_os = "vita")]
+        return self.mark(frame).map(|mut mark| {
+            mark.display_start = crate::display_timing::input();
+            mark
+        });
+        #[cfg(not(target_os = "vita"))]
+        self.mark(frame)
+    }
+
+    #[cfg(target_os = "vita")]
+    pub(super) fn display_before_swap(&mut self, stamp: Stamp, mark: Option<&Mark>) -> Option<DisplaySample> {
+        let input_us = mark?.display_start?;
+        self.collect_display();
+        let Some(ticket) = crate::display_timing::arm() else {
+            self.dropped += 1;
+            return None;
+        };
+        Some(DisplaySample { stamp, input_us, ticket })
+    }
+
+    #[cfg(target_os = "vita")]
+    pub(super) fn display_after_swap(&mut self, sample: Option<DisplaySample>) {
+        if let Some(sample) = sample {
+            if crate::display_timing::submitted(sample.ticket) {
+                self.display_pending.push(sample);
+                self.collect_display();
+            } else {
+                crate::display_timing::cancel(sample.ticket);
+                self.dropped += 1;
+            }
+        }
+    }
+
+    #[cfg(target_os = "vita")]
+    fn collect_display(&mut self) {
+        self.display_pending.retain(|sample| {
+            let Some(time) = crate::display_timing::take(sample.ticket) else { return true; };
+            if self.display_rows.len() < 100_000 {
+                self.display_rows.push((*sample, time));
+            } else {
+                self.dropped += 1;
+            }
+            false
+        });
     }
 
     pub(super) fn owner(
@@ -191,8 +258,29 @@ impl Trace {
     }
 
     pub(super) fn flush(self) {
+        #[cfg(target_os = "vita")]
+        let mut this = self;
+        #[cfg(not(target_os = "vita"))]
+        let this = self;
+        #[cfg(target_os = "vita")]
+        {
+            if !this.display_pending.is_empty() && !crate::display_timing::finish() {
+                this.dropped += 1;
+            }
+            this.collect_display();
+            this.dropped += this.display_pending.len() as u64;
+            for (sample, time) in this.display_rows {
+                let stamp = sample.stamp;
+                println!("SIM_W0_DISPLAY {}", serde_json::json!({
+                    "frame": stamp.frame.frame, "tape_step": stamp.frame.tape_step,
+                    "visit": stamp.frame.visit_id, "generation": stamp.slot_generation,
+                    "submission": sample.ticket, "scheduled_us": time,
+                    "input_to_display_us": time.wrapping_sub(sample.input_us),
+                }));
+            }
+        }
         let owner = std::thread::current().id();
-        for row in self.rows {
+        for row in this.rows {
             let stamp = row.stamp;
             println!(
                 "SIM_W0_TIMING {}",
@@ -205,7 +293,7 @@ impl Trace {
                 })
             );
         }
-        for detail in self.details {
+        for detail in this.details {
             let stamp = detail.stamp;
             println!(
                 "SIM_W0_DETAILS {}",
@@ -217,8 +305,8 @@ impl Trace {
                 })
             );
         }
-        if self.dropped != 0 {
-            println!("SIM_W0_TIMING_DROPPED {}", self.dropped);
+        if this.dropped != 0 {
+            println!("SIM_W0_TIMING_DROPPED {}", this.dropped);
         }
     }
 }

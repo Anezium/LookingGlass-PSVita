@@ -822,14 +822,15 @@ impl Config {
         if self.sim_overlap_live {
             ensure!(self.replay_play.is_empty() && self.replay_record.is_empty(),
                 "sim_overlap_live requires live input without playback or recording");
-            ensure!(self.replay_start.starts_with("chapter:"),
-                "sim_overlap_live requires replay_start=chapter:<map>");
+            ensure!(self.replay_start == "chapter:potears2"
+                && self.sim_overlap_maps.iter().all(|map| map == "potears2"),
+                "sim_overlap_live is available only with chapter:potears2");
             ensure!(!self.sim_overlap || !self.sim_overlap_maps.is_empty(),
                 "live lag one requires an explicit sim_overlap_maps allowlist");
         }
         ensure!(self.sim_overlap_maps.iter().all(|map|
-            matches!(map.as_str(), "potears2" | "skool1" | "centipede1" | "hatter1")),
-            "lag-one overlap is available on potears2, skool1, centipede1 and hatter1");
+            matches!(map.as_str(), "potears2" | "skool1" | "centipede1")),
+            "lag-one overlap is available on potears2, skool1 and centipede1");
         ensure!(!self.sim_overlap_cap_30 || !self.sim_overlap_maps.is_empty(),
             "sim_overlap_cap_30 requires an explicit lag-one map allowlist");
         crate::replay::validate_settings(&crate::replay::Settings { record: self.replay_record.clone(),
@@ -4854,7 +4855,7 @@ mod tests {
         assert!(config.validate().is_err());
         config.replay_play = "a2-04.lgtape".into();
         assert!(config.validate().is_ok());
-        config.sim_overlap_maps.extend(["skool1", "centipede1", "hatter1"].map(String::from));
+        config.sim_overlap_maps.extend(["skool1", "centipede1"].map(String::from));
         config.sim_overlap_cap_30 = true;
         assert!(config.validate().is_ok());
         config.sim_overlap_maps.push("potears1".into());
@@ -4869,7 +4870,12 @@ mod tests {
         config.replay_start = "chapter:potears2".into();
         assert!(config.validate().is_err()); // Live opt-in with playback.
         config.replay_play.clear();
+        assert!(config.validate().is_err()); // Tape-only maps are unavailable in live play.
+        config.sim_overlap_maps.truncate(1);
         assert!(config.validate().is_ok());
+        config.replay_start = "chapter:skool1".into();
+        assert!(config.validate().is_err());
+        config.replay_start = "chapter:potears2".into();
         config.replay_record = "play.lgtape".into();
         assert!(config.validate().is_err());
         config.replay_record.clear();

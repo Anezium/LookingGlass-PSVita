@@ -151,7 +151,11 @@ impl Frame {
         drop(clock_guard);
         crate::frame_phases::mark(9);
         let started = trace.mark(stamp.frame.frame);
+        #[cfg(target_os = "vita")]
+        let display = trace.display_before_swap(stamp, tail.input_started.as_ref());
         next_frame().await;
+        #[cfg(target_os = "vita")]
+        trace.display_after_swap(display);
         trace.owner(stamp, Scope::Present, None, started);
         trace.owner(stamp, Scope::InputToPresent, None, tail.input_started);
         Ok(report_due)

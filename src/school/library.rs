@@ -295,7 +295,7 @@ impl School {
 }
 
 impl Art {
-    pub(super) fn draw_library(&mut self, school: &School, bright: bool) {
+    pub(super) fn draw_library(&mut self, school: &super::FirstDraw, bright: bool) {
         let s = school.first_cinema.as_ref().unwrap();
         let l = s.library.as_ref().unwrap();
         let d = school.cinema_data.as_ref().unwrap();
