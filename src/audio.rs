@@ -13,7 +13,7 @@ pub mod events;
 mod reaction;
 pub mod regression;
 pub mod world;
-mod voice;
+pub(crate) mod voice;
 use crate::{assets::Assets, bsp::Bsp, collision::World};
 use anyhow::{ensure, Context, Result};
 use macroquad::prelude::{vec3, Vec3};
@@ -1943,18 +1943,24 @@ impl Audio {
         sink.append(Decoder::new(Cursor::new(bytes))?);
         Ok(Some(sink))
     }
-    pub(crate) fn prefetch_story_voices(
-        &mut self,
-        assets: &mut Assets,
-        story: &crate::story::Story,
-        map: &str,
-    ) {
+    pub(crate) fn install_story_voices(&mut self, story: &mut crate::story::Story, map: &str) {
         #[cfg(feature = "vita_renderer")]
-        if crate::render::vita_renderer::config().audio_voice_prefetch && self.playback.is_some() {
-            self.story_voices = voice::prefetch(assets, story, map);
+        if let Some(cache) = story.prefetched_voices.take().filter(|_| self.playback.is_some()) {
+            self.story_voices = cache.install(map);
         }
         #[cfg(not(feature = "vita_renderer"))]
-        let _ = (assets, story, map);
+        let _ = (story, map);
+    }
+
+    pub(crate) fn reload_story_voices(&mut self, assets: &mut Assets, map: &str) {
+        #[cfg(feature = "vita_renderer")]
+        if crate::render::vita_renderer::config().audio_voice_prefetch && self.playback.is_some() {
+            let _timing = crate::startup::Phase::new("rollback_story_load");
+            let mut story = crate::story::Story::load(assets, map);
+            self.install_story_voices(&mut story, map);
+        }
+        #[cfg(not(feature = "vita_renderer"))]
+        let _ = (assets, map);
     }
 
     pub fn speak_from(&mut self, assets: &mut Assets, path: &str, seconds: f32) {

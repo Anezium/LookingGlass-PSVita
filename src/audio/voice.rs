@@ -48,11 +48,11 @@ use std::{collections::BTreeMap, io::Cursor};
 #[cfg(feature = "vita_renderer")]
 const PCM_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(feature = "vita_renderer")]
-const WAV_BYTES: u64 = 1024 * 1024;
+const WAV_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "vita_renderer")]
-fn decode(bytes: Vec<u8>, remaining: usize) -> Option<Pcm> {
-    let header = hound::WavReader::new(Cursor::new(bytes.as_slice())).ok()?;
+fn decode(bytes: &[u8], remaining: usize) -> Option<Pcm> {
+    let header = hound::WavReader::new(Cursor::new(bytes)).ok()?;
     let spec = header.spec();
     if spec.channels == 0
         || spec.sample_rate == 0
@@ -81,34 +81,47 @@ fn decode(bytes: Vec<u8>, remaining: usize) -> Option<Pcm> {
 }
 
 #[cfg(feature = "vita_renderer")]
-pub(super) fn prefetch(
-    assets: &mut crate::assets::Assets,
-    story: &crate::story::Story,
-    map: &str,
-) -> BTreeMap<String, Pcm> {
-    let mut cache = BTreeMap::new();
-    let mut bytes = 0;
-    let started = std::time::Instant::now();
-    for path in story.voice_paths() {
-        if bytes == PCM_BYTES {
-            break;
+#[derive(Default)]
+pub(crate) struct Cache {
+    clips: BTreeMap<String, Pcm>,
+    bytes: usize,
+    decode_time: Duration,
+}
+
+#[cfg(feature = "vita_renderer")]
+impl Cache {
+    pub(crate) fn add(&mut self, path: &str, wav: &[u8]) {
+        let remaining = PCM_BYTES - self.bytes;
+        if remaining < size_of::<i16>() || wav.len() > WAV_BYTES || self.clips.contains_key(path) {
+            return;
         }
-        if cache.contains_key(path) {
-            continue;
+        let started = std::time::Instant::now();
+        if let Some(clip) = decode(wav, remaining) {
+            self.bytes += clip.samples.capacity() * size_of::<i16>();
+            self.clips.insert(path.to_owned(), clip);
         }
-        if let Ok(wav) = assets.read_limited(path, WAV_BYTES) {
-            if let Some(clip) = decode(wav, PCM_BYTES - bytes) {
-                bytes += clip.samples.capacity() * size_of::<i16>();
-                cache.insert(path.to_owned(), clip);
-            }
-        }
+        self.decode_time += started.elapsed();
     }
-    eprintln!(
-        "[lg/story-voice-prefetch] map={map} clips={} bytes={bytes} cap_bytes={PCM_BYTES} ms={:.3}",
-        cache.len(),
-        started.elapsed().as_secs_f64() * 1000.
-    );
-    cache
+
+    pub(crate) fn retain(&mut self, registered: impl Fn(&str) -> bool) {
+        self.clips.retain(|path, clip| {
+            if registered(path) {
+                return true;
+            }
+            self.bytes -= clip.samples.capacity() * size_of::<i16>();
+            false
+        });
+    }
+
+    pub(super) fn install(self, map: &str) -> BTreeMap<String, Pcm> {
+        eprintln!(
+            "[lg/story-voice-prefetch] map={map} clips={} bytes={} cap_bytes={PCM_BYTES} ms={:.3}",
+            self.clips.len(),
+            self.bytes,
+            self.decode_time.as_secs_f64() * 1000.
+        );
+        self.clips
+    }
 }
 
 #[cfg(all(test, feature = "vita_renderer"))]
@@ -131,8 +144,8 @@ mod tests {
             }
             writer.finalize().unwrap();
             let bytes = bytes.into_inner();
-            assert!(decode(bytes.clone(), 1999).is_none());
-            let prefetched = decode(bytes.clone(), 2000).unwrap();
+            assert!(decode(&bytes, 1999).is_none());
+            let prefetched = decode(&bytes, 2000).unwrap();
             for seconds in [0., 0.000031, 0.01337, 0.25] {
                 let offset = Duration::from_secs_f32(seconds);
                 let baseline = rodio::Decoder::new(Cursor::new(bytes.clone())).unwrap();

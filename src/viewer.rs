@@ -1071,6 +1071,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             crate::loading_screen::between("level_art_models_textures").await;
             skip_scene = crate::cinematic::Skip::default();
             audio.load(&mut assets, &maps[current], &scene.map);
+            audio.install_story_voices(&mut story, &maps[current]);
             install_timing.mark("audio_load");
             clock.pause();
             paused = $pause;
@@ -1209,8 +1210,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         pickup_clock = 0.;
         environment_clock = 0.;
         audio.load(&mut assets, &maps[current], &scene.map);
-        story = crate::story::Story::load(&mut assets, &maps[current]);
-        audio.prefetch_story_voices(&mut assets, &story, &maps[current]);
+        {
+            let _timing = crate::startup::Phase::new("startup_story_load");
+            story = crate::story::Story::load(&mut assets, &maps[current]);
+            audio.install_story_voices(&mut story, &maps[current]);
+        }
         crate::loading_screen::between("sound").await;
         let mut entry_timing = crate::startup::Phase::new("entry_after_story");
         eprintln!("[lg/startup] entry owner=engine map={} opening_roq_requested={opening_requested}", maps[current]);
@@ -1423,6 +1427,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 particles.restore_runtime($particles);
                 level_art = art; npcs = cast; steam = particles; scene = world;
                 audio.reload_failed_transition(&mut assets, &maps[current], &scene.map);
+                audio.reload_story_voices(&mut assets, &maps[current]);
                 audio.restore_transition($audio);
                 character
             }
@@ -2652,6 +2657,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                         interactions.sync(&mut scene.world);
                         environment_clock = 0.;
                         audio.load(&mut assets, &maps[selected], &scene.map);
+                        audio.install_story_voices(&mut story, &maps[selected]);
                         current = selected;
                         campaign = Campaign::default();
                         played = true;
@@ -3356,6 +3362,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                         &catalog,
                     );
                     audio.load(&mut assets, &name, &scene.map);
+                    audio.install_story_voices(&mut story, &name);
                     eprintln!("[lg/transition] destination={name} resources_audio_ms={:.3}", transition_started.elapsed().as_secs_f64()*1000.);
                     // A blocked entrance already failed the exit, so there is no flight fallback.
                     (pos, yaw) = (arrived_eye, arrived_yaw);

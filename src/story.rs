@@ -323,19 +323,10 @@ pub struct Story {
     exit: Option<(String, Option<String>)>,
     pub completed: u64,
     finished: Vec<String>,
+    #[cfg(feature = "vita_renderer")]
+    pub(crate) prefetched_voices: Option<crate::audio::voice::Cache>,
 }
 impl Story {
-    /// Warm first lines across all registered beats before later replies. Some
-    /// owners queue and start the first line on the same gameplay frame.
-    pub(crate) fn voice_paths(&self) -> impl Iterator<Item = &str> {
-        let longest = self.available.values().map(|s| s.lines.len()).max().unwrap_or(0);
-        (0..longest).flat_map(move |index| {
-            self.available.values().filter_map(move |s| {
-                s.lines.get(index).map(|line| line.path.as_str())
-            })
-        })
-    }
-
     pub fn has_seen(&self, event: &str) -> bool {
         self.seen.contains(event)
     }
@@ -441,6 +432,15 @@ impl Story {
             map: map.into(),
             ..Self::default()
         };
+        #[cfg(feature = "vita_renderer")]
+        let mut cache = crate::render::vita_renderer::config().audio_voice_prefetch
+            .then(crate::audio::voice::Cache::default);
+        let mut prefetch = |_path: &str, _wav: &[u8]| {
+            #[cfg(feature = "vita_renderer")]
+            if let Some(cache) = &mut cache {
+                cache.add(_path, _wav);
+            }
+        };
         let table = assets
             .read(&format!("dialog/{map}.tlk"))
             .map(|b| subtitles(&b))
@@ -465,24 +465,10 @@ impl Story {
                     .into_iter()
                     .map(|(index, call)| (call, watches[index].clone()))
                     .map(|((actor, path), watches)| {
-                        let mut line = load_line(assets, &table, actor, path)?;
-                        if !matches!(spec.calls, registry::Calls::Legacy) {
-                            ensure!(
-                                speakers::for_voice(&line.path).is_some(),
-                                "Unregistered speaker {}",
-                                line.path
-                            );
-                            // New beats use the actual recording length, including subsecond
-                            // answers. Retain the shipped floor for legacy saved clocks.
-                            let wav = hound::WavReader::new(Cursor::new(assets.read(&line.path)?))?;
-                            line.duration = wav.duration() as f32 / wav.spec().sample_rate as f32;
-                            ensure!(
-                                line.duration.is_finite()
-                                    && line.duration > 0.
-                                    && line.duration <= 120.,
-                                "Invalid dialogue duration"
-                            );
-                        }
+                        let reviewed = !matches!(spec.calls, registry::Calls::Legacy);
+                        let mut line = load_line_with_voice(
+                            assets, &table, actor, path, reviewed, &mut prefetch,
+                        )?;
                         line.watches = watches;
                         Ok(line)
                     })
@@ -517,7 +503,9 @@ impl Story {
                         .is_some_and(|c| c == "trigger_catmessage")
                     {
                         if let Some(path) = e.get("target").filter(|p| voice_path(p)) {
-                            if let Ok(line) = load_line(assets, &table, String::new(), path.clone())
+                            if let Ok(line) = load_line_with_voice(
+                                assets, &table, String::new(), path.clone(), false, &mut prefetch,
+                            )
                             {
                                 s.available.insert(
                                     path.clone(),
@@ -532,6 +520,14 @@ impl Story {
                     }
                 }
             }
+        }
+        #[cfg(feature = "vita_renderer")]
+        if let Some(mut cache) = cache {
+            let registered: BTreeSet<_> = s.available.values()
+                .flat_map(|sequence| sequence.lines.iter().map(|line| line.path.as_str()))
+                .collect();
+            cache.retain(|path| registered.contains(path));
+            s.prefetched_voices = Some(cache);
         }
         println!(
             "Story {map}: {} conversations, {} voiced lines",
@@ -870,18 +866,43 @@ pub(crate) fn load_line(
     actor: String,
     path: String,
 ) -> Result<Line> {
+    load_line_with_voice(assets, table, actor, path, false, &mut |_, _| {})
+}
+
+fn load_line_with_voice(
+    assets: &mut Assets,
+    table: &BTreeMap<String, String>,
+    actor: String,
+    path: String,
+    reviewed: bool,
+    prefetch: &mut impl FnMut(&str, &[u8]),
+) -> Result<Line> {
     let text = table.get(&path).context("No matching subtitle")?.clone();
-    let duration = assets
-        .read(&path)
-        .and_then(|b| {
-            let wav = hound::WavReader::new(Cursor::new(b))?;
-            Ok(wav.duration() as f32 / wav.spec().sample_rate as f32)
-        })
-        .unwrap_or_else(|e| {
+    if reviewed {
+        ensure!(speakers::for_voice(&path).is_some(), "Unregistered speaker {path}");
+    }
+    let duration = assets.read(&path).and_then(|bytes| {
+        let wav = hound::WavReader::new(Cursor::new(bytes.as_slice()))?;
+        let duration = wav.duration() as f32 / wav.spec().sample_rate as f32;
+        if reviewed {
+            // New beats use the recording length, including subsecond answers.
+            ensure!(
+                duration.is_finite() && duration > 0. && duration <= 120.,
+                "Invalid dialogue duration"
+            );
+        }
+        prefetch(&path, &bytes);
+        Ok(duration)
+    });
+    let duration = if reviewed {
+        duration?
+    } else {
+        // Retain the shipped floor for legacy saved clocks.
+        duration.unwrap_or_else(|e| {
             eprintln!("Voice unavailable {path}: {e:#}; using subtitles");
             (text.split_whitespace().count() as f32 / 2.6).max(3.)
-        })
-        .clamp(1., 120.);
+        }).clamp(1., 120.)
+    };
     // Some source lines assign the Cat's voice to fakeplayer. Label and animate the
     // actual speaker, never Alice speaking with the Cat's voice.
     let actor = speakers::bind_actor(&actor, &path).to_owned();

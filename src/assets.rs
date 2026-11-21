@@ -138,7 +138,7 @@ impl Assets {
         }
         result
     }
-    pub(crate) fn read_limited(&mut self, name: &str, limit: u64) -> Result<Vec<u8>> {
+    fn read_limited(&mut self, name: &str, limit: u64) -> Result<Vec<u8>> {
         let &(p, i, _, _) = self
             .entries
             .get(&normalize(name))
