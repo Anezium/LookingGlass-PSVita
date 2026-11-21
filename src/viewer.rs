@@ -379,7 +379,7 @@ async fn enter_level_async(
 ) -> Result<Entered> {
     crate::transition_memory::fault("level")?;
     let loaded =
-        crate::campaign::load_visit_async(assets, name, entry, cached, options.difficulty, play_entry).await?;
+        crate::campaign::load_visit_async(assets, name, entry, cached, options.difficulty, play_entry, true).await?;
     finish_entered(assets, loaded, name, entry, cached, options).await
 }
 /// The window half of entering a level: the scene, the cast, the particles and the art, built on
@@ -482,7 +482,7 @@ async fn enter_natural(
     leaving: Level, exit: &crate::campaign::Exit, options: &Options,
 ) -> Result<(Entered, crate::movement::Player, Vec3, f32)> {
     crate::transition_memory::fault("level")?;
-    let visit = crate::campaign::arrive_async(assets, stats, campaign, leaving, exit, false).await?;
+    let visit = crate::campaign::arrive_async(assets, stats, campaign, leaving, exit, false, true).await?;
     let crate::campaign::NextVisit { map, entry, cached, loaded, player, eye, yaw, .. } = visit;
     let entered = finish_entered(assets, loaded, &map, entry.as_deref(), cached.as_ref(), options).await?;
     Ok((entered, player, eye, yaw))
@@ -537,7 +537,7 @@ pub(crate) async fn check_loading_screen(assets: &mut Assets, options: &Options)
         let load = crate::loading_screen::begin("death-retry", map);
         crate::loading_screen::released().await;
         let start = std::time::Instant::now();
-        let restored = Box::pin(save::Restored::build_async(assets, saved)).await?;
+        let restored = Box::pin(save::Restored::build_async(assets, saved, true)).await?;
         let mut art = LevelArt::default();
         art.prepare(assets, &restored.scene, &restored.interactions, true)?;
         crate::loading_screen::between("level_art_models_textures").await;
@@ -859,7 +859,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             println!("bench: loading auto save {}", loaded.game.current);
             startup_memory = Some(crate::transition_memory::Transition::begin(
                 "startup-entry", "menu", &loaded.game.level()?.map));
-            let restored = save::Restored::build(&mut assets, loaded.game.clone())?;
+            let restored = save::Restored::build_with_voices(&mut assets, loaded.game.clone())?;
             bench_restored = Some(restored);
             Ok(loaded)
         }) {
@@ -1103,7 +1103,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let restored = {
             // The restore build is its own load window; a failed one keeps nothing.
             let _share = crate::texture::load_scope();
-            save::Restored::build(&mut assets, loaded.game.clone())
+            save::Restored::build_with_voices(&mut assets, loaded.game.clone())
         };
         match restored {
             Ok(restored) => Some(restored),
@@ -1212,7 +1212,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         audio.load(&mut assets, &maps[current], &scene.map);
         {
             let _timing = crate::startup::Phase::new("startup_story_load");
-            story = crate::story::Story::load(&mut assets, &maps[current]);
+            story = crate::story::Story::load_with_voices(&mut assets, &maps[current], true);
             audio.install_story_voices(&mut story, &maps[current]);
         }
         crate::loading_screen::between("sound").await;
@@ -1460,7 +1460,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 let outgoing_alice = if crate::transition_memory::legacy_overlap() { Some(alice) } else { drop(alice); None };
                 crate::loading_screen::released().await;
                 memory.after_release();
-                let result = match Box::pin(save::Restored::build_async(&mut assets, incoming)).await {
+                let result = match Box::pin(save::Restored::build_async(&mut assets, incoming, true)).await {
                     Ok(restored) => {
                         apply_loaded!(restored, $pause, $install);
                         Ok(())

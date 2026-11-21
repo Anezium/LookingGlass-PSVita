@@ -1956,7 +1956,7 @@ impl Audio {
         #[cfg(feature = "vita_renderer")]
         if crate::render::vita_renderer::config().audio_voice_prefetch && self.playback.is_some() {
             let _timing = crate::startup::Phase::new("rollback_story_load");
-            let mut story = crate::story::Story::load(assets, map);
+            let mut story = crate::story::Story::load_with_voices(assets, map, true);
             self.install_story_voices(&mut story, map);
         }
         #[cfg(not(feature = "vita_renderer"))]

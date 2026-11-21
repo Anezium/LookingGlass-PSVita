@@ -51,7 +51,7 @@ const PCM_BYTES: usize = 4 * 1024 * 1024;
 const WAV_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "vita_renderer")]
-fn decode(bytes: Vec<u8>, remaining: usize) -> Option<Pcm> {
+fn decode(bytes: Vec<u8>, reserve: impl FnOnce(usize) -> bool) -> Option<Pcm> {
     let header = hound::WavReader::new(Cursor::new(bytes.as_slice())).ok()?;
     let spec = header.spec();
     if spec.channels == 0
@@ -64,11 +64,15 @@ fn decode(bytes: Vec<u8>, remaining: usize) -> Option<Pcm> {
         return None;
     }
     let count = header.len() as usize;
-    if count == 0 || count > remaining / size_of::<i16>() {
+    let size = count.checked_mul(size_of::<i16>())?;
+    if size == 0 || size > PCM_BYTES {
         return None;
     }
     let decoder = rodio::Decoder::new_wav(Cursor::new(bytes)).ok()?;
     let duration = decoder.total_duration()?;
+    if !reserve(size) {
+        return None;
+    }
     let mut samples = Vec::with_capacity(count);
     samples.extend(decoder.take(count));
     Some(Pcm {
@@ -84,26 +88,61 @@ fn decode(bytes: Vec<u8>, remaining: usize) -> Option<Pcm> {
 #[derive(Default)]
 pub(crate) struct Cache {
     clips: BTreeMap<String, Pcm>,
+    replies: Vec<String>,
     bytes: usize,
     decode_time: Duration,
+    first_lines: (usize, usize),
 }
 
 #[cfg(feature = "vita_renderer")]
 impl Cache {
-    pub(crate) fn add(&mut self, path: &str, wav: Vec<u8>) {
-        let remaining = PCM_BYTES - self.bytes;
-        if remaining < size_of::<i16>() || wav.len() > WAV_BYTES || self.clips.contains_key(path) {
+    pub(crate) fn add(&mut self, path: &str, wav: Vec<u8>, first_line: bool) {
+        if self.clips.contains_key(path) {
+            if first_line {
+                self.replies.retain(|reply| reply != path);
+            }
+            return;
+        }
+        if wav.len() > WAV_BYTES || (!first_line && self.bytes == PCM_BYTES) {
             return;
         }
         let started = std::time::Instant::now();
-        if let Some(clip) = decode(wav, remaining) {
+        if let Some(clip) = decode(wav, |size| self.reserve(size, first_line)) {
             self.bytes += clip.samples.capacity() * size_of::<i16>();
             self.clips.insert(path.to_owned(), clip);
+            if !first_line {
+                self.replies.push(path.to_owned());
+            }
         }
         self.decode_time += started.elapsed();
     }
 
-    pub(crate) fn retain(&mut self, registered: impl Fn(&str) -> bool) {
+    fn reserve(&mut self, size: usize, first_line: bool) -> bool {
+        let mut remaining = PCM_BYTES - self.bytes;
+        if size <= remaining {
+            return true;
+        }
+        if first_line {
+            // Establish that the line fits before removing any useful replies.
+            for (index, path) in self.replies.iter().enumerate().rev() {
+                remaining += self.clips[path].samples.capacity() * size_of::<i16>();
+                if size <= remaining {
+                    for reply in self.replies.drain(index..) {
+                        let clip = self.clips.remove(&reply).unwrap();
+                        self.bytes -= clip.samples.capacity() * size_of::<i16>();
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn retain<'a>(
+        &mut self,
+        registered: impl Fn(&str) -> bool,
+        first_lines: impl Iterator<Item = &'a str>,
+    ) {
         self.clips.retain(|path, clip| {
             if registered(path) {
                 return true;
@@ -111,11 +150,19 @@ impl Cache {
             self.bytes -= clip.samples.capacity() * size_of::<i16>();
             false
         });
+        self.replies.retain(|path| registered(path));
+        self.first_lines = first_lines.fold((0, 0), |(cached, total), path| {
+            (
+                cached + usize::from(self.clips.contains_key(path)),
+                total + 1,
+            )
+        });
     }
 
     pub(super) fn install(self, map: &str) -> BTreeMap<String, Pcm> {
+        let (cached, total) = self.first_lines;
         eprintln!(
-            "[lg/story-voice-prefetch] map={map} clips={} bytes={} cap_bytes={PCM_BYTES} ms={:.3}",
+            "[lg/story-voice-prefetch] map={map} clips={} bytes={} cap_bytes={PCM_BYTES} ms={:.3} first_lines={cached}/{total}",
             self.clips.len(),
             self.bytes,
             self.decode_time.as_secs_f64() * 1000.
@@ -144,16 +191,62 @@ mod tests {
             }
             writer.finalize().unwrap();
             let bytes = bytes.into_inner();
-            assert!(decode(bytes.clone(), 1999).is_none());
-            let prefetched = decode(bytes.clone(), 2000).unwrap();
+            assert!(decode(bytes.clone(), |size| size <= 1999).is_none());
+            let prefetched = decode(bytes.clone(), |size| size == 2000).unwrap();
             for seconds in [0., 0.000031, 0.01337, 0.25] {
                 let offset = Duration::from_secs_f32(seconds);
                 let baseline = rodio::Decoder::new(Cursor::new(bytes.clone())).unwrap();
                 assert_eq!(baseline.total_duration(), prefetched.total_duration());
-                assert!(baseline
-                    .skip_duration(offset)
-                    .eq(prefetched.clone().skip_duration(offset)));
+                assert!(
+                    baseline
+                        .skip_duration(offset)
+                        .eq(prefetched.clone().skip_duration(offset))
+                );
             }
         }
+    }
+
+    #[test]
+    fn first_lines_evict_newest_replies_from_a_saturated_map() {
+        // Eight equal clips fit exactly after expanding 8-bit WAV to i16 PCM.
+        let mut bytes = Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(
+            &mut bytes,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 22050,
+                bits_per_sample: 8,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..PCM_BYTES / 16 {
+            writer.write_sample(0_i8).unwrap();
+        }
+        writer.finalize().unwrap();
+        let bytes = bytes.into_inner();
+        let mut cache = Cache::default();
+        cache.add("opening", bytes.clone(), true);
+        for i in 1..=7 {
+            cache.add(&format!("reply-{i}"), bytes.clone(), false);
+        }
+        assert_eq!(cache.bytes, PCM_BYTES);
+
+        cache.add("reply-7", bytes.clone(), true);
+        cache.add("late-opening", bytes.clone(), true);
+        assert!(!cache.clips.contains_key("reply-6"));
+        assert!(cache.clips.contains_key("reply-5"));
+        for i in 1..=5 {
+            cache.add(&format!("reply-{i}"), bytes.clone(), true);
+        }
+        cache.add("extra-opening", bytes, true);
+        assert_eq!(cache.bytes, PCM_BYTES);
+        assert_eq!(cache.clips.len(), 8);
+        assert!(!cache.clips.contains_key("extra-opening"));
+        cache.retain(
+            |_| true,
+            ["opening", "reply-7", "late-opening", "extra-opening"].into_iter(),
+        );
+        assert_eq!(cache.first_lines, (3, 4));
     }
 }

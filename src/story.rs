@@ -427,18 +427,22 @@ impl Story {
         Ok(())
     }
     pub fn load(assets: &mut Assets, map: &str) -> Self {
+        Self::load_with_voices(assets, map, false)
+    }
+
+    pub(crate) fn load_with_voices(assets: &mut Assets, map: &str, _install_voices: bool) -> Self {
         let _r13_memory = crate::allocation_census::Scope::new(5);
         let mut s = Self {
             map: map.into(),
             ..Self::default()
         };
         #[cfg(feature = "vita_renderer")]
-        let mut cache = crate::render::vita_renderer::config().audio_voice_prefetch
+        let mut cache = (_install_voices && crate::render::vita_renderer::config().audio_voice_prefetch)
             .then(crate::audio::voice::Cache::default);
-        let mut prefetch = |_path: &str, _wav: Vec<u8>| {
+        let mut prefetch = |_path: &str, _wav: Vec<u8>, _first_line: bool| {
             #[cfg(feature = "vita_renderer")]
             if let Some(cache) = &mut cache {
-                cache.add(_path, _wav);
+                cache.add(_path, _wav, _first_line);
             }
         };
         let table = assets
@@ -461,13 +465,16 @@ impl Story {
                     watches.len() == spec.source_lines,
                     "Headwatch/dialogue count differs"
                 );
+                let first_function = s.available.get(event).is_none_or(|sequence| sequence.lines.is_empty());
                 reviewed_calls(&text, spec)?
                     .into_iter()
                     .map(|(index, call)| (call, watches[index].clone()))
-                    .map(|((actor, path), watches)| {
+                    .enumerate()
+                    .map(|(index, ((actor, path), watches))| {
                         let reviewed = !matches!(spec.calls, registry::Calls::Legacy);
                         let mut line = load_line_with_voice(
-                            assets, &table, actor, path, reviewed, &mut prefetch,
+                            assets, &table, actor, path, reviewed,
+                            &mut |path, wav| prefetch(path, wav, first_function && index == 0),
                         )?;
                         line.watches = watches;
                         Ok(line)
@@ -504,7 +511,8 @@ impl Story {
                     {
                         if let Some(path) = e.get("target").filter(|p| voice_path(p)) {
                             if let Ok(line) = load_line_with_voice(
-                                assets, &table, String::new(), path.clone(), false, &mut prefetch,
+                                assets, &table, String::new(), path.clone(), false,
+                                &mut |path, wav| prefetch(path, wav, true),
                             )
                             {
                                 s.available.insert(
@@ -526,7 +534,9 @@ impl Story {
             let registered: BTreeSet<_> = s.available.values()
                 .flat_map(|sequence| sequence.lines.iter().map(|line| line.path.as_str()))
                 .collect();
-            cache.retain(|path| registered.contains(path));
+            let first_lines = s.available.values()
+                .filter_map(|sequence| sequence.lines.first().map(|line| line.path.as_str()));
+            cache.retain(|path| registered.contains(path), first_lines);
             s.prefetched_voices = Some(cache);
         }
         println!(

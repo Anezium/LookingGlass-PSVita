@@ -249,7 +249,7 @@ pub fn load_visit(
     difficulty: Difficulty,
     play_entry: bool,
 ) -> Result<Loaded> {
-    crate::loading_screen::run_ready(load_visit_async(assets, name, entry, cached, difficulty, play_entry))
+    crate::loading_screen::run_ready(load_visit_async(assets, name, entry, cached, difficulty, play_entry, false))
 }
 
 /// `load_visit` with its two stage boundaries open to a loading frame.
@@ -260,6 +260,7 @@ pub async fn load_visit_async(
     cached: Option<&Level>,
     difficulty: Difficulty,
     play_entry: bool,
+    install_voices: bool,
 ) -> Result<Loaded> {
     let mut timing = crate::startup::Phase::new("campaign_map_load");
     let bytes = assets.read(&format!("maps/{name}.bsp"))?;
@@ -276,13 +277,13 @@ pub async fn load_visit_async(
     let (mut interactions, mut story, hints) = if let Some(saved) = cached {
         let mut saved = saved.clone();
         saved.entry = entry.map(str::to_owned);
-        saved.restore_logic(assets, &map)?
+        saved.restore_logic_with_voices(assets, &map, install_voices)?
     } else {
         let mut i = Interactions::load(&map)?;
         i.set_entry(assets, &map, name, entry)?;
         (
             i,
-            Story::load(assets, name),
+            Story::load_with_voices(assets, name, install_voices),
             Hints::load(assets, &map, name)?,
         )
     };
@@ -338,7 +339,7 @@ pub fn arrive(
     exit: &Exit,
     strict: bool,
 ) -> Result<NextVisit> {
-    crate::loading_screen::run_ready(arrive_async(assets, stats, ledger, leaving, exit, strict))
+    crate::loading_screen::run_ready(arrive_async(assets, stats, ledger, leaving, exit, strict, false))
 }
 
 /// `arrive` with `load_visit`'s stage boundaries open to a loading frame.
@@ -349,11 +350,12 @@ pub async fn arrive_async(
     leaving: Level,
     exit: &Exit,
     strict: bool,
+    install_voices: bool,
 ) -> Result<NextVisit> {
     let (name, entry) = (exit.0.as_str(), exit.1.as_deref());
     let key = save::visit_key(name, entry);
     let cached = ledger.levels.get(&key).cloned();
-    let loaded = load_visit_async(assets, name, entry, cached.as_ref(), stats.difficulty, true).await?;
+    let loaded = load_visit_async(assets, name, entry, cached.as_ref(), stats.difficulty, true, install_voices).await?;
     let (eye, yaw) = interaction::spawn(&loaded.map, entry);
     let player = clear_entrance(&loaded.world, eye, &key)?;
     ledger.completed.insert(leaving.key());
