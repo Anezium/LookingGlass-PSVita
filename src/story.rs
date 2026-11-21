@@ -435,7 +435,7 @@ impl Story {
         #[cfg(feature = "vita_renderer")]
         let mut cache = crate::render::vita_renderer::config().audio_voice_prefetch
             .then(crate::audio::voice::Cache::default);
-        let mut prefetch = |_path: &str, _wav: &[u8]| {
+        let mut prefetch = |_path: &str, _wav: Vec<u8>| {
             #[cfg(feature = "vita_renderer")]
             if let Some(cache) = &mut cache {
                 cache.add(_path, _wav);
@@ -875,7 +875,7 @@ fn load_line_with_voice(
     actor: String,
     path: String,
     reviewed: bool,
-    prefetch: &mut impl FnMut(&str, &[u8]),
+    prefetch: &mut impl FnMut(&str, Vec<u8>),
 ) -> Result<Line> {
     let text = table.get(&path).context("No matching subtitle")?.clone();
     if reviewed {
@@ -891,7 +891,7 @@ fn load_line_with_voice(
                 "Invalid dialogue duration"
             );
         }
-        prefetch(&path, &bytes);
+        prefetch(&path, bytes);
         Ok(duration)
     });
     let duration = if reviewed {

@@ -51,8 +51,8 @@ const PCM_BYTES: usize = 4 * 1024 * 1024;
 const WAV_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "vita_renderer")]
-fn decode(bytes: &[u8], remaining: usize) -> Option<Pcm> {
-    let header = hound::WavReader::new(Cursor::new(bytes)).ok()?;
+fn decode(bytes: Vec<u8>, remaining: usize) -> Option<Pcm> {
+    let header = hound::WavReader::new(Cursor::new(bytes.as_slice())).ok()?;
     let spec = header.spec();
     if spec.channels == 0
         || spec.sample_rate == 0
@@ -90,7 +90,7 @@ pub(crate) struct Cache {
 
 #[cfg(feature = "vita_renderer")]
 impl Cache {
-    pub(crate) fn add(&mut self, path: &str, wav: &[u8]) {
+    pub(crate) fn add(&mut self, path: &str, wav: Vec<u8>) {
         let remaining = PCM_BYTES - self.bytes;
         if remaining < size_of::<i16>() || wav.len() > WAV_BYTES || self.clips.contains_key(path) {
             return;
@@ -144,8 +144,8 @@ mod tests {
             }
             writer.finalize().unwrap();
             let bytes = bytes.into_inner();
-            assert!(decode(&bytes, 1999).is_none());
-            let prefetched = decode(&bytes, 2000).unwrap();
+            assert!(decode(bytes.clone(), 1999).is_none());
+            let prefetched = decode(bytes.clone(), 2000).unwrap();
             for seconds in [0., 0.000031, 0.01337, 0.25] {
                 let offset = Duration::from_secs_f32(seconds);
                 let baseline = rodio::Decoder::new(Cursor::new(bytes.clone())).unwrap();
