@@ -110,7 +110,7 @@ fn compatible_pair(base: &Pass, bu: &[f32; UNIFORM_FLOATS], glow: &Pass, gu: &[f
         && bu[..32] == gu[..32] && bu[..32].iter().all(|x| x.is_finite())
         && bu[48..52] == [0.; 4] && gu[48..52] == [0.; 4]
         && if lit {
-            actor_lean::admitted_lit(base, bu) && actor_lean::admitted_lit(glow, gu)
+            actor_lean::admitted_lit(base, bu, true) && actor_lean::admitted_lit(glow, gu, true)
                 && actor_lean::bounded_glow_lights(gu)
         } else {
             actor_lean::admitted(base, bu) && actor_lean::admitted(glow, gu)

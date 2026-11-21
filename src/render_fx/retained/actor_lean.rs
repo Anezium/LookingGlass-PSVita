@@ -85,8 +85,8 @@ pub(super) fn admitted(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
     !has_lights(u, 0) && lean_material(p, u)
 }
 
-pub(super) fn admitted_lit(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
-    p.lit && has_lights(u, 0) && !has_lights(u, 2) && lean_material(p, u)
+pub(super) fn admitted_lit(p: &Pass, u: &[f32; UNIFORM_FLOATS], culled_to_zero: bool) -> bool {
+    p.lit && (culled_to_zero || has_lights(u, 0)) && !has_lights(u, 2) && lean_material(p, u)
 }
 
 fn has_lights(u: &[f32; UNIFORM_FLOATS], first: usize) -> bool {
@@ -343,9 +343,9 @@ mod tests {
         let p = pass();
         let mut u = payload(&p);
         u[LIGHTS + 15] = 1.;
-        assert!(admitted_lit(&p, &u));
+        assert!(admitted_lit(&p, &u, false));
         u[LIGHTS + 23] = 1.;
-        assert!(!admitted_lit(&p, &u));
+        assert!(!admitted_lit(&p, &u, false));
     }
 
     #[test]
@@ -361,7 +361,7 @@ mod tests {
         put(&mut u, 3, -10., 4.);
         assert!(!cull_lights(&p, &mut u));
         assert_eq!((u[LIGHTS + 4], u[LIGHTS + 12]), (2., 4.));
-        assert!(admitted_lit(&p, &u));
+        assert!(admitted_lit(&p, &u, false));
         assert!(!admitted(&p, &u));
 
         let mut u = payload(&p);
@@ -372,6 +372,8 @@ mod tests {
         p.mesh.vertices[0].position = Vec3::ZERO;
         assert!(cull_lights(&p, &mut u));
         assert!(admitted(&p, &u));
+        assert!(!admitted_lit(&p, &u, false));
+        assert!(admitted_lit(&p, &u, true));
     }
 
     #[test]

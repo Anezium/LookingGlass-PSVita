@@ -582,8 +582,9 @@ impl Gpu {
                 .map_err(|e| eprintln!("[lg/vita-renderer] warning {} program failed, key off: {e:?}", add_program::NAMES[i])).ok()
         }).flatten().map(|shader| Lite { uniforms: UniformCache::default(), shader, pipelines: BTreeMap::new(), fields: crate::render::uniform_fields::Cache::new(meta()) }));
         let sources = actor_lean::sources();
+        let lit_variant = c.actor_lean_lights || c.actor_light_cull && c.actor_lean_shader;
         let actor_fragments = [0, 1, 2, 3].map(|i| {
-            (if i < 2 { c.actor_lean_shader } else { c.actor_lean_lights }).then(|| {
+            (if i < 2 { c.actor_lean_shader } else { lit_variant }).then(|| {
                 let source = if i < 2 { sources[i].clone() } else { actor_lean::lit_source(i == 3) };
                 crate::environment::fragment(&source)
             })
@@ -609,8 +610,8 @@ impl Gpu {
                     corpse_opaque.is_some().then(|| crate::lighting::fragment(&crate::environment::fragment(&super::corpse_opaque::fragment()))),
                     actor_fragments[0].clone().filter(|_| actor_lean[0].is_some()),
                     actor_fragments[1].clone().filter(|_| actor_lean[1].is_some()),
-                    actor_fragments[2].clone().filter(|_| actor_lean[2].is_some()),
-                    actor_fragments[3].clone().filter(|_| actor_lean[3].is_some()),
+                    actor_fragments[2].clone().filter(|_| c.actor_lean_lights && actor_lean[2].is_some()),
+                    actor_fragments[3].clone().filter(|_| c.actor_lean_lights && actor_lean[3].is_some()),
                 ]).map_err(|e|eprintln!("[lg/gpu-skin] CPU fallback: {e:#}")).ok()
             }).flatten(),
             pipelines: BTreeMap::new(),
@@ -825,12 +826,14 @@ impl Gpu {
             .unwrap_or_else(|| route(p, opaque, self.lite.is_some()));
         let program = actor_lean_route(program,
             [0, 1].map(|i| self.actor_lean[i].as_ref().is_some_and(|l| l.pipelines.contains_key(&key))),
-            false, || actor_lean::admitted(p, u));
-        let program = if c.actor_lean_lights {
+            false, || !culled_to_zero && actor_lean::admitted(p, u));
+        // Keep the RGB light-add expression after a cull to zero. Omitting it
+        // changed native GL rounding on a replay even with a zero light sum.
+        let program = if c.actor_lean_lights || culled_to_zero && c.actor_lean_shader {
             actor_lean_route(program, [2, 3].map(|i| {
                 self.actor_lean[i].as_ref().is_some_and(|l| l.pipelines.contains_key(&key))
                     && (p.gpu_skin.is_none() || self.skin.as_ref().is_some_and(|skin| skin.supports(i + 2)))
-            }), true, || actor_lean::admitted_lit(p, u))
+            }), true, || actor_lean::admitted_lit(p, u, culled_to_zero))
         } else { program };
         let variant = match program {
             Route::CorpseOpaque => 1, Route::ActorLean => 2, Route::ActorLeanOpaque => 3,
