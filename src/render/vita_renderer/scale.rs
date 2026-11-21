@@ -273,6 +273,7 @@ void main(){gl_FragColor=vec4(texture2D(Texture,vec2(uv.x,1.-uv.y)).rgb,1.);}"#;
 fn cropped_upscale() -> Material {
     let v = if cfg!(target_os = "vita") { "1.-sample_uv.y" } else { "sample_uv.y" };
     let fragment = format!(r#"#version 100
+precision highp float;
 varying mediump vec2 uv; uniform sampler2D Texture; uniform vec4 Crop;
 void main(){{
     vec2 sample_uv=clamp(uv*Crop.xy,Crop.zw,Crop.xy-Crop.zw);
