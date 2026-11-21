@@ -159,6 +159,7 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/gpu_timing.rs:241` | `query_fence` | diagnostic | Frame end or render-pass timing. Keep graphics hooks and frame completion on the owner. See line 265. |
 | `src/gpu_timing.rs:242` | `gxm_render_target` | diagnostic | Frame end or render-pass timing. Keep graphics hooks and frame completion on the owner. See line 283. |
 | `src/gpu_timing.rs:268` | `VERTEX` | diagnostic | Frame end or render-pass timing. Keep graphics hooks and frame completion on the owner. See line 302. |
+| `src/gpu_timing.rs:313` | `CAP_30` | diagnostic | The game thread sets the optional display queue interval before vitaGL starts. The Vita display callback reads it atomically. Simulation never accesses it. |
 | `src/hud.rs:544` | `ENABLED` | cache | Owner HUD tracing reads the cached host switch. Share its immutable value. See line 545. |
 | `src/input.rs:134` | `KEYS` | cache | No free-step poll. Owner capture resolves scripted binding fixtures into StepInput. See line 135. |
 | `src/interaction/hooks.rs:681` | `REG` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 696. |
