@@ -351,6 +351,19 @@ pub(crate) fn planner(kind: usize, ms: f64, expanded: u32, tests: u32) {
         *p = (p.0 + 1, p.1 + ms, p.2 + expanded, p.3 + tests);
     });
 }
+pub(crate) fn voice(path: &str, cached: bool, elapsed: std::time::Duration) {
+    let frame = FRAME.with(|f| {
+        let f = f.borrow();
+        f.begin.map(|_| f.number)
+    });
+    if let Some(frame) = frame {
+        let ms = elapsed.as_secs_f64() * 1000.;
+        OUT.with(|o| o.borrow_mut().push(|line| {
+            let _ = write!(line, "[lg/story-voice] frame={frame} cached={cached} ms={ms:.3} path={path}");
+        }));
+    }
+}
+
 /// A loader call outside any load phase. `name` is printed when given.
 pub(crate) fn late(kind: usize, ms: f64, name: Option<&str>, bytes: Option<usize>) {
     if !on() { return; }

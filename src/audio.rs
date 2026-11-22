@@ -13,6 +13,7 @@ pub mod events;
 mod reaction;
 pub mod regression;
 pub mod world;
+pub(crate) mod voice;
 use crate::{assets::Assets, bsp::Bsp, collision::World};
 use anyhow::{ensure, Context, Result};
 use macroquad::prelude::{vec3, Vec3};
@@ -1009,6 +1010,7 @@ pub struct Audio {
     playback: Option<Playback>,
     scene_presented: bool,
     voice: Option<Sink>,
+    story_voices: BTreeMap<String, voice::Pcm>,
     music: Option<(Sink, Music)>,
     emitters: Vec<Emitter>,
     effects: Vec<Effect>,
@@ -1150,6 +1152,7 @@ impl Audio {
             playback,
             scene_presented: true,
             voice: None,
+            story_voices: BTreeMap::new(),
             music: None,
             emitters: Vec::new(),
             effects: Vec::new(),
@@ -1212,6 +1215,7 @@ impl Audio {
         game_stage(5);
         let _stage=UpdateStage;
         self.stop_voice();
+        self.story_voices.clear();
         if let Some(cache) = &mut self.static_cache { cache.reset(); }
         if let Some(client) = self.playback.as_mut().and_then(|p| p.mixer.acoustics.as_mut()) { client.reset(); }
         self.retire_music();
@@ -1939,28 +1943,57 @@ impl Audio {
         sink.append(Decoder::new(Cursor::new(bytes))?);
         Ok(Some(sink))
     }
+    pub(crate) fn install_story_voices(&mut self, story: &mut crate::story::Story, map: &str) {
+        #[cfg(feature = "vita_renderer")]
+        if let Some(cache) = story.prefetched_voices.take().filter(|_| self.playback.is_some()) {
+            self.story_voices = cache.install(map);
+        }
+        #[cfg(not(feature = "vita_renderer"))]
+        let _ = (story, map);
+    }
+
+    pub(crate) fn reload_story_voices(&mut self, assets: &mut Assets, map: &str) {
+        #[cfg(feature = "vita_renderer")]
+        if crate::render::vita_renderer::config().audio_voice_prefetch && self.playback.is_some() {
+            let _timing = crate::startup::Phase::new("rollback_story_load");
+            let mut story = crate::story::Story::load_with_voices(assets, map, true);
+            self.install_story_voices(&mut story, map);
+        }
+        #[cfg(not(feature = "vita_renderer"))]
+        let _ = (assets, map);
+    }
+
     pub fn speak_from(&mut self, assets: &mut Assets, path: &str, seconds: f32) {
         self.stop_voice();
         let Some(playback) = &self.playback else {
             return;
         };
-        match assets
-            .read(path)
-            .and_then(|b| Ok(Decoder::new(Cursor::new(b))?))
-        {
-            Ok(clip) => {
-                let sink = playback.sink();
-                sink.set_volume(if self.settings.muted {
-                    0.
-                } else {
-                    self.settings.effects
-                });
-                sink.append(clip.skip_duration(Duration::from_secs_f32(seconds.max(0.))));
-                self.voice = Some(sink);
-                println!("Dialogue voice: {path}");
+        let started = crate::spike_log::on().then(std::time::Instant::now);
+        let offset = Duration::from_secs_f32(seconds.max(0.));
+        let cached = self.story_voices.get(path);
+        let decoder = if cached.is_none() {
+            match assets.read(path).and_then(|b| Ok(Decoder::new(Cursor::new(b))?)) {
+                Ok(decoder) => Some(decoder),
+                Err(e) => {
+                    eprintln!("Dialogue voice unavailable: {e:#}");
+                    return;
+                }
             }
-            Err(e) => eprintln!("Dialogue voice unavailable: {e:#}"),
+        } else {
+            None
+        };
+        let sink = playback.sink();
+        sink.set_volume(if self.settings.muted { 0. } else { self.settings.effects });
+        if let Some(clip) = cached {
+            sink.append(clip.clone().skip_duration(offset));
+        } else if let Some(decoder) = decoder {
+            sink.append(decoder.skip_duration(offset));
         }
+        self.voice = Some(sink);
+        if let Some(started) = started {
+            crate::spike_log::voice(path, cached.is_some(), started.elapsed());
+        }
+        println!("Dialogue voice: {path}");
     }
     fn play_effect(&mut self, index: usize) {
         if let Some(path) = EFFECTS.get(index) {

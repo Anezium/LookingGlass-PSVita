@@ -112,6 +112,15 @@ impl Level {
         assets: &mut Assets,
         map: &Bsp,
     ) -> Result<(Interactions, Story, Hints)> {
+        self.restore_logic_with_voices(assets, map, false)
+    }
+
+    pub(crate) fn restore_logic_with_voices(
+        &self,
+        assets: &mut Assets,
+        map: &Bsp,
+        install_voices: bool,
+    ) -> Result<(Interactions, Story, Hints)> {
         validate_entry(map, self.entry.as_deref())?;
         let mut interactions = Interactions::load(map)?;
         interactions.set_entry(assets, map, &self.map, self.entry.as_deref())?;
@@ -119,7 +128,7 @@ impl Level {
         let mut hints = Hints::load(assets, map, &self.map)?;
         hints.restore(&self.hints)?;
         hints.sync(&interactions);
-        let mut story = Story::load(assets, &self.map);
+        let mut story = Story::load_with_voices(assets, &self.map, install_voices);
         story.restore(&self.story, &hints)?;
         Ok((interactions, story, hints))
     }
@@ -749,8 +758,10 @@ fn resume(
     map: &Bsp,
     world: &mut World,
     migrate: Migrations,
+    install_voices: bool,
 ) -> Result<Logic> {
-    let (mut interactions, story, hints) = level.restore_logic(assets, map)?;
+    let (mut interactions, story, hints) =
+        level.restore_logic_with_voices(assets, map, install_voices)?;
     for slot in &mut interactions.levels { slot.ctl.restore_position(&game.player, map)?; }
     settle(
         game,
@@ -834,7 +845,7 @@ pub fn rebuild_headless(assets: &mut Assets, mut game: Game) -> Result<Headless>
     // `Scene::load` builds its world before the saved difficulty is applied to the map.
     let mut world = World::from_bsp(&map)?;
     map.difficulty = game.stats.difficulty;
-    let logic = resume(assets, &mut game, &level, &map, &mut world, migrate)?;
+    let logic = resume(assets, &mut game, &level, &map, &mut world, migrate, false)?;
     Ok(Headless {
         game,
         level,
@@ -845,10 +856,14 @@ pub fn rebuild_headless(assets: &mut Assets, mut game: Game) -> Result<Headless>
 }
 impl Restored {
     pub fn build(assets: &mut Assets, game: Game) -> Result<Self> {
-        crate::loading_screen::run_ready(Self::build_async(assets, game))
+        crate::loading_screen::run_ready(Self::build_async(assets, game, false))
+    }
+
+    pub fn build_with_voices(assets: &mut Assets, game: Game) -> Result<Self> {
+        crate::loading_screen::run_ready(Self::build_async(assets, game, true))
     }
     /// `build` with its stage boundaries open to a loading frame.
-    pub async fn build_async(assets: &mut Assets, mut game: Game) -> Result<Self> {
+    pub async fn build_async(assets: &mut Assets, mut game: Game, install_voices: bool) -> Result<Self> {
         let mut timing = crate::startup::Phase::new("save_restore");
         let (level, migrate) = prepare(assets, &mut game, true)?;
         timing.mark("prepare_migrate");
@@ -869,6 +884,7 @@ impl Restored {
             &scene.map,
             &mut scene.world,
             migrate,
+            install_voices,
         )?;
         timing.mark("logic_story_hints");
         crate::loading_screen::between("logic_story_hints").await;
