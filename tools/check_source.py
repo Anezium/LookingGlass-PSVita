@@ -165,6 +165,7 @@ PINNED_FILES = {
     "configs/PL-v11-2-play.json": "ca05c67c86db0af20a745eaca991d0e4aeefff7719d54ced8063ed4947a6131a",
     "configs/PL-v11-2-ship.json": "37a6cf2f5b7c5e861bb5d0a563010102deb603c929c01fd006148907f23eb993",
     "configs/PL-v11-2b-ship.json": "89b991183df1fe3a3f7c2e89976f0bd28de0a1341a32754c3aca5efbe779a59c",
+    "configs/PL-v11-2c-ship.json": "2055a5862e86bc6449e1ad1ec9467a72f02c127e529f118ef98369a7e6fb662b",
     # Tooling, licence texts and test fixtures.
     "tools/config_record/fixtures/host-bad.json": "0baa0c4b95907662865e70a9946f546c486fca6e3808dc64bab650a16b2b5912",
     "tools/config_record/fixtures/host-bad.txt": "9744a970a2ce54da3cfc3de774339a1989d6b1e4207fafe0b5686329089d0da5",
