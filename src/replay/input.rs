@@ -390,6 +390,14 @@ pub(crate) mod epoch_taps {
                  EPOCH.load(Relaxed));
     }
 
+    /// The head yielded to owner work (loading, a menu, a movie): its presented epoch, if any,
+    /// belongs to the owner. Printed between this head's line and the next head's.
+    pub(crate) fn log_yield() {
+        if enabled() {
+            println!("LIVE_EPOCH_YIELD");
+        }
+    }
+
     /// The clock the step runs with, after the head's refresh or latch.
     pub(crate) fn log_clock(frame_index: u64, clock_bits: u64, latched: bool) {
         if enabled() {

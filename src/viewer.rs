@@ -1464,6 +1464,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             input.refresh_controls();
             // The owner's framework frames are not carried into the next step (as key off).
             lag_epochs.yielded();
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            crate::replay::input::epoch_taps::log_yield();
             if in_step {
                 let step = StepGuard::enter();
                 $guards = Some((step, ClockView::capture().enter()));

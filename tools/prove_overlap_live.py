@@ -111,7 +111,13 @@ def epochs(stdout, owner_frames=()):
     """Tap accounting per framework epoch. `owner_frames` are heads that left for owner work (a
     scheduled exit, menu action, retry or New Game): when such a head presented its retained frame
     first, the presented epoch belongs to the owner's loading or menu frames and reaches no step, as
-    with the key off (review S34 F3). Those epochs, and only those, may be absent."""
+    with the key off (review S34 F3). Each exemption must hold for its reason at that exact head: it
+    is scheduled, its previous frame has a `pending` event (it presented that frame), it yielded to
+    the owner (`LIVE_EPOCH_YIELD` after its head line) and it left: the next head is a later frame.
+    A death retry yields and then runs its frame again, and that re-run head captures the presented
+    epoch, so a retry is not exempt. Those epochs must be absent, and only those: a carried F3 epoch
+    fails, and so does a tap lost at any other head, such as the first step of a lag visit entered
+    from an unlisted map (REVIEW-FIXES-S10 R4)."""
     heads = [(int(m[1]), int(m[2]), int(m[3], 16), int(m[4]), m[5] == 'true')
              for line in stdout if (m := HEAD.match(line))]
     assert heads, 'no live epoch heads'
@@ -127,9 +133,24 @@ def epochs(stdout, owner_frames=()):
     by_frame = {}
     for frame, epoch, *_ in heads:
         by_frame.setdefault(frame, epoch)
-    owner_epochs = {by_frame[f] + 1 for f in owner_frames if f in by_frame}
+    rows = [json.loads(line.split(' ', 1)[1]) for line in stdout if line.startswith('SIM_EVENT ')]
+    pending = {row['frame'] for row in rows if row.get('event') == 'pending'}
+    assert pending, 'no pending events: the tap accounting needs LOOKING_GLASS_SIM_AUDIT'
+    # Heads that yielded to the owner and then left: the next head line is a later frame.
+    left, head, did_yield = set(), None, False
+    for line in stdout:
+        if (m := HEAD.match(line)):
+            if head is not None and did_yield and int(m[1]) > head:
+                left.add(head)
+            head, did_yield = int(m[1]), False
+        elif line == 'LIVE_EPOCH_YIELD' and head is not None:
+            did_yield = True
+    owner_heads = sorted(f for f in owner_frames if f in by_frame and f - 1 in pending and f in left)
+    owner_epochs = {by_frame[f] + 1 for f in owner_heads}
     owner = sorted(e for e in window if delivered[e] == 0 and e in owner_epochs)
     lost = sorted(e for e in window if delivered[e] == 0 and e not in owner_epochs)
+    assert owner == sorted(owner_epochs), ('owner-consumed epochs differ from the scheduled heads that '
+                                           'presented a retained frame', owner, sorted(owner_epochs))
     latched = [i for i, head in enumerate(heads) if head[4]]
     # A latched head delivers no edge and runs its step on the previous step's clock.
     clocks = [(int(m[1]), int(m[2]), m[3] == 'true') for line in stdout if (m := CLOCK.match(line))]
@@ -141,6 +162,7 @@ def epochs(stdout, owner_frames=()):
     assert all(held == (frame in set(latched_frames)) for frame, _, held in clocks), 'latch mismatch'
     carried = sum(1 for _, _, taps, _, _ in heads if bin(taps).count('1') > 1)
     return dict(heads=len(heads), epochs=len(window), duplicated=duplicated, lost=lost, owner_consumed=owner,
+                owner_heads=owner_heads,
                 latched_heads=len(latched), latched_clock_and_no_edges=clocks_held,
                 carried_heads=carried)
 
