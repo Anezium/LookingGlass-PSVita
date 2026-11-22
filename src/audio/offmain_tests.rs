@@ -209,8 +209,8 @@ fn map_mixed_output_is_sample_exact() -> Result<()> {
         let mut world = World::from_bsp(&map)?;
         let (mut a, ma) = setup(false);
         let (mut b, mb) = setup(true);
-        a.load(&mut assets, name, &map);
-        b.load(&mut assets, name, &map);
+        a.load(&mut assets, name, &map, false);
+        b.load(&mut assets, name, &map, false);
         a.scene_presented();
         b.scene_presented();
         compare(a, ma, b, mb, Some(&mut assets), &mut world, name, eye, 120);
@@ -325,7 +325,7 @@ fn census_map_output_is_sample_exact() -> Result<()> {
         let map = Bsp::parse(&assets.read(&format!("maps/{name}.bsp"))?)?;
         let mut world = World::from_bsp(&map)?;
         let (mut a,ma)=setup(false);let (mut b,mb)=setup(false);
-        a.load(&mut assets,name,&map);b.load(&mut assets,name,&map);
+        a.load(&mut assets,name,&map, false);b.load(&mut assets,name,&map, false);
         a.scene_presented();b.scene_presented();
         compare(a,ma,b,mb,Some(&mut assets),&mut world,name,Vec3::ZERO,120);
     }
@@ -346,7 +346,7 @@ fn static_cache_map_output_is_sample_exact() -> Result<()> {
         let mut world = World::from_bsp(&map)?;
         let (mut a,ma)=setup(false);let (mut b,mb)=setup(false);
         a.static_cache=None;b.static_cache=Some(Box::new(static_cache::Cache::new()));
-        a.load(&mut assets,name,&map);b.load(&mut assets,name,&map);
+        a.load(&mut assets,name,&map, false);b.load(&mut assets,name,&map, false);
         a.scene_presented();b.scene_presented();
         compare(a,ma,b,mb,Some(&mut assets),&mut world,name,eye,120);
     }
