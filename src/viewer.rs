@@ -1011,6 +1011,22 @@ fn start_checkpoint_writer(
     }
 }
 
+fn finish_checkpoint_unretained(
+    pending_checkpoint: &mut Option<save::PendingCheckpoint>,
+    retained_frame: bool,
+    wait: bool,
+    interactions: &mut Interactions,
+    retry: &mut recovery::RetryPoint,
+) -> Option<String> {
+    if pending_checkpoint.is_some() {
+        assert!(
+            !retained_frame,
+            "pending checkpoint completion cannot announce over a retained frame"
+        );
+    }
+    finish_checkpoint(pending_checkpoint, wait, interactions, retry)
+}
+
 fn finish_checkpoint(
     pending: &mut Option<save::PendingCheckpoint>,
     wait: bool,
@@ -1775,8 +1791,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     }
     macro_rules! finish_checkpoint {
         ($wait:expr) => {
-            if let Some(message) = finish_checkpoint(
-                &mut pending_checkpoint, $wait, &mut interactions, &mut retry,
+            if let Some(message) = finish_checkpoint_unretained(
+                &mut pending_checkpoint, pending.is_some(), $wait, &mut interactions, &mut retry,
             ) {
                 hud.announce(message);
             }
@@ -3594,6 +3610,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             ("quit", quit_after_frame),
             ("menu_save", pending_menu_save.is_some()),
             ("menu_newgame", pending_menu_newgame.is_some()),
+            ("pending_checkpoint", pending_checkpoint.is_some()),
             ("context", context_before != (menu, inventory_menu, console.open, paused)),
             ("visit", frame_stamp.frame.visit_id != level_art.snapshot_visit.id()),
             ("retained_renderer", !scene.retained_active()),
@@ -6131,6 +6148,121 @@ mod reference_input_tests {
         assert!(marker.is_file());
         assert!(store.latest().unwrap().1.game.campaign.completed.contains("qlair$first"));
         assert_eq!(retry.game_for(&game.current).unwrap().current, game.current);
+    }
+
+    #[test]
+    fn finish_checkpoint_unretained_allows_idle_slot_with_retained_frame() {
+        let mut pending = None;
+        let mut interactions = save::tests::requesting_interactions();
+        let mut retry = recovery::RetryPoint::default();
+        assert!(finish_checkpoint_unretained(
+            &mut pending,
+            true,
+            false,
+            &mut interactions,
+            &mut retry,
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "pending checkpoint completion cannot announce over a retained frame")]
+    fn finish_checkpoint_unretained_rejects_retained_frame_while_pending() {
+        use save::{format12::Scratch, tests::{gated_writer, jlair2_game, requesting_interactions}};
+
+        let scratch = Scratch::new("checkpoint-hud-bleed-guard");
+        let (writer, _active, release) = gated_writer(scratch.store());
+        let game = jlair2_game();
+        let mut interactions = requesting_interactions();
+        let mut retry = recovery::RetryPoint::default();
+        let mut pending = Some(
+            writer
+                .submit(game.clone(), None, &mut interactions, |_| game.clone())
+                .unwrap(),
+        );
+        let _ = release.send(());
+        let _ = finish_checkpoint_unretained(
+            &mut pending,
+            true,
+            true,
+            &mut interactions,
+            &mut retry,
+        );
+    }
+
+    #[test]
+    fn delayed_checkpoint_fences_lag_until_success_and_failure() {
+        use save::{format12::Scratch, tests::{gated_writer, jlair2_game, requesting_interactions}};
+        use std::time::Duration;
+
+        for fail in [false, true] {
+            let scratch = Scratch::new(if fail {
+                "checkpoint-delayed-fence-fail"
+            } else {
+                "checkpoint-delayed-fence-ok"
+            });
+            let store = scratch.store();
+            let initial = jlair2_game();
+            store.write(Slot::Auto, &initial).unwrap();
+            let mut checkpoint = initial.clone();
+            checkpoint.view.yaw = 1.5;
+            let (writer, active, release) = gated_writer(scratch.store());
+            let mut interactions = requesting_interactions();
+            let mut retry = recovery::RetryPoint::default();
+            retry.remember(initial.clone());
+            let mut pending = Some(
+                writer
+                    .submit(checkpoint.clone(), None, &mut interactions, |_| {
+                        checkpoint.clone()
+                    })
+                    .unwrap(),
+            );
+            active.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(pending.is_some());
+            assert!(finish_checkpoint_unretained(
+                &mut pending,
+                false,
+                false,
+                &mut interactions,
+                &mut retry,
+            )
+            .is_none());
+            assert!(pending.is_some());
+            assert_eq!(
+                retry.game_for(&initial.current).unwrap().view.yaw,
+                initial.view.yaw
+            );
+            if fail {
+                std::fs::remove_dir_all(&scratch.0).unwrap();
+                std::fs::write(&scratch.0, b"blocked").unwrap();
+            }
+            release.send(()).unwrap();
+            let message = finish_checkpoint_unretained(
+                &mut pending,
+                false,
+                true,
+                &mut interactions,
+                &mut retry,
+            );
+            assert!(pending.is_none());
+            if fail {
+                assert!(message
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("Checkpoint save failed:")));
+                assert!(interactions.levels[0].ctl.checkpoint_requested());
+                assert_eq!(
+                    retry.game_for(&initial.current).unwrap().view.yaw,
+                    initial.view.yaw
+                );
+            } else {
+                assert_eq!(message.as_deref(), Some("Checkpoint saved"));
+                assert!(!interactions.levels[0].ctl.checkpoint_requested());
+                assert_eq!(
+                    retry.game_for(&checkpoint.current).unwrap().view.yaw,
+                    checkpoint.view.yaw
+                );
+            }
+        }
     }
 
     #[test]
