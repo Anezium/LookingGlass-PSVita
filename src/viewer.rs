@@ -2474,6 +2474,12 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         );
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         crate::replay::input::epoch_taps::log_head(frame, &step_input.frame, step_input.clock_bits, latched_epoch);
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        if crate::replay::input::live_keys::enabled() {
+            println!("LIVE_UI frame={frame} t={:.3} map={} paused={paused} menu={menu} inventory={inventory_menu} \
+                escape={} alive={} scripted={} muted={}", macroquad::time::get_time(), maps[current],
+                escape_menu.page.is_some(), stats.alive(), interactions.scripted(), audio.settings.muted);
+        }
         input.apply_step(&step_input, &preferences);
         #[cfg(feature="native_timing")]
         timing.with(|r| {if r.schedule.is_some(){r.schedule_input(input.diagnostic_activity());}});
@@ -3266,6 +3272,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         }
         let host_retry = matches!(host_transition.as_str(), "retry" | "new-game+retry")
             || lag_save_action == Some(lag_control::SaveAction::Retry);
+        // Host proof only: a real death, left on the death screen until a Retry press.
+        if lag_save_action == Some(lag_control::SaveAction::Die) { stats.damage(10000.); }
         if host_retry
             && new_campaign_memory.is_none() && pending_menu_newgame.is_none() { stats.damage(10000.); }
         let recover = host_retry || focused

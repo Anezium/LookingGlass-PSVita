@@ -134,6 +134,8 @@ pub(super) enum SaveAction {
     NewGame,
     NaturalExit,
     Retry,
+    /// Kill the player and leave the death screen to the live Retry press.
+    Die,
 }
 
 /// Host proof schedule of owner actions by frame (`LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS`).
@@ -178,6 +180,7 @@ impl SaveActions {
                 "new-game" => SaveAction::NewGame,
                 "natural-exit" => SaveAction::NaturalExit,
                 "retry" => SaveAction::Retry,
+                "die" => SaveAction::Die,
                 _ => anyhow::bail!("unknown lag save action {kind:?}"),
             };
             entries.push((frame, action, destination));
@@ -220,6 +223,7 @@ mod tests {
         assert_eq!(exits.take(5), Some((SaveAction::NaturalExit, Some("potears3".to_owned()))));
         assert!(std::env::var_os("LOOKING_GLASS_TRANSITION_DESTINATION").is_none(),
             "the destination must not reach the process environment");
+        assert_eq!(SaveActions::parse("7:die").unwrap().take(7), Some((SaveAction::Die, None)));
         assert!(SaveActions::parse("5:natural-exit=").is_err());
         assert!(SaveActions::parse("5:retry=potears3").is_err());
         assert!(SaveActions::parse("30:unknown").is_err());

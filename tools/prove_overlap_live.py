@@ -9,6 +9,16 @@ visits dispatch and retain.
 
 replay: the PotEars2 tape crossing the same maps by natural exits, OFF against the normal
 layout, exact on every oracle channel, with dispatch and retention only on listed visits.
+
+ui: host live play on PotEars2 with the normal layout and lag one admitted, driven through the UI
+states that heads of a listed visit can now reach (review S34 F1). `LOOKING_GLASS_LIVE_KEYS` holds
+keys at the framework capture, as physical keys arrive, so the real Start (Escape) path runs,
+including the throttled-preview frozen frame before the menu. The run holds the skip keys at entry,
+toggles pause, inventory and the chapter chooser, opens and closes the Start menu, dies
+(`die` host action) and retries from the death screen with Enter, and mutes and unmutes. Each state
+must be reached, no head in it may dispatch, lag must dispatch again after it, the death retry must
+reinstall the listed map as a new visit, and the run must exit cleanly with its dispatch and
+retention totals equal to the per-visit audit events.
 """
 import argparse
 from collections import Counter, defaultdict
@@ -308,16 +318,91 @@ def run_controls(args, out):
     return dict(controls=rows)
 
 
+UI_LINE = re.compile(r'^LIVE_UI frame=(\d+) t=([0-9.]+) map=(\S+) paused=(\w+) menu=(\w+) inventory=(\w+) '
+                     r'escape=(\w+) alive=(\w+) scripted=(\w+) muted=(\w+)$')
+UI_STATES = ('paused', 'inventory', 'menu', 'escape', 'dead', 'muted')
+# Seconds after the first live capture. Enter and E (Cross and Triangle on the Vita) are held as
+# skip keys at entry; Escape is Start, Tab is Select, I is the inventory, P pauses, M mutes.
+UI_KEYS = ','.join(['0:Enter:3', '3.5:E:1.5', '6:P:0.1', '8:P:0.1', '10:I:0.1', '12:I:0.1',
+                    '14:Tab:0.1', '16:Tab:0.1', '18:Escape:0.1', '21:Escape:0.1']
+                   + [f'{t}:Enter:0.1' for t in range(24, 35)] + ['37:M:0.1', '40:M:0.1'])
+UI_DIE_FRAME = 2600
+
+
+def run_ui(args, out):
+    base = json.loads(Path(args.config).read_text())
+    config = normal_config(base)
+    assert config['save_preview'] == 'throttled', 'the frozen preview frame needs save_preview throttled'
+    stdout, stderr, elapsed = launch(
+        args.binary, args.data, config, args.sim, out / 'ui_states_live',
+        ['--map', 'potears2', '--new-game', '--frames', '5200'],
+        dict(LOOKING_GLASS_SIM_AUDIT='1', LOOKING_GLASS_LIVE_KEYS=UI_KEYS,
+             LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS=f'{UI_DIE_FRAME}:die'), timeout_s=900)
+    assert not any('panicked' in line for line in stdout + stderr), 'panic in the UI-state run'
+    heads = []
+    for line in stdout:
+        if (m := UI_LINE.match(line)):
+            f = [m[1], m[2], m[3], *m.groups()[3:]]
+            flags = dict(zip(('paused', 'menu', 'inventory', 'escape', 'alive', 'scripted', 'muted'),
+                             (v == 'true' for v in f[3:])))
+            flags['dead'] = not flags.pop('alive')
+            heads.append(dict(frame=int(f[0]), t=float(f[1]), map=f[2], **flags))
+    assert heads, 'no LIVE_UI heads'
+    events = [json.loads(line.split(' ', 1)[1]) for line in stdout if line.startswith('SIM_EVENT ')]
+    dispatch = sorted({e['frame'] for e in events if e['event'] == 'dispatch'})
+    pending = sorted({e['frame'] for e in events if e['event'] == 'pending'})
+    last_head = {h['frame']: h for h in heads}
+    states = {}
+    for name in UI_STATES:
+        frames = [h['frame'] for h in heads if h[name]]
+        assert frames, f'state {name} was never reached'
+        first, last = frames[0], frames[-1]
+        # A modal head runs again under the same frame number after the modal closes; the frame's
+        # dispatch belongs to its last head line.
+        in_state = {f for f, h in last_head.items() if h[name]}
+        inside = [f for f in dispatch if f in in_state]
+        kept = [f for f in pending if f in in_state]
+        after = [f for f in pending if last < f <= last + 600]
+        states[name] = dict(first_frame=first, last_frame=last, heads=len(frames),
+                            first_t=next(h['t'] for h in heads if h[name]),
+                            dispatched_in_state=len(inside), retained_in_state=len(kept),
+                            retained_before=len([f for f in pending if first - 240 <= f < first]),
+                            retained_after=len(after))
+        if name != 'muted':
+            # A paused, menu, inventory, Start or death head is not gameplay: it never dispatches.
+            assert not inside, (name, inside[:5])
+        assert after, f'lag did not retain again after {name}'
+    # The Start press head renders one frozen serial frame (throttled preview) before the menu.
+    frozen = states['escape']['first_frame'] - 1
+    states['escape']['frozen_frame'] = frozen
+    assert frozen not in dispatch and any(e['event'] == 'present' and e['frame'] == frozen
+                                          and e['generation'] == 0 for e in events), 'no frozen serial frame'
+    order = [states[n]['first_frame'] for n in ('paused', 'inventory', 'menu', 'escape', 'dead', 'muted')]
+    assert order == sorted(order), states
+    assert states['dead']['first_frame'] >= UI_DIE_FRAME
+    retry = [line for line in stderr if '"kind":"death-retry"' in line and '"event":"end"' in line]
+    assert len(retry) == 1 and '"success":true' in retry[0], 'no death retry from the death screen'
+    rows, counts = visits(stdout, stderr)
+    check_visits(rows, counts, 'ui_states_live')
+    assert [r['map'] for r in rows] == ['potears2', 'potears2'] and rows[0]['visit'] != rows[1]['visit'], rows
+    skip_heads = [h for h in heads if h['t'] - heads[0]['t'] < 5.0]
+    summary = dict(states=states, visits=rows, overlap=counts, heads=len(heads),
+                   dispatch=len(dispatch), pending=len(pending), scripted_heads=sum(h['scripted'] for h in heads),
+                   skip_held_heads=len(skip_heads), elapsed_s=elapsed, keys=UI_KEYS, die_frame=UI_DIE_FRAME)
+    print('ui_states_live', json.dumps(summary), flush=True)
+    return dict(ui_states_live=summary)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('live', 'replay', 'controls'))
+    parser.add_argument('mode', choices=('live', 'replay', 'controls', 'ui'))
     for name in ('binary', 'data', 'config', 'sim', 'out'):
         parser.add_argument(f'--{name}', required=True)
     parser.add_argument('--tape')
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    report = dict(live=run_live, replay=run_replay, controls=run_controls)[args.mode](args, out)
+    report = dict(live=run_live, replay=run_replay, controls=run_controls, ui=run_ui)[args.mode](args, out)
     report.update(binary=str(args.binary),
                   binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest())
     (out / f'{args.mode}-proof.json').write_text(json.dumps(report, indent=2) + '\n')
