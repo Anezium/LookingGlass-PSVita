@@ -490,6 +490,9 @@ pub struct Config {
     /// With `audio_cue_prefetch`, also decode the map's measured first-use clips on the
     /// load path, inside the same 6 MiB cue budget. Sample-exact, off by default.
     pub audio_level_cues_extra: bool,
+    /// Prefetch measured first-use effects with a separate per-map allowance
+    /// inside the shared PCM cache cap.
+    pub audio_named_prefetch: bool,
     pub audio_block_mix: bool,
     pub audio_preresample: bool,
     pub audio_block_parameters: bool,
@@ -757,6 +760,7 @@ impl Default for Config {
             audio_loop_resident: false,
             audio_cue_prefetch: false,
             audio_level_cues_extra: false,
+            audio_named_prefetch: false,
             audio_block_mix: false,
             audio_preresample: false,
             audio_block_parameters: false,
@@ -4218,6 +4222,16 @@ mod tests {
             assert!(c.audio_loop_resident && c.audio_cue_prefetch);
         }
     }
+    #[test]
+    fn audio_named_prefetch_is_opt_in() {
+        for json in ["{}", r#"{"audio_named_prefetch":false}"#] {
+            assert!(!serde_json::from_str::<Config>(json).unwrap().audio_named_prefetch);
+        }
+        let on = serde_json::from_str::<Config>(r#"{"audio_named_prefetch":true}"#).unwrap();
+        assert!(on.audio_named_prefetch);
+        assert!(serde_json::from_str::<Config>(r#"{"audio_named_prefetch":"true"}"#).is_err());
+    }
+
     // `audio_level_cues_extra` extends the cue prefetch with each map's measured first-use
     // clips. It arrived after every frozen era file, so those stay valid unchanged and an
     // omitted opt-in reads as an explicit off.

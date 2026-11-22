@@ -73,6 +73,9 @@ pub const ACTION_CLIPS: [&str; 20] = [
     "staff_att_alt_end",
     "buss_att",
 ];
+pub(crate) const KNIFE_SPIN: &str = "sound/weapon/knife/knife_spin.wav";
+pub(crate) const WEAPON_REAPPEAR: &str = "sound/weapon/shared/weapon_reappear.wav";
+
 const EXTRA_MODELS: [&str; 7] = [
     "w_card_loose",
     "croquetball",
@@ -1467,7 +1470,7 @@ impl Visuals {
                 id: p.audio_id,
                 origin: p.position,
                 path: if p.model == 0 {
-                    "sound/weapon/knife/knife_spin.wav"
+                    KNIFE_SPIN
                 } else if p.model == 10 {
                     "sound/weapon/cards/cards_loop1.wav"
                 } else {
@@ -1842,7 +1845,7 @@ impl Visuals {
         });
         let mut sounds = Vec::new();
         if events.blade_return {
-            sounds.push("sound/weapon/shared/weapon_reappear.wav");
+            sounds.push(WEAPON_REAPPEAR);
         }
         let dice_events = self.dice.advance_clocks(
             dt,

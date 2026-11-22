@@ -14,7 +14,8 @@ struct Mix {
     hash: Sha256,
 }
 thread_local! {
-    static MIX: RefCell<Option<Mix>> = const { RefCell::new(None) };
+    // Whole-session count of stereo interleaved samples actually pulled by the host mixer.
+    static MIX: RefCell<(u64, Option<Mix>)> = const { RefCell::new((0, None)) };
 }
 
 pub(super) fn enabled() -> bool {
@@ -29,7 +30,8 @@ pub(super) fn mix_sample(value: f32) {
     }
     MIX.with(|mix| {
         let mut mix = mix.borrow_mut();
-        let entry = mix.get_or_insert_with(|| Mix {
+        mix.0 += 1;
+        let entry = mix.1.get_or_insert_with(|| Mix {
             samples: 0,
             hash: Sha256::new(),
         });
@@ -45,7 +47,7 @@ pub(super) fn mix_end() {
     }
     let frame = crate::sim_maps::probe::frame();
     MIX.with(|mix| {
-        if let Some(entry) = mix.borrow_mut().take() {
+        if let Some(entry) = mix.borrow_mut().1.take() {
             println!(
                 "AUDIO_MIX frame={frame} samples={} sha256={:x}",
                 entry.samples,
@@ -61,14 +63,47 @@ pub(super) fn decode(origin: &str, path: &str, samples: &[f32]) {
     if !enabled() {
         return;
     }
-    let mut hash = Sha256::new();
-    for sample in samples {
-        hash.update(sample.to_bits().to_le_bytes());
-    }
     println!(
         "AUDIO_DECODE frame={} origin={origin} path={path} samples={} sha256={:x}",
         crate::sim_maps::probe::frame(),
         samples.len(),
-        hash.finalize()
+        pcm_hash(samples)
     );
+}
+
+fn pcm_hash(samples: &[f32]) -> impl std::fmt::LowerHex {
+    let mut hash = Sha256::new();
+    for sample in samples {
+        hash.update(sample.to_bits().to_le_bytes());
+    }
+    hash.finalize()
+}
+
+/// Playback proof for measured first-use effects. Use the source passed to
+/// append_effect, before resampling, and the deterministic mixer's output clock.
+pub(super) fn named_enqueue(
+    path: &str,
+    pcm: &super::Pcm,
+    origin: Option<macroquad::prelude::Vec3>,
+    gain: f32,
+    loop_id: Option<usize>,
+) {
+    if !enabled() || ![super::ROCK_CUES, super::NOSEWIPE_CUES, super::KNIFE_CUES]
+        .iter().any(|paths| paths.contains(&path))
+    {
+        return;
+    }
+    let output_sample = MIX.with(|mix| mix.borrow().0);
+    println!("AUDIO_NAMED_ENQUEUE {}", serde_json::json!({
+        "frame": crate::sim_maps::probe::frame(),
+        "output_sample": output_sample,
+        "path": path,
+        "origin_bits": origin.map(|p| p.to_array().map(f32::to_bits)),
+        "gain_bits": gain.to_bits(),
+        "loop_id": loop_id,
+        "index": pcm.index,
+        "rate": pcm.clip.rate,
+        "samples": pcm.clip.samples.len(),
+        "sha256": format!("{:x}", pcm_hash(&pcm.clip.samples)),
+    }));
 }

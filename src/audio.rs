@@ -317,6 +317,83 @@ fn placed_actor_cues(assets: &mut Assets, map: &Bsp) -> Vec<String> {
     }
     out
 }
+const ROCK_CUES: &[&str] = &[
+    "sound/character/walking_rock/small/walk.wav",
+    "sound/character/walking_rock/small/run.wav",
+    "sound/character/walking_rock/large/step1.wav",
+    "sound/character/walking_rock/large/step2.wav",
+    "sound/character/walking_rock/large/getting_down.wav",
+    "sound/character/walking_rock/small/getting_down.wav",
+];
+const NOSEWIPE_CUES: &[&str] = &["sound/character/mock_turtle/idle_nosewipe.wav"];
+const KNIFE_CUES: &[&str] = &[crate::weapons::KNIFE_SPIN, crate::weapons::WEAPON_REAPPEAR];
+
+#[derive(Default)]
+struct NamedPrefetch {
+    paths: &'static [&'static str],
+    limit: usize,
+    staged_bytes: usize,
+    rejected: BTreeMap<&'static str, Option<Clip>>,
+}
+impl NamedPrefetch {
+    fn for_map(name: &str, enabled: bool) -> Self {
+        let (paths, limit) = match (name, enabled) {
+            ("potears1", true) => (ROCK_CUES, 339_484),
+            ("garden1", true) => (NOSEWIPE_CUES, 133_884),
+            ("potears2", true) => (KNIFE_CUES, 240_196),
+            _ => return Self::default(),
+        };
+        Self { paths, limit, ..Self::default() }
+    }
+
+    fn stage_reject(&mut self, path: &str, clip: Option<Clip>) {
+        let Some(&path) = self.paths.iter().find(|&&named| named == path) else { return };
+        let clip = clip.filter(|clip| {
+            let bytes = clip.samples.len() * std::mem::size_of::<f32>();
+            if self.staged_bytes + bytes > self.limit {
+                return false;
+            }
+            self.staged_bytes += bytes;
+            true
+        });
+        self.rejected.insert(path, clip);
+    }
+
+    fn finish(
+        mut self,
+        assets: &mut Assets,
+        name: &str,
+        cache: &mut BTreeMap<String, Option<Clip>>,
+        cache_samples: &mut usize,
+    ) {
+        if self.paths.is_empty() {
+            return;
+        }
+        // The legacy passes have committed all their admissions. Only now may
+        // the named clips consume room under the shared cap.
+        let (mut clips, mut bytes) = (0, 0);
+        for &path in self.paths {
+            if cache.contains_key(path) {
+                continue;
+            }
+            let clip = self.rejected.remove(path)
+                .unwrap_or_else(|| assets.read(path).and_then(decode_clip).ok());
+            let Some(clip) = clip else { continue };
+            let size = clip.samples.len() * std::mem::size_of::<f32>();
+            if bytes + size > self.limit || *cache_samples + clip.samples.len() > CACHE_SAMPLES {
+                continue;
+            }
+            clips += 1;
+            bytes += size;
+            *cache_samples += clip.samples.len();
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            proof::decode("named", path, &clip.samples);
+            cache.insert(path.to_owned(), Some(clip));
+            audio_memory(&format!("named:{path}"), *cache_samples);
+        }
+        println!("[lg/audio-named-prefetch] map={name} clips={clips} bytes={bytes} allowance={}", self.limit);
+    }
+}
 /// `audio_cue_prefetch`: decode the level's own cue clips on the load path, before
 /// their first request. `limit` bounds the added decoded bytes; a cue that does not
 /// fit is skipped and keeps the ordinary runtime read-and-decode path, so the
@@ -335,6 +412,7 @@ fn prefetch_level_clips(
     cache_samples: &mut usize,
     limit: usize,
     extra: bool,
+    named: &mut NamedPrefetch,
 ) -> (usize, usize) {
     let mut candidates: Vec<String> = Vec::new();
     let mut seen = BTreeSet::new();
@@ -363,10 +441,12 @@ fn prefetch_level_clips(
             return;
         }
         let Ok(clip) = assets.read(path).and_then(decode_clip) else {
+            named.stage_reject(path, None);
             return;
         };
         let size = clip.samples.len() * std::mem::size_of::<f32>();
         if bytes + size > limit || *cache_samples + clip.samples.len() > CACHE_SAMPLES {
+            named.stage_reject(path, Some(clip));
             return;
         }
         bytes += size;
@@ -691,7 +771,7 @@ struct Clip {
 }
 /// Exact clip for a looping voice: a clone of the resident samples when present,
 /// otherwise one read and decode. `audio_loop_resident` retains that decode in the
-/// same bounded level cache, so a reissued loop does not read and decode the file
+/// same bounded level cache used by load-time prefetch, so a reissued loop does not read and decode the file
 /// again on a later frame. The samples and every playback parameter stay identical.
 fn looping_clip(
     assets: &mut Assets,
@@ -1295,10 +1375,11 @@ impl Audio {
                 }
             }
         }
+        let mut named = NamedPrefetch::for_map(name, block::settings().named_prefetch);
         if block::settings().cue_prefetch {
             let (clips, bytes) = prefetch_level_clips(
                 assets, name, map, &mut cache, &mut cache_samples, PREFETCH_BYTES,
-                block::settings().level_cues_extra,
+                block::settings().level_cues_extra, &mut named,
             );
             self.prefetch_clips = clips;
             self.prefetch_bytes = bytes;
@@ -1307,6 +1388,7 @@ impl Audio {
                 cache_samples * std::mem::size_of::<f32>()
             );
         }
+        named.finish(assets, name, &mut cache, &mut cache_samples);
         self.cache_samples = cache_samples;
         self.world_clips = cache
             .iter()
@@ -1773,12 +1855,10 @@ impl Audio {
                 sink.set_volume(0.);
                 let pan = Pan::new();
                 let acoustics = acoustics::Controls::new();
-                sink.append_effect(Pcm {
-                        clip,
-                        index,
-                        looping: true,
-                        pan: pan.clone(),
-                    }, acoustics.clone());
+                let pcm = Pcm { clip, index, looping: true, pan: pan.clone() };
+                #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                proof::named_enqueue(cue.path, &pcm, Some(cue.origin), volume, Some(cue.id));
+                sink.append_effect(pcm, acoustics.clone());
                 self.loops.insert(
                     cue.id,
                     Loop {
@@ -1994,12 +2074,10 @@ impl Audio {
         let pan = Pan::new();
         let acoustics = acoustics::Controls::new();
         acoustics.set(0., self.submerged, self.room);
-        sink.append_effect(Pcm {
-                clip,
-                index: 0,
-                looping: false,
-                pan: pan.clone(),
-            }, acoustics.clone());
+        let pcm = Pcm { clip, index: 0, looping: false, pan: pan.clone() };
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        proof::named_enqueue(&request.path, &pcm, request.origin, request.volume, None);
+        sink.append_effect(pcm, acoustics.clone());
         let effect = Effect {
             sink,
             pan,
@@ -2676,12 +2754,12 @@ mod tests {
         // any decoded sample. The extra cues stay off, so this is the RC19 set.
         let mut none = BTreeMap::new();
         let mut none_samples = 0usize;
-        ensure!(prefetch_level_clips(&mut assets, "hatter2", &map, &mut none, &mut none_samples, 0, false)
+        ensure!(prefetch_level_clips(&mut assets, "hatter2", &map, &mut none, &mut none_samples, 0, false, &mut NamedPrefetch::default())
             == (0, 0), "an empty limit prefetched clips");
         let mut cache = BTreeMap::new();
         let mut cache_samples = 0usize;
         let (clips, bytes) = prefetch_level_clips(
-            &mut assets, "hatter2", &map, &mut cache, &mut cache_samples, PREFETCH_BYTES, false);
+            &mut assets, "hatter2", &map, &mut cache, &mut cache_samples, PREFETCH_BYTES, false, &mut NamedPrefetch::default());
         ensure!(clips > 0 && bytes <= PREFETCH_BYTES, "prefetch exceeded its byte budget");
         ensure!(cache_samples * 4 == bytes, "prefetch accounting differs from its byte sum");
         for path in ["sound/ambience/special/clock_gong_2.wav",
@@ -2877,7 +2955,7 @@ mod tests {
             // Control: the key-off prefetch equals the device-measured RC19 bytes.
             let (mut off, mut off_samples) = (base.clone(), base_samples);
             let (off_clips, off_bytes) = prefetch_level_clips(
-                &mut assets, map, &bsp, &mut off, &mut off_samples, PREFETCH_BYTES, false);
+                &mut assets, map, &bsp, &mut off, &mut off_samples, PREFETCH_BYTES, false, &mut NamedPrefetch::default());
             ensure!(off_bytes == DEVICE_PREFETCH_BYTES.iter().find(|(m, _)| *m == map)
                     .map(|(_, bytes)| *bytes).unwrap_or_default(),
                 "{map}: control prefetch {off_bytes} differs from the device measurement");
@@ -2886,7 +2964,7 @@ mod tests {
             // legacy set is unchanged and every prefetched sample is a fresh decode.
             let (mut on, mut on_samples) = (base.clone(), base_samples);
             let (on_clips, on_bytes) = prefetch_level_clips(
-                &mut assets, map, &bsp, &mut on, &mut on_samples, PREFETCH_BYTES, true);
+                &mut assets, map, &bsp, &mut on, &mut on_samples, PREFETCH_BYTES, true, &mut NamedPrefetch::default());
             let mut kept_bytes = 0usize;
             for path in kept {
                 let resident = on.get(*path).and_then(Clone::clone).expect(*path);
@@ -2909,7 +2987,7 @@ mod tests {
             // extras, so the prefetched set stays the key-off one.
             let (mut tight, mut tight_samples) = (base.clone(), base_samples);
             let (tight_clips, tight_bytes) = prefetch_level_clips(
-                &mut assets, map, &bsp, &mut tight, &mut tight_samples, off_bytes, true);
+                &mut assets, map, &bsp, &mut tight, &mut tight_samples, off_bytes, true, &mut NamedPrefetch::default());
             let tight_set: BTreeSet<&str> = tight.keys().map(String::as_str).collect();
             ensure!(tight_clips == off_clips && tight_bytes == off_bytes && tight_set == off_set,
                 "{map}: a tight budget changed the legacy prefetched set ({tight_bytes} vs {off_bytes})");
@@ -2920,7 +2998,7 @@ mod tests {
             let legacy_samples = off_samples - base_samples;
             let (mut cap, mut cap_samples) = (base.clone(), CACHE_SAMPLES - legacy_samples);
             let (cap_clips, cap_bytes) = prefetch_level_clips(
-                &mut assets, map, &bsp, &mut cap, &mut cap_samples, PREFETCH_BYTES, true);
+                &mut assets, map, &bsp, &mut cap, &mut cap_samples, PREFETCH_BYTES, true, &mut NamedPrefetch::default());
             let cap_set: BTreeSet<&str> = cap.keys().map(String::as_str).collect();
             ensure!(cap_clips == off_clips && cap_bytes == off_bytes && cap_set == off_set
                 && cap_samples == CACHE_SAMPLES,
@@ -2930,7 +3008,7 @@ mod tests {
                 let (mut one, mut one_samples) =
                     (base, CACHE_SAMPLES - legacy_samples - first_samples);
                 let (one_clips, one_bytes) = prefetch_level_clips(
-                    &mut assets, map, &bsp, &mut one, &mut one_samples, PREFETCH_BYTES, true);
+                    &mut assets, map, &bsp, &mut one, &mut one_samples, PREFETCH_BYTES, true, &mut NamedPrefetch::default());
                 let one_set: BTreeSet<&str> = one.keys().map(String::as_str).collect();
                 let expected: BTreeSet<&str> =
                     off_set.union(&BTreeSet::from([*first])).copied().collect();
