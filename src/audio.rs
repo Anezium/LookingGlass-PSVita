@@ -420,6 +420,7 @@ mod player_prefetch_tests {
         ("sound/character/alice/idle_swish_2.wav", 16_548),
         ("sound/character/alice/idle_toss.wav", 7_061),
         ("sound/character/alice/idle_knife_click2.wav", 6_136),
+        ("sound/weapon/knife/knife_phit_world1.wav", 14_813),
     ];
 
     fn clip(value: f32, len: usize) -> Clip {
@@ -452,9 +453,11 @@ mod player_prefetch_tests {
         for &(path, _) in MEASURED_PLAYER_CUES {
             assert!(PLAYER_CUES.contains(&path), "missing {path}");
             assert!(seen.insert(path), "duplicate {path}");
-            assert!(path.starts_with("sound/character/alice/") && path.ends_with(".wav"));
+            assert!((path.starts_with("sound/character/alice/") || path.starts_with("sound/weapon/knife/"))
+                && path.ends_with(".wav"));
             assert!(path.chars().all(|c| !c.is_ascii_uppercase()));
         }
+        assert_eq!(PLAYER_PREFETCH_BYTES, 1_071_740, "ten Alice cues plus the knife world impact");
         assert!(!block::settings().player_prefetch, "off by default");
 
         // Key off performs no decoding or admission.
@@ -561,7 +564,7 @@ mod player_prefetch_tests {
 
         // Exercise every play path with an empty Assets directory (any archive read fails):
         // water (submerge, gasp1), player_state (pain1 + swimloop via looping_clip),
-        // and animation (all six idle cues), both before and after release_level().
+        // animation (all six idle cues) and the spatial knife impact, both before and after release_level().
         let world = World::fixture(&[]);
         for round in 0..2 {
             if round == 1 {
@@ -585,9 +588,11 @@ mod player_prefetch_tests {
             ] {
                 audio.animation(events::Cue { path: idle.into(), volume: 1. });
             }
+            // A thrown knife hitting the world (weapons.rs projectile_impact_sound).
+            audio.world_effect_at("sound/weapon/knife/knife_phit_world1.wav", Vec3::X);
             audio.prepare(&mut assets, &world, Vec3::ZERO, false, 0.033);
-            // 2 water + 1 pain + 6 idle = 9 queued one-shots resolved from player_cache.
-            assert_eq!(audio.resolved - before_resolved, 9, "round {round}");
+            // 2 water + 1 pain + 6 idle + 1 knife impact = 10 queued one-shots resolved from player_cache.
+            assert_eq!(audio.resolved - before_resolved, 10, "round {round}");
             assert!(audio.missing.is_empty(), "round {round}: unexpected archive miss");
             assert!(audio.world_clips.is_empty(), "round {round}: player cue polluted world_clips");
             assert_eq!(audio.cache_samples, 0, "round {round}: player cue charged level cache");
@@ -751,7 +756,8 @@ struct NamedPrefetch {
     staged_bytes: [usize; 2],
     rejected: BTreeMap<&'static str, Option<Clip>>,
 }
-/// Global Alice player cues measured over 8 ms in the int2 logs and A2 scan.
+/// Global Alice player cues measured over 8 ms in the int2 logs and A2 scan,
+/// plus the thrown knife's world impact (13.2-13.8 ms on potears2, FIX-A2).
 /// Decoded once into a resident cache when `audio_player_prefetch` is enabled
 /// so they survive map loads and hit cache on every one-shot, loop, sanity/pain
 /// and animation-driven play path.
@@ -766,9 +772,10 @@ const PLAYER_CUES: &[&str] = &[
     "sound/character/alice/idle_swish_2.wav",
     "sound/character/alice/idle_toss.wav",
     "sound/character/alice/idle_knife_click2.wav",
+    "sound/weapon/knife/knife_phit_world1.wav",
 ];
-/// Exact mono f32 PCM size of the 10 cues in `PLAYER_CUES` (253,122 samples).
-const PLAYER_PREFETCH_BYTES: usize = 1_012_488;
+/// Exact mono f32 PCM size of the 11 cues in `PLAYER_CUES` (267,935 samples).
+const PLAYER_PREFETCH_BYTES: usize = 1_071_740;
 
 /// `resident`: every cue the player cache holds. `unshared`: the part the level
 /// cache does not also charge, so cache bytes plus `unshared` counts each PCM block once.
