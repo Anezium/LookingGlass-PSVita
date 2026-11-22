@@ -520,6 +520,14 @@ fn program_choice(c: &crate::render::vita_renderer::Config) -> (Option<Specializ
 }
 impl Gpu {
     pub(crate) fn new() -> Result<Self> {
+        Self::build(FRAME.with(|f| f.borrow().gpu_skin_actors), true)
+    }
+
+    pub(crate) fn prewarm(gpu_skin_actors: bool) -> Result<Self> {
+        Self::build(gpu_skin_actors, false)
+    }
+
+    fn build(gpu_skin_actors: bool, activate_skin: bool) -> Result<Self> {
         let white = crate::texture::upload_rgba8(1, 1, &[255; 4]);
         let fragment =
             crate::lighting::fragment(&crate::environment::fragment(crate::render::FRAGMENT));
@@ -578,7 +586,7 @@ impl Gpu {
         let mut gpu = Self {
             _game_thread: crate::game_thread::GameThread::new(),
             shader,
-            skin: (c.gpu_skin_ants || FRAME.with(|f| f.borrow().gpu_skin_actors)).then(|| {
+            skin: (c.gpu_skin_ants || gpu_skin_actors).then(|| {
                 // The same fragment sources as the four actor routes above.
                 let sources = actor_lean::sources();
                 gpu_skin::Gpu::new([
@@ -586,7 +594,7 @@ impl Gpu {
                     corpse_opaque.is_some().then(|| crate::lighting::fragment(&crate::environment::fragment(&super::corpse_opaque::fragment()))),
                     actor_lean[0].is_some().then(|| crate::environment::fragment(&sources[0])),
                     actor_lean[1].is_some().then(|| crate::environment::fragment(&sources[1])),
-                ]).map_err(|e|eprintln!("[lg/gpu-skin] CPU fallback: {e:#}")).ok()
+                ], activate_skin).map_err(|e|eprintln!("[lg/gpu-skin] CPU fallback: {e:#}")).ok()
             }).flatten(),
             pipelines: BTreeMap::new(),
             lite,
@@ -1583,7 +1591,12 @@ pub(crate) fn finish_world(
     gpu.uniform_cache.interrupt(); // Probe only uninterrupted draws of this owned program.
     gpu.submit_cache.interrupt();
     gpu.field_uniforms.interrupt();
-    if let Some(s) = &mut gpu.skin { s.interrupt(); }
+    if let Some(s) = &mut gpu.skin {
+        // First submission is the lazy constructor's original activation point.
+        // The packets queued before it keep their original CPU/GPU routing.
+        s.activate();
+        s.interrupt();
+    }
     if let Some(l) = &mut gpu.lite { l.fields.interrupt(); l.uniforms.interrupt(); }
     if let Some(l) = &mut gpu.corpse_opaque { l.fields.interrupt(); l.uniforms.interrupt(); }
     for l in gpu.actor_lean.iter_mut().flatten() { l.fields.interrupt(); l.uniforms.interrupt(); }

@@ -47,6 +47,22 @@ pub(super) fn prepare(bg: Color) {
         }
         return;
     }
+    prewarm();
+    begin(PassAction::Clear {
+        color: Some((bg.r, bg.g, bg.b, 1.)),
+        depth: Some(1.),
+        stencil: None,
+    });
+    unsafe {
+        get_internal_gl().quad_context.end_render_pass();
+    }
+}
+
+/// Allocate the reusable target and upscale material before rendering a scene.
+pub(super) fn prewarm() {
+    if config().render_scale == 1. {
+        return;
+    }
     let w = (screen_width() * config().render_scale).round() as u32;
     let h = (screen_height() * config().render_scale).round() as u32;
     TARGET.with(|slot| {
@@ -133,15 +149,28 @@ pub(super) fn prepare(bg: Color) {
             );
         }
     });
-    begin(PassAction::Clear {
-        color: Some((bg.r, bg.g, bg.b, 1.)),
-        depth: Some(1.),
-        stencil: None,
-    });
-    unsafe {
-        get_internal_gl().quad_context.end_render_pass();
-    }
 }
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+pub(crate) fn probe_depth() -> anyhow::Result<()> {
+    use macroquad::miniquad::gl;
+    use sha2::{Digest, Sha256};
+
+    unsafe { get_internal_gl().flush(); }
+    let [w, h] = diagnostic_size().unwrap_or([screen_width() as u32, screen_height() as u32]);
+    let mut depth = vec![0u8; w as usize * h as usize * 4];
+    begin(PassAction::Nothing);
+    let error = unsafe {
+        gl::glReadPixels(0, 0, w as i32, h as i32, 0x1902, 0x1406, depth.as_mut_ptr().cast());
+        let error = gl::glGetError();
+        get_internal_gl().quad_context.end_render_pass();
+        error
+    };
+    anyhow::ensure!(error == 0, "depth readback failed: {error:#x}");
+    let varied = depth.chunks_exact(4).any(|sample| sample != &depth[..4]);
+    println!("FIRST_FRAME_DEPTH {w}x{h} varied={varied} sha256={:x}", Sha256::digest(depth));
+    Ok(())
+}
+
 /// The 3D target's rectangle: what the world pass draws into, for a readback.
 #[cfg(target_os = "vita")]
 pub(super) fn target_rect() -> (i32, i32, i32, i32) {

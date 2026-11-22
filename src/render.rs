@@ -1317,6 +1317,20 @@ fn draw_batch(
 }
 
 impl Scene {
+    /// Final loading work on the GL owner, using this visit's GPU-skin selection.
+    pub(crate) fn prepare_level_gpu(&mut self) {
+        #[cfg(feature = "vita_renderer")]
+        if vita_renderer::config().eager_level_gpu {
+            crate::game_thread::assert_current();
+            vita_renderer::prewarm_3d();
+            if vita_renderer::config().alpha_interop && !vita_renderer::world_only() {
+                if let Some(renderer) = &mut self.retained {
+                    renderer.prewarm_fx(self.gpu_skin_actors);
+                }
+            }
+        }
+    }
+
     pub(crate) fn retained_active(&self) -> bool {
         #[cfg(feature = "vita_renderer")]
         { self.retained.is_some() }

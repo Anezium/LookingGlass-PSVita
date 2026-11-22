@@ -193,9 +193,9 @@ impl Uniforms {
 #[derive(Default)]
 struct State { pipeline: Option<(usize,usize,bool,bool)>, bindings: Option<(usize,TextureId,BufferId)> }
 pub(crate) struct Gpu { shaders:[Option<ShaderId>;4],pipelines:BTreeMap<(usize,usize,bool),Pipeline>,buffers:BTreeMap<usize,Buffers>,
-    uniforms:[Uniforms;4], state:State }
+    uniforms:[Uniforms;4], state:State, active:bool }
 impl Gpu {
-    pub(super) fn new(fragments:[Option<String>;4])->Result<Self> {
+    pub(super) fn new(fragments:[Option<String>;4], active:bool)->Result<Self> {
         let mut attributes=0;let mut uniforms=0;
         unsafe {gl::glGetIntegerv(0x8869,&mut attributes);}
         #[cfg(target_os="vita")]
@@ -217,10 +217,16 @@ impl Gpu {
                 Err(e)=>eprintln!("[lg/gpu-skin] warning {} failed, full program kept: {e:?}",VARIANTS[i]),
             }
         }
-        AVAILABLE.with(|v|v.set(v.get()+1));
+        if active { AVAILABLE.with(|v|v.set(v.get()+1)); }
         println!("[lg/gpu-skin] READY programs={}",shaders.iter().flatten().count());
         let uniforms=std::array::from_fn(|_|Uniforms {fields:crate::render::uniform_fields::Cache::new(meta()),locations:None,occurrence:None,eye:None});
-        Ok(Self {shaders,pipelines:BTreeMap::new(),buffers:BTreeMap::new(),uniforms,state:State::default()})
+        Ok(Self {shaders,pipelines:BTreeMap::new(),buffers:BTreeMap::new(),uniforms,state:State::default(),active})
+    }
+    pub(super) fn activate(&mut self) {
+        if !self.active {
+            AVAILABLE.with(|v| v.set(v.get() + 1));
+            self.active = true;
+        }
     }
     /// Another program, pipeline, binding or depth mask may have been applied since the
     /// last skin draw: apply them again. Uniform values stay (they belong to the program).
@@ -330,7 +336,8 @@ impl Gpu {
     }
 }
 impl Drop for Gpu {fn drop(&mut self) {
-    AVAILABLE.with(|v|v.set(v.get()-1));let ctx=unsafe{get_internal_gl()}.quad_context;
+    if self.active { AVAILABLE.with(|v|v.set(v.get()-1)); }
+    let ctx=unsafe{get_internal_gl()}.quad_context;
     for (_,b) in std::mem::take(&mut self.buffers) {ctx.delete_buffer(b.vertex);ctx.delete_buffer(b.index);}
     for (_,p) in std::mem::take(&mut self.pipelines) {ctx.delete_pipeline(p);}
     for shader in self.shaders.iter().flatten() {ctx.delete_shader(*shader);}
