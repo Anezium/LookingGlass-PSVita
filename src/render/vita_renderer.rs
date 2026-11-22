@@ -910,10 +910,13 @@ impl Config {
                 && self.skin_workers == 2 && self.skin_overlap
                 && self.audio_pcm_worker && self.audio_producer_affinity == 0x40000
         ), "sim_overlap_normal requires two overlapping skin workers, a sim_overlap map allowlist and buffered audio on CPU2, without legacy layout diagnostics");
+        // sim_overlap_normal admits listed maps in ordinary play; without it a list needs a
+        // replay tape or the live chapter diagnostic. Recording stays excluded above.
         ensure!(self.sim_overlap_maps.is_empty()
-            || (self.sim_overlap && (!self.replay_play.is_empty() || self.sim_overlap_live)),
+            || (self.sim_overlap && (!self.replay_play.is_empty() || self.sim_overlap_live
+                || self.sim_overlap_normal)),
             if self.sim_overlap_live { "sim_overlap_maps requires sim_overlap in live play" }
-            else { "sim_overlap_maps requires sim_overlap and a replay tape" });
+            else { "sim_overlap_maps requires sim_overlap and a replay tape, or sim_overlap_normal" });
         if self.sim_overlap_live {
             ensure!(self.replay_play.is_empty() && self.replay_record.is_empty(),
                 "sim_overlap_live requires live input without playback or recording");
@@ -6718,6 +6721,42 @@ mod overlap_probe_tests {
         });
         config.skin_workers = 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn normal_overlap_admits_a_map_list_without_a_replay_tape() {
+        let normal = Config {
+            sim_overlap: true,
+            sim_overlap_normal: true,
+            sim_overlap_maps: vec!["potears2".into()],
+            skin_workers: 2,
+            audio_pcm_worker: true,
+            audio_producer_affinity: 0x40000,
+            ..Config::default()
+        };
+        normal.validate().unwrap();
+        // Without the key the list still needs a tape or the live diagnostic.
+        let mut plain = normal.clone();
+        plain.sim_overlap_normal = false;
+        plain.skin_workers = 1;
+        assert!(plain.validate().is_err());
+        // Recording, an empty list, the live diagnostic and unproved maps stay refused.
+        let mut recording = normal.clone();
+        recording.replay_record = "take.lgtape".into();
+        assert!(recording.validate().is_err());
+        let mut empty = normal.clone();
+        empty.sim_overlap_maps.clear();
+        assert!(empty.validate().is_err());
+        let mut live = normal.clone();
+        live.sim_overlap_live = true;
+        live.replay_start = "chapter:potears2".into();
+        assert!(live.validate().is_err());
+        let mut unproved = normal.clone();
+        unproved.sim_overlap_maps = vec!["wchess1".into()];
+        assert!(unproved.validate().is_err());
+        let mut no_sim = normal;
+        no_sim.sim_overlap = false;
+        assert!(no_sim.validate().is_err());
     }
 
     #[test]

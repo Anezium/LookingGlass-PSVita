@@ -275,7 +275,61 @@ fn capture_live_controls() -> Frame {
     f.mouse = mq::mouse_position();
     f.wheel = mq::mouse_wheel();
     f.quit = mq::is_quit_requested();
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    epoch_taps::inject(&mut f);
     f
+}
+
+/// Host only, for the live lag-one input proof: `LOOKING_GLASS_LIVE_EPOCH_TAPS` presses one key
+/// of F13..F24 in every framework epoch of the gameplay loop, as a real tap would arrive, and
+/// logs what each head sample received. The viewer advances the epoch after each gameplay
+/// `next_frame` (a retained present or the serial tail).
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+pub(crate) mod epoch_taps {
+    use super::{key_bit, Frame, KeyCode};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    const POOL: [KeyCode; 12] = {
+        use KeyCode::*;
+        [F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24]
+    };
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("LOOKING_GLASS_LIVE_EPOCH_TAPS").is_some())
+    }
+
+    pub(crate) fn advance() {
+        if enabled() {
+            EPOCH.fetch_add(1, Relaxed);
+        }
+    }
+
+    pub(super) fn inject(frame: &mut Frame) {
+        if enabled() {
+            let key = POOL[(EPOCH.load(Relaxed) % POOL.len() as u64) as usize];
+            frame.keys_pressed |= 1u128 << key_bit(key).unwrap();
+        }
+    }
+
+    pub(crate) fn log_head(frame_index: u64, frame: &Frame, clock_bits: u64, latched: bool) {
+        if !enabled() {
+            return;
+        }
+        let taps = POOL.iter().enumerate()
+            .filter(|(_, key)| frame.keys_pressed >> key_bit(**key).unwrap() & 1 != 0)
+            .fold(0u32, |mask, (i, _)| mask | 1 << i);
+        println!("LIVE_EPOCH_HEAD frame={frame_index} epoch={} taps={taps:x} clock={clock_bits} latched={latched}",
+                 EPOCH.load(Relaxed));
+    }
+
+    /// The clock the step runs with, after the head's refresh or latch.
+    pub(crate) fn log_clock(frame_index: u64, clock_bits: u64, latched: bool) {
+        if enabled() {
+            println!("LIVE_EPOCH_CLOCK frame={frame_index} clock={clock_bits} latched={latched}");
+        }
+    }
 }
 
 /// Owner-side gameplay sample. Character input remains queued for the modal UI or console.

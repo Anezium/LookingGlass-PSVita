@@ -1095,6 +1095,7 @@ mod sim_timing;
 mod free_render;
 mod lag_frame;
 mod lag_control;
+mod lag_input;
 use step::{
     step_a, step_b, step_due, Due, SimState, ConsoleOps, StepAInput, StepBInput, StepJob, StepLocals, StepScopes,
     StepView,
@@ -2030,6 +2031,19 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let lag_maps = &crate::render::vita_renderer::config().sim_overlap_maps[..];
     #[cfg(not(feature = "vita_renderer"))]
     let lag_maps: &[String] = &[];
+    // Ordinary play admits listed maps without a tape session. A tape keeps its own running
+    // test, and the live chapter diagnostic keeps its path; the config makes them exclusive.
+    #[cfg(feature = "vita_renderer")]
+    let normal_admission = layout_config.sim_overlap_normal && replay.is_none() && !live_chapter;
+    #[cfg(not(feature = "vita_renderer"))]
+    let normal_admission = false;
+    // Host only: LOOKING_GLASS_LIVE_EPOCHS=off shows the input edge faults the epochs prevent.
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    let live_epochs = normal_admission
+        && std::env::var("LOOKING_GLASS_LIVE_EPOCHS").as_deref() != Ok("off");
+    #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
+    let live_epochs = normal_admission;
+    let mut lag_epochs = lag_input::Epochs::new(live_epochs);
     #[cfg(not(target_os = "vita"))]
     let fence_every = std::env::var("LOOKING_GLASS_SIM_FENCE_EVERY")
         .ok().map(|s| s.parse::<u64>()).transpose()?.unwrap_or(0);
@@ -2070,6 +2084,9 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 #[cfg(not(target_os = "vita"))]
                 let _ = report_due;
                 sim_audit.event("present", stamp);
+                lag_epochs.presented();
+                #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                crate::replay::input::epoch_taps::advance();
                 last_present = Some(stamp.frame.frame);
                 audio.scene_presented();
                 assert!(handoff_return.consume(&level_art.snapshot_visit), "missing pending handoff completion");
@@ -2238,7 +2255,9 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         forced_flush = false;
         let head_started = sim_trace.mark(frame);
         let lag_map = lag_maps.iter().any(|name| name == &maps[current])
-            && (live_chapter || replay.as_ref().is_some_and(|r| r.running() && r.replaying()));
+            && (live_chapter || replay.as_ref().is_some_and(|r| r.running() && r.replaying())
+                || normal_admission);
+        // The installed visit decides lag, never the map name the head happens to see.
         #[cfg(feature = "vita_renderer")]
         let lag_map = lag_map && (!layout_config.sim_overlap_normal
             || reserved_visit == Some(level_art.snapshot_visit.id()));
@@ -2442,10 +2461,15 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         // Inside the bench, retain physics with neutral input, including sticks.
         let mut step_guards = None;
         let mut input_started = sim_trace.input(frame);
-        let mut step_input = input.capture_step(
+        let (mut step_input, latched_epoch) = lag_epochs.head(
             replay.as_ref().filter(|r| r.running()).map_or(frame, |r| r.current_step() - 1),
-            physical_input && window_focused() && !bench && !route_running,
+            || input.capture_step(
+                replay.as_ref().filter(|r| r.running()).map_or(frame, |r| r.current_step() - 1),
+                physical_input && window_focused() && !bench && !route_running,
+            ),
         );
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        crate::replay::input::epoch_taps::log_head(frame, &step_input.frame, step_input.clock_bits, latched_epoch);
         input.apply_step(&step_input, &preferences);
         #[cfg(feature="native_timing")]
         timing.with(|r| {if r.schedule.is_some(){r.schedule_input(input.diagnostic_activity());}});
@@ -2496,7 +2520,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let throttle_normal = false;
         #[cfg(target_os = "vita")]
         let throttle_normal = throttle_normal && crate::frame_profile::mode() == crate::frame_profile::Mode::Full;
-        let mut quit_after_frame = is_quit_requested()
+        let mut quit_after_frame = step_input.frame.quit
             || (replay.as_ref().is_some_and(|r| r.replaying()) && macroquad::input::is_quit_requested());
         quit_after_frame |= host_transition == "quit" || lag_control.quit == Some(frame);
         if lag_control.quit == Some(frame) || (quit_after_frame && !throttle_normal) {
@@ -2506,14 +2530,14 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             break;
         }
         if physical_input && window_focused() && !console.open && !bench {
-            if (is_key_pressed(KeyCode::Escape) || input.pad_pressed("Start"))
+            if (step_input.frame.key(KeyCode::Escape, true) || input.pad_pressed("Start"))
                 && !menu
                 && !inventory_menu
             {
                 flush_pending!(frame, step_guards, step_input);
                 flush_audio!("escape-open");
                 escape_menu.open(crate::menu::Page::Main, &preferences, audio.settings);
-            } else if is_key_pressed(KeyCode::F3) {
+            } else if step_input.frame.key(KeyCode::F3, true) {
                 flush_pending!(frame, step_guards, step_input);
                 menu = false;
                 inventory_menu = false;
@@ -2717,7 +2741,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let mut chars = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
         chars.reverse();
         let toggle_console = physical_input && focused && !bench
-            && (is_key_pressed(KeyCode::GraveAccent)
+            && (step_input.frame.key(KeyCode::GraveAccent, true)
                 || chars.iter().any(|c| matches!(c, '`' | '~' | '\u{00ac}')));
         let console_input = console.open || toggle_console;
         let mut console_map = if let Some(choice) = chapter_requested.take() {
@@ -3052,7 +3076,10 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         }
         // Install the sampled clock before the owner head.
         let step = StepGuard::enter();
-        step_input.refresh_clock();
+        // A repeated epoch keeps the clock its first head latched.
+        if !latched_epoch { step_input.refresh_clock(); }
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        crate::replay::input::epoch_taps::log_clock(frame, step_input.clock_bits, latched_epoch);
         step_guards = Some((step, step_input.enter_clock()));
         macro_rules! pressed {
             ($key:expr) => { focused && !console_input && input.key(&preferences, $key, true) };
@@ -4657,6 +4684,7 @@ interactions
             });
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
             pending_probe.swap();
+            lag_epochs.retained(&step_input);
             frame += 1;
             continue;
         }
@@ -5630,10 +5658,13 @@ interactions
             }
         }
         drop(step_guards.take());
+        lag_epochs.before_tail_frame(crate::replay::input::capture_controls);
         let present_started = sim_trace.mark(present_stamp.frame.frame);
         #[cfg(target_os = "vita")]
         let display = sim_trace.display_before_swap(present_stamp, input_started.as_ref());
         next_frame().await;
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        crate::replay::input::epoch_taps::advance();
         #[cfg(target_os = "vita")]
         sim_trace.display_after_swap(display);
         sim_trace.owner(present_stamp, sim_timing::Scope::Present, None, present_started);
