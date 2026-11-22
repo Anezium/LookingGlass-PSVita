@@ -1580,7 +1580,9 @@ pub struct Renderer {
     sky_room: Option<sky_room::SkyRoom>,
     alpha_order: Vec<(f32, usize)>,
     prepared: Vec<Prepared>,
-    fx_gpu: Option<crate::render_fx::retained::Gpu>,
+    /// Boxed: `finish_fx` trades this field through a take/put-back pair every
+    /// frame, and the box keeps those moves one pointer wide.
+    fx_gpu: Option<Box<crate::render_fx::retained::Gpu>>,
     visibility_key: Option<[u32; 26]>,
     visibility_generation: u64,
     visibility: Vec<(u64, Option<(f32, Mat4)>)>,
@@ -3200,14 +3202,14 @@ impl Renderer {
     }
     pub(super) fn prewarm_fx(&mut self, gpu_skin_actors: bool) {
         self.fx_gpu.get_or_insert_with(|| {
-            crate::render_fx::retained::Gpu::prewarm(gpu_skin_actors).expect("retained actor shader")
+            Box::new(crate::render_fx::retained::Gpu::prewarm(gpu_skin_actors).expect("retained actor shader"))
         });
     }
     pub(super) fn finish_fx(&mut self, interop_flush: bool) -> (usize, usize) {
         let probe_finish = water_probe::tick();
         let _pass_clock = crate::pass_clock::scope(crate::pass_clock::FX_FINISH);
         let mut gpu = self.fx_gpu.take().unwrap_or_else(|| {
-            crate::render_fx::retained::Gpu::new().expect("retained actor shader")
+            Box::new(crate::render_fx::retained::Gpu::new().expect("retained actor shader"))
         });
         // water_stage_merge: a pair draws once, at the filter stage's place ("merge"), or as
         // the alpha stage alone ("drop_filter"). See alpha_fill::frame_pairs for the order.
@@ -3836,6 +3838,22 @@ pub(crate) async fn visualizer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_owner_sizes() {
+        // `Scene::draw` and `finish_fx` trade their retained owners through take()/Some()
+        // pairs every frame; both payloads are boxed, so each swap moves one pointer.
+        // The printed sizes identify the host unit-test target recording them.
+        println!(
+            "retained owner sizes: Renderer={} Gpu={}",
+            std::mem::size_of::<Renderer>(),
+            std::mem::size_of::<crate::render_fx::retained::Gpu>()
+        );
+        assert_eq!(std::mem::size_of::<Option<Box<Renderer>>>(), std::mem::size_of::<usize>());
+        assert_eq!(
+            std::mem::size_of::<Option<Box<crate::render_fx::retained::Gpu>>>(),
+            std::mem::size_of::<usize>()
+        );
+    }
     #[test]
     fn shader_cache_namespace_preserves_defaults_and_rejects_paths() {
         let parsed = parse_runtime_config(include_bytes!("../../configs/PL-rc13-release-play04.json")).unwrap().0;
