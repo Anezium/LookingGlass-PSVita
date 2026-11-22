@@ -1453,6 +1453,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             Loaded { scene, world } = $next;
         };
     }
+    // Declared before `owner_yield!` so the macro can name it; enabled once admission is known.
+    let mut lag_epochs = lag_input::Epochs::new(false);
     // Leave the step and drop its clock before yielding to owner work. Only the
     // controls that the base reads live can change on return.
     macro_rules! owner_yield {
@@ -1460,6 +1462,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             let in_step = $guards.take().is_some();
             let result = ($future).await;
             input.refresh_controls();
+            // The owner's framework frames are not carried into the next step (as key off).
+            lag_epochs.yielded();
             if in_step {
                 let step = StepGuard::enter();
                 $guards = Some((step, ClockView::capture().enter()));
@@ -2043,7 +2047,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         && std::env::var("LOOKING_GLASS_LIVE_EPOCHS").as_deref() != Ok("off");
     #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
     let live_epochs = normal_admission;
-    let mut lag_epochs = lag_input::Epochs::new(live_epochs);
+    lag_epochs = lag_input::Epochs::new(live_epochs);
     #[cfg(not(target_os = "vita"))]
     let fence_every = std::env::var("LOOKING_GLASS_SIM_FENCE_EVERY")
         .ok().map(|s| s.parse::<u64>()).transpose()?.unwrap_or(0);

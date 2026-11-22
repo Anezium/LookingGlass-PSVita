@@ -50,6 +50,13 @@ impl Epochs {
         self.presented = true;
     }
 
+    /// The head yielded to owner work (loading, a menu, a movie) after its present. Those
+    /// framework frames belong to the owner, as with the key off: the tail must not carry the
+    /// epoch the owner already showed to the live controls into the next step.
+    pub(super) fn yielded(&mut self) {
+        self.presented = false;
+    }
+
     /// The head retained its frame and loops back without a framework frame. Without a present
     /// in this head, the next head sees the epoch this head already consumed.
     pub(super) fn retained(&mut self, sample: &StepInput) {
@@ -105,10 +112,17 @@ mod tests {
         Lag,
         /// Drain: present the previous retained frame, then run serially.
         Drain,
+        /// Drain whose head then yields to owner work for two framework frames (loading),
+        /// as a natural exit, chapter or New Game does after its present.
+        DrainYield,
     }
 
     /// Runs heads in order and returns the tap bits each step received, plus latched clocks.
     fn run(enabled: bool, heads: &[Head]) -> (Vec<u128>, Vec<(u64, bool)>) {
+        run_with(enabled, true, heads)
+    }
+
+    fn run_with(enabled: bool, yield_clears: bool, heads: &[Head]) -> (Vec<u128>, Vec<(u64, bool)>) {
         let mut framework = Framework { epoch: 0 };
         let mut epochs = Epochs::new(enabled);
         let mut retained = false;
@@ -137,6 +151,16 @@ mod tests {
                     epochs.before_tail_frame(|| framework.edges());
                     framework.next_frame();
                 }
+                Head::DrainYield => {
+                    present(&mut framework, &mut epochs, &mut retained);
+                    framework.next_frame();
+                    framework.next_frame();
+                    if yield_clears {
+                        epochs.yielded();
+                    }
+                    epochs.before_tail_frame(|| framework.edges());
+                    framework.next_frame();
+                }
             }
         }
         (taps, clocks)
@@ -150,7 +174,22 @@ mod tests {
         epochs
     }
 
-    use Head::{Drain, Lag, Serial};
+    use Head::{Drain, DrainYield, Lag, Serial};
+
+    #[test]
+    fn a_press_on_the_last_loading_frame_does_not_reach_the_new_map() {
+        // Lag, then a drain whose head presents and yields two loading frames (epochs 2..=4 go
+        // to the owner), then serial play on the new map from epoch 5.
+        let heads = [Serial, Lag, DrainYield, Serial, Serial];
+        let (lag, _) = run(true, &heads);
+        let (off, _) = run(false, &[Serial, Serial, DrainYield, Serial, Serial]);
+        let new_map = |taps: &[u128]| delivered(&taps[3..]);
+        assert_eq!(new_map(&lag), vec![5, 6], "the new map's first step sees only its own epoch");
+        assert_eq!(new_map(&lag), new_map(&off), "same as with the key off");
+        // Without the yield clear, the last loading epoch (4) leaks into the new map's first step.
+        let (leak, _) = run_with(true, false, &heads);
+        assert_eq!(new_map(&leak), vec![4, 5, 6]);
+    }
     const ENTRY_AND_DRAIN: &[Head] = &[Serial, Serial, Lag, Lag, Lag, Drain, Serial, Lag, Lag, Drain, Lag, Drain, Serial];
 
     #[test]
