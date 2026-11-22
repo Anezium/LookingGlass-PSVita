@@ -44,7 +44,9 @@ LISTED = ['potears2']
 # Natural exits as mid-step exits (LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS), not the transition
 # probe, whose diagnostic tail fence would stop retention.
 EXIT_ORDER = ['potears3', 'potears2', 'wchess1', 'potears2']
-LIVE_EXITS = ','.join(f'{f}:natural-exit={m}' for f, m in zip((150, 330, 520, 700), EXIT_ORDER))
+LIVE_EXIT_FRAMES = (150, 330, 520, 700)
+LIVE_EXITS = ','.join(f'{f}:natural-exit={m}' for f, m in zip(LIVE_EXIT_FRAMES, EXIT_ORDER))
+ROLLBACK_FRAMES = (120, 200, 300, 480)
 REPLAY_EXITS = ','.join(f'{f}:natural-exit={m}' for f, m in zip((400, 800, 1200, 1600), EXIT_ORDER))
 
 
@@ -105,7 +107,11 @@ def check_visits(rows, counts, label):
     assert retained == sum(r['pending'] for r in rows), (label, counts, rows)
 
 
-def epochs(stdout):
+def epochs(stdout, owner_frames=()):
+    """Tap accounting per framework epoch. `owner_frames` are heads that left for owner work (a
+    scheduled exit, menu action, retry or New Game): when such a head presented its retained frame
+    first, the presented epoch belongs to the owner's loading or menu frames and reaches no step, as
+    with the key off (review S34 F3). Those epochs, and only those, may be absent."""
     heads = [(int(m[1]), int(m[2]), int(m[3], 16), int(m[4]), m[5] == 'true')
              for line in stdout if (m := HEAD.match(line))]
     assert heads, 'no live epoch heads'
@@ -118,7 +124,12 @@ def epochs(stdout):
     first, last = heads[0][1], heads[-1][1]
     window = range(first, last + 1)
     duplicated = sorted(e for e in window if delivered[e] > 1)
-    lost = sorted(e for e in window if delivered[e] == 0)
+    by_frame = {}
+    for frame, epoch, *_ in heads:
+        by_frame.setdefault(frame, epoch)
+    owner_epochs = {by_frame[f] + 1 for f in owner_frames if f in by_frame}
+    owner = sorted(e for e in window if delivered[e] == 0 and e in owner_epochs)
+    lost = sorted(e for e in window if delivered[e] == 0 and e not in owner_epochs)
     latched = [i for i, head in enumerate(heads) if head[4]]
     # A latched head delivers no edge and runs its step on the previous step's clock.
     clocks = [(int(m[1]), int(m[2]), m[3] == 'true') for line in stdout if (m := CLOCK.match(line))]
@@ -129,7 +140,7 @@ def epochs(stdout):
         for f in latched_frames)
     assert all(held == (frame in set(latched_frames)) for frame, _, held in clocks), 'latch mismatch'
     carried = sum(1 for _, _, taps, _, _ in heads if bin(taps).count('1') > 1)
-    return dict(heads=len(heads), epochs=len(window), duplicated=duplicated, lost=lost,
+    return dict(heads=len(heads), epochs=len(window), duplicated=duplicated, lost=lost, owner_consumed=owner,
                 latched_heads=len(latched), latched_clock_and_no_edges=clocks_held,
                 carried_heads=carried)
 
@@ -162,7 +173,7 @@ def run_live(args, out):
     rows, counts = visits(stdout, stderr)
     check_visits(rows, counts, 'multimap_live')
     assert [r['map'] for r in rows] == ['potears2', 'potears3', 'potears2', 'wchess1', 'potears2'], rows
-    summary = epochs(stdout)
+    summary = epochs(stdout, LIVE_EXIT_FRAMES)
     assert not summary['duplicated'] and not summary['lost'], summary
     summary.update(visits=rows, overlap=counts, elapsed_s=elapsed)
     report['multimap_live'] = summary
@@ -174,7 +185,7 @@ def run_live(args, out):
         args.binary, args.data, dict(config, story_film_bypass=True), args.sim,
         out / 'rollback_retry_live', ['--map', 'potears2', '--new-game', '--frames', '560'],
         dict(tap_env, LOOKING_GLASS_TRANSITION_FAIL_BUILD='1', LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS=(
-            '120:natural-exit=potears3,200:menu-save,300:retry,480:new-game')))
+            '%d:natural-exit=potears3,%d:menu-save,%d:retry,%d:new-game' % ROLLBACK_FRAMES)))
     rows, counts = visits(stdout, stderr)
     assert [r['map'] for r in rows] == ['potears2', 'potears2', 'potears2', 'gvillage'], rows
     assert len({r['visit'] for r in rows}) == 4, rows
@@ -187,7 +198,7 @@ def run_live(args, out):
     slot = json.loads((out / 'rollback_retry_live' / 'saves' / 'slot1.json').read_text())
     jpeg = bytes(slot['preview']['jpeg'])
     assert slot['payload']['current'].startswith('potears2') and jpeg[:2] == b'\xff\xd8', 'menu save'
-    summary = epochs(stdout)
+    summary = epochs(stdout, ROLLBACK_FRAMES)
     assert not summary['duplicated'] and not summary['lost'], summary
     summary.update(visits=rows, overlap=counts, elapsed_s=elapsed, menu_save_jpeg_bytes=len(jpeg))
     report['rollback_retry_live'] = summary
