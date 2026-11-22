@@ -641,6 +641,10 @@ pub(super) fn scene_fixture() -> Scene {
     let map = crate::interaction::tests::fixture();
     Scene {
         #[cfg(feature = "vita_renderer")]
+        gpu_skin_actors: false,
+        #[cfg(feature = "vita_renderer")]
+        actor_glow_subset: false,
+        #[cfg(feature = "vita_renderer")]
         retained: None,
         #[cfg(feature = "vita_renderer")]
         authored_sky: false,
