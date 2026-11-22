@@ -127,6 +127,16 @@ impl Peer {
     }
 }
 
+/// Whether mute keeps a step from retaining its frame. Mute only scales the owner's sink
+/// volumes. The owner applies a step's audio requests before it decides to retain that step's
+/// frame, a retained presentation touches no audio, and both mute writes (M and the Start menu's
+/// Audio page) flush the retained frame first, so a muted lag step hears and shows exactly what the
+/// serial step would. With `sim_overlap_normal` mute therefore fences nothing; without the key it
+/// fences as before, so the key-off build and the legacy diagnostics are unchanged.
+pub(super) fn mute_fences_lag(sim_overlap_normal: bool, muted: bool) -> bool {
+    muted && !sim_overlap_normal
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SaveAction {
     MenuSave,
@@ -208,6 +218,14 @@ impl SaveActions {
 #[cfg(all(test, not(target_os = "vita")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mute_fences_lag_only_without_the_normal_key() {
+        assert!(!mute_fences_lag(false, false));
+        assert!(mute_fences_lag(false, true), "key off: mute keeps fencing lag, as before");
+        assert!(!mute_fences_lag(true, false));
+        assert!(!mute_fences_lag(true, true), "sim_overlap_normal: a muted player keeps lag one");
+    }
 
     #[test]
     fn parse_save_actions_schedule() {

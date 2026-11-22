@@ -18,7 +18,12 @@ toggles pause, inventory and the chapter chooser, opens and closes the Start men
 (`die` host action) and retries from the death screen with Enter, and mutes and unmutes. Each state
 must be reached, no head in it may dispatch, lag must dispatch again after it, the death retry must
 reinstall the listed map as a new visit, and the run must exit cleanly with its dispatch and
-retention totals equal to the per-visit audit events.
+retention totals equal to the per-visit audit events. Muted heads must retain (the mute fix).
+
+mute: the PotEars2 tape with the game muted from the start, and with M pressed on two frames
+(mute, then sound back), OFF against the normal layout. Every oracle channel, check and event
+line must be exact, and the muted lag run must retain as many frames as the unmuted one.
+
 """
 import argparse
 from collections import Counter, defaultdict
@@ -401,7 +406,10 @@ def run_ui(args, out):
                             dispatched_in_state=len(inside), retained_in_state=len(kept),
                             retained_before=len([f for f in pending if first - 240 <= f < first]),
                             retained_after=len(after))
-        if name != 'muted':
+        if name == 'muted':
+            # Mute is not a lag fence with the normal key: muted gameplay heads keep retaining.
+            assert kept, 'muted heads retained nothing'
+        else:
             # A paused, menu, inventory, Start or death head is not gameplay: it never dispatches.
             assert not inside, (name, inside[:5])
         assert after, f'lag did not retain again after {name}'
@@ -426,16 +434,126 @@ def run_ui(args, out):
     return dict(ui_states_live=summary)
 
 
+KEY_BITS = dict(M=1 << 30)
+# Binding row of "Mute sound" (preferences::BINDINGS). The Vita preset in the tapes leaves it
+# unbound: mute is a Start-menu setting there.
+MUTE_ROW = 23
+TAPE_TIME = dict(LOOKING_GLASS_SIM_MAPS_TAPE_TIME='1')
+MUTED = 'music=0.5\neffects=0.7\nmuted=true\n'
+MUTE_PRESSES = (700, 1500)
+
+
+def edit_tape(src, dst, presses=(), holds=(), bind=None):
+    """Copy a tape, adding one-frame key presses (step, mask) and held keys (first, last, mask),
+    and binding rows of its recorded preferences (`bind`: row -> key name). `kd` is sticky in the
+    tape, so the copy decodes it and writes it back where it changes."""
+    edits = {}
+    for step, mask in presses:
+        edits.setdefault(step, []).append(('press', mask))
+        edits.setdefault(step + 1, []).append(('release', mask))
+    for first, last, mask in holds:
+        edits.setdefault(first, []).append(('press', mask))
+        for step in range(first + 1, last + 1):
+            edits.setdefault(step, []).append(('hold', mask))
+        edits.setdefault(last + 1, []).append(('release', mask))
+    out, step, down, written = [], 0, 0, 0
+    for line in Path(src).read_text(encoding='utf-8').splitlines():
+        if line.startswith('H ') and bind:
+            header = json.loads(line[2:])
+            for row, key in bind.items():
+                header['preferences']['bindings'][row] = key
+            out.append('H ' + json.dumps(header, separators=(',', ':')))
+            continue
+        if not line.startswith('F '):
+            out.append(line)
+            continue
+        tokens = line.split(' ')
+        fields = dict(t.split('=', 1) for t in tokens[2:] if '=' in t)
+        flags = [t for t in tokens[2:] if '=' not in t]
+        if 'kd' in fields:
+            down = int(fields['kd'], 16)
+        pressed = int(fields.get('kp', '0'), 16)
+        released = int(fields.get('kr', '0'), 16)
+        kd = down
+        for kind, mask in sorted(edits.get(step, ()), key=lambda e: e[0] != 'release'):
+            if kind == 'release':
+                released |= mask
+                kd &= ~mask
+            else:
+                kd |= mask
+                if kind == 'press':
+                    pressed |= mask
+        rest = [f'{k}={v}' for k, v in fields.items() if k not in ('kd', 'kp', 'kr')]
+        new = [tokens[0], tokens[1]]
+        if kd != written:
+            new.append(f'kd={kd:x}')
+        if pressed:
+            new.append(f'kp={pressed:x}')
+        if released:
+            new.append(f'kr={released:x}')
+        out.append(' '.join(new + rest + flags))
+        written = kd
+        step += 1
+    Path(dst).write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+
+def run_mute(args, out):
+    """The mute fix on the PotEars2 tape: muted from the start and toggled twice by M."""
+    lag = dict(sim_overlap=True, sim_overlap_normal=True, sim_overlap_maps=LISTED, skin_workers=2)
+    toggled = out / 'a2-04-mute-toggles.lgtape'
+    edit_tape(args.tape, toggled, presses=[(f, KEY_BITS['M']) for f in MUTE_PRESSES], bind={MUTE_ROW: 'M'})
+    plan = dict(LOOKING_GLASS_SIM_AUDIT='1', **TAPE_TIME)
+
+    def arm(name, overrides, tape, muted):
+        result = saves.run_viewer(args.binary, args.data, args.config, args.sim, out / name,
+                                  tape_src=tape, overrides=overrides, extra_env=plan, timeout_s=900,
+                                  private_files={'audio-settings.txt': MUTED} if muted else None)
+        result['settings_after'] = (out / name / 'private' / 'audio-settings.txt').read_text() \
+            if (out / name / 'private' / 'audio-settings.txt').exists() else None
+        return result
+
+    report = {}
+    unmuted = arm('lag_unmuted', lag, args.tape, False)
+    for label, tape, muted in (('muted', args.tape, True), ('toggled', toggled, False)):
+        off = arm(f'off_{label}', {}, tape, muted)
+        on = arm(f'lag_{label}', lag, tape, muted)
+        saves.compare_channels(off, on, f'mute:{label}')
+        assert off['checks'] == on['checks'], f'{label}: replay check lines differ'
+        assert off['events'] == on['events'], f'{label}: replay event lines differ'
+        assert off['dispatched_frames'] == 0 and off['retained_frames'] == 0, label
+        assert on['dispatched_frames'] > 0, label
+        # The game really was muted: the mix differs from the unmuted run.
+        assert on['audio_mix'] != unmuted['audio_mix'], f'{label}: mute had no effect on the mix'
+        done = [l for l in on['stdout_lines'] if l.startswith('[lg/replay] done ')]
+        assert len(done) == 1 and 'result=PASS' in done[0] and ' diff=0 ' in done[0], (label, done)
+        report[label] = dict(frames=on['frames'], dispatched=on['dispatched_frames'],
+                             retained=on['retained_frames'], checks=len(on['checks']),
+                             events=len(on['events']), channels_exact=True, replay=done[0],
+                             settings_after=on['settings_after'])
+        print('mute', label, json.dumps(report[label]), flush=True)
+    report['unmuted'] = dict(dispatched=unmuted['dispatched_frames'], retained=unmuted['retained_frames'])
+    assert report['muted']['dispatched'] == report['unmuted']['dispatched']
+    assert report['muted']['retained'] == report['unmuted']['retained'], report
+    # Each M press flushes the retained frame, so the toggled run may retain a couple fewer frames.
+    assert report['unmuted']['retained'] - report['toggled']['retained'] <= len(MUTE_PRESSES), report
+    assert 'muted=false' in report['toggled']['settings_after'], 'M was not pressed twice'
+    for name in ('lag_unmuted', 'off_muted', 'lag_muted', 'off_toggled', 'lag_toggled'):
+        shutil.rmtree(out / name)
+    print('mute', json.dumps(report), flush=True)
+    return dict(mute=report)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('live', 'replay', 'controls', 'ui'))
+    parser.add_argument('mode', choices=('live', 'replay', 'controls', 'ui', 'mute'))
     for name in ('binary', 'data', 'config', 'sim', 'out'):
         parser.add_argument(f'--{name}', required=True)
     parser.add_argument('--tape')
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    report = dict(live=run_live, replay=run_replay, controls=run_controls, ui=run_ui)[args.mode](args, out)
+    report = dict(live=run_live, replay=run_replay, controls=run_controls, ui=run_ui,
+                  mute=run_mute)[args.mode](args, out)
     report.update(binary=str(args.binary),
                   binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest())
     (out / f'{args.mode}-proof.json').write_text(json.dumps(report, indent=2) + '\n')

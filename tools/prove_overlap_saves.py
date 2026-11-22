@@ -126,7 +126,7 @@ def slice_tape(src, dst, max_frames, kp_frames=None, quit_frame=None, bind_f5=Fa
 
 def run_viewer(binary, data_dir, config_path, sim_path, work_dir, tape_src=None,
                overrides=None, extra_env=None, seed_files=None, replay_record=None,
-               replay_start=None, stop_after=0, timeout_s=300):
+               replay_start=None, stop_after=0, timeout_s=300, private_files=None):
     if work_dir.exists():
         shutil.rmtree(work_dir)
     private = work_dir / 'private'
@@ -166,6 +166,9 @@ def run_viewer(binary, data_dir, config_path, sim_path, work_dir, tape_src=None,
         config.update(overrides)
     (private / 'vita_renderer.json').write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
     shutil.copy2(sim_path, private / 'vita_sim.json')
+    # Host settings files such as audio-settings.txt (read from private/ on the host).
+    for name, text in (private_files or {}).items():
+        (private / name).write_text(text, encoding='utf-8')
     env = dict(os.environ)
     env.update(
         LANG='C',

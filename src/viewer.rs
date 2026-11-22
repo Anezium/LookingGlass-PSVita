@@ -2043,6 +2043,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let normal_admission = layout_config.sim_overlap_normal && replay.is_none() && !live_chapter;
     #[cfg(not(feature = "vita_renderer"))]
     let normal_admission = false;
+    // With the normal key, mute is not a lag fence (lag_control::mute_fences_lag).
+    #[cfg(feature = "vita_renderer")]
+    let normal_key = layout_config.sim_overlap_normal;
+    #[cfg(not(feature = "vita_renderer"))]
+    let normal_key = false;
     // Host only: LOOKING_GLASS_LIVE_EPOCHS=off shows the input edge faults the epochs prevent.
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     let live_epochs = normal_admission
@@ -4643,7 +4648,7 @@ interactions
         crate::spike_log::world_last_read();
         let lag_free = lag_dispatch && worker_complete && snapshot_world_free && active && focused
             && stats.alive() && !paused && !menu && !inventory_menu && !console.open && !console_input
-            && !audio.settings.muted
+            && !lag_control::mute_fences_lag(normal_key, audio.settings.muted)
             && context_before == (menu, inventory_menu, console.open, paused)
             && skip_id.is_none() && !pand_cinematic && scripted_camera.is_none() && !story.busy()
             && !camera_handoff.was_scripted() && !freeze_capture && !opening_escape_menu
