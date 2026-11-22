@@ -907,7 +907,13 @@ fn looping_clip(
     if let Some(clip) = world_clips.get(path) {
         return Some(clip.clone());
     }
-    let clip = assets.read(path).and_then(decode_clip).ok()?;
+    let late = crate::spike_log::on().then(std::time::Instant::now);
+    let decoded = assets.read(path).and_then(decode_clip);
+    if let Some(start) = late {
+        crate::spike_log::late(crate::spike_log::AUDIO_CLIP, start.elapsed().as_secs_f64() * 1000.,
+            Some(path), decoded.as_ref().ok().map(|c| c.samples.len() * 4));
+    }
+    let clip = decoded.ok()?;
     if retain && *cache_samples + clip.samples.len() <= CACHE_SAMPLES {
         *cache_samples += clip.samples.len();
         world_clips.insert(path.to_owned(), clip.clone());
