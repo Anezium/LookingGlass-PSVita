@@ -13,8 +13,12 @@ use crate::replay::input::Frame;
 #[derive(Default)]
 pub(super) struct Epochs {
     enabled: bool,
-    /// A present ran after this head's capture, so the framework epoch moved on.
-    presented: bool,
+    /// A present ran after this head's capture and its epoch is owed to the next head: the tail
+    /// carries its edges. An owner yield hands that epoch to the owner and clears this.
+    carry_due: bool,
+    /// The framework epoch moved on after this head's capture (a present, with or without a
+    /// later yield). A retaining head then must not share its sample with the next head.
+    moved: bool,
     /// The previous head's sample when the next head repeats its epoch.
     shared: Option<StepInput>,
     /// Edges of an epoch that no head captured.
@@ -29,7 +33,8 @@ impl Epochs {
     /// The head sample. The bool is true when the sample repeats the previous epoch, whose
     /// clock stays latched for this step.
     pub(super) fn head(&mut self, step: u64, capture: impl FnOnce() -> StepInput) -> (StepInput, bool) {
-        self.presented = false;
+        self.carry_due = false;
+        self.moved = false;
         if !self.enabled {
             return (capture(), false);
         }
@@ -47,20 +52,22 @@ impl Epochs {
 
     /// Called after every present of a retained frame.
     pub(super) fn presented(&mut self) {
-        self.presented = true;
+        self.carry_due = true;
+        self.moved = true;
     }
 
     /// The head yielded to owner work (loading, a menu, a movie) after its present. Those
     /// framework frames belong to the owner, as with the key off: the tail must not carry the
-    /// epoch the owner already showed to the live controls into the next step.
+    /// epoch the owner already showed to the live controls into the next step. The epoch still
+    /// moved: a head that retains after the yield must not share its stale sample.
     pub(super) fn yielded(&mut self) {
-        self.presented = false;
+        self.carry_due = false;
     }
 
     /// The head retained its frame and loops back without a framework frame. Without a present
     /// in this head, the next head sees the epoch this head already consumed.
     pub(super) fn retained(&mut self, sample: &StepInput) {
-        if self.enabled && !self.presented {
+        if self.enabled && !self.moved {
             self.shared = Some(sample.clone());
         }
     }
@@ -68,7 +75,7 @@ impl Epochs {
     /// Just before the serial tail's framework frame. A present in this head began an epoch that
     /// this head's consumers never read; keep its edges for the next head.
     pub(super) fn before_tail_frame(&mut self, edges: impl FnOnce() -> Frame) {
-        if self.enabled && self.presented {
+        if self.enabled && self.carry_due {
             self.carry = Some(edges());
         }
     }
@@ -115,6 +122,9 @@ mod tests {
         /// Drain whose head then yields to owner work for two framework frames (loading),
         /// as a natural exit, chapter or New Game does after its present.
         DrainYield,
+        /// Present the previous retained frame, yield one framework frame to the owner, then
+        /// retain this step (reachable on desktop when `save_preview` is not throttled).
+        LagYield,
     }
 
     /// Runs heads in order and returns the tap bits each step received, plus latched clocks.
@@ -123,17 +133,25 @@ mod tests {
     }
 
     fn run_with(enabled: bool, yield_clears: bool, heads: &[Head]) -> (Vec<u128>, Vec<(u64, bool)>) {
+        run_full(enabled, yield_clears, heads).0
+    }
+
+    /// Also returns each head's sample, so a test can see what a derived head repeated.
+    fn run_full(enabled: bool, yield_clears: bool, heads: &[Head])
+        -> ((Vec<u128>, Vec<(u64, bool)>), Vec<StepInput>) {
         let mut framework = Framework { epoch: 0 };
         let mut epochs = Epochs::new(enabled);
         let mut retained = false;
         let mut taps = Vec::new();
         let mut clocks = Vec::new();
+        let mut samples = Vec::new();
         for (step, head) in heads.iter().enumerate() {
             let (sample, latched) = epochs.head(step as u64, || framework.capture(step as u64));
             assert_eq!(sample.step, step as u64);
             assert_eq!(sample.frame.keys_down, 1 << 100, "held input survives every sample");
             taps.push(sample.frame.keys_pressed);
             clocks.push((sample.clock_bits, latched));
+            samples.push(sample.clone());
             let present = |framework: &mut Framework, epochs: &mut Epochs, retained: &mut bool| {
                 if std::mem::take(retained) {
                     framework.next_frame();
@@ -161,9 +179,18 @@ mod tests {
                     epochs.before_tail_frame(|| framework.edges());
                     framework.next_frame();
                 }
+                Head::LagYield => {
+                    present(&mut framework, &mut epochs, &mut retained);
+                    framework.next_frame();
+                    if yield_clears {
+                        epochs.yielded();
+                    }
+                    retained = true;
+                    epochs.retained(&sample);
+                }
             }
         }
-        (taps, clocks)
+        ((taps, clocks), samples)
     }
 
     fn delivered(taps: &[u128]) -> Vec<u32> {
@@ -174,7 +201,40 @@ mod tests {
         epochs
     }
 
-    use Head::{Drain, DrainYield, Lag, Serial};
+    use Head::{Drain, DrainYield, Lag, LagYield, Serial};
+
+    #[test]
+    fn a_head_that_presents_yields_and_retains_does_not_share_its_stale_sample() {
+        // Review REVIEW-FIXES-S10 R5. Step 2 presents step 1's frame (epoch 1 -> 2), yields one
+        // owner frame (2 -> 3), then retains. The epoch moved, so step 3 must capture epoch 3
+        // fresh, not repeat step 2's pre-yield sample (stale held keys, sticks and clock).
+        let heads = [Serial, Lag, LagYield, Drain, Serial];
+        let ((taps, clocks), samples) = run_full(true, true, &heads);
+        assert!(!clocks[3].1, "step 3 captured, not derived");
+        assert_eq!(samples[3].clock_bits, 3, "step 3 sees the post-yield epoch");
+        assert_ne!(samples[3].clock_bits, samples[2].clock_bits);
+        // Epoch 2 began at the present in step 2's head and the owner's yield frame consumed it,
+        // as after any owner yield (review S34 F3). No epoch reaches two steps.
+        let got = delivered(&taps);
+        let mut sorted = got.clone();
+        sorted.dedup();
+        assert_eq!(sorted, got, "no epoch reaches two steps: {got:?}");
+        assert!(!got.contains(&2), "the yielded epoch belongs to the owner: {got:?}");
+        assert!(got.contains(&3), "the post-yield epoch reaches the next step: {got:?}");
+    }
+
+    #[test]
+    fn ship_profile_sequences_are_unchanged_by_the_split_flag() {
+        // Every head kind reachable with the ship profile: steady lag, drains, serial play and a
+        // present followed by an owner yield and the serial tail. Same deliveries and latches as
+        // the single flag gave (pinned values from the tests above).
+        let (lag, _) = run(true, &[Serial, Lag, DrainYield, Serial, Serial]);
+        assert_eq!(delivered(&lag[3..]), vec![5, 6]);
+        let (taps, clocks) = run(true, ENTRY_AND_DRAIN);
+        let got = delivered(&taps);
+        assert_eq!(got, (0..=*got.last().unwrap()).collect::<Vec<_>>());
+        assert_eq!(clocks.iter().filter(|(_, latched)| *latched).count(), 3);
+    }
 
     #[test]
     fn a_press_on_the_last_loading_frame_does_not_reach_the_new_map() {
