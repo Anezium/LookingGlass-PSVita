@@ -287,6 +287,10 @@ impl Session {
             aggregates: BTreeMap::new(),
         }))
     }
+    pub(crate) fn control_mut(&mut self) -> &mut Control {
+        self.control.as_mut().expect("route control in session")
+    }
+
     pub(crate) fn take_control(&mut self) -> Control {
         self.control.take().expect("route control in session")
     }

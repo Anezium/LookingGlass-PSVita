@@ -1,5 +1,5 @@
 //! Simulation values captured for the viewer's presentation writes.
-use crate::{collision::World, interaction::Interactions, level::ReflectionActor, water::Liquid};
+use crate::{interaction::Interactions, level::ReflectionActor, water::Liquid};
 use macroquad::prelude::{Quat, Vec3, Vec4};
 
 pub(crate) struct PresentationInput {
@@ -29,8 +29,8 @@ impl PresentationInput {
         }
     }
 
-    pub fn capture(world: &World, camera: Vec3, interactions: &Interactions) -> Self {
-        let liquid = Liquid::from_contents(world.liquid_at(camera)).tint();
+    pub fn capture(liquid_contents: i32, interactions: &Interactions) -> Self {
+        let liquid = Liquid::from_contents(liquid_contents).tint();
         let (script_fog, script_sky_origin) = interactions.presentation.inputs();
         let levels = &interactions.levels;
         let controller_sky_origin = levels.iter().find_map(|slot| slot.ctl.sky_origin());

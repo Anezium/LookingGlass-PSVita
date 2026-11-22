@@ -850,7 +850,7 @@ impl Gpu {
         let actual = if p.gpu_skin.is_some() && !self.skin.as_ref().unwrap().supports(variant) {
             Route::Full
         } else { program };
-        if !p.effect {
+        if !p.effect && c.spike_log_ms > 0. {
             crate::spike_log::actor_routes(culled_to_zero, actual.is_lean_lit(), actual == Route::Full);
         }
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]

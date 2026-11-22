@@ -1422,6 +1422,8 @@ impl AliceArt {
 impl Character {
     pub(crate) fn art_mut(&mut self) -> &mut AliceArt { &mut self.art }
 
+    pub(crate) fn sim_mut(&mut self) -> &mut AliceSim { &mut self.sim }
+
     pub(crate) fn body_ready(&self) -> bool {
         self.art.body_input.as_ref().is_some_and(|input| self.art.valid_body_input(input))
     }
