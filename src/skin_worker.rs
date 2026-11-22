@@ -1,6 +1,11 @@
 //! Persistent math workers: fixed application masks, explicit stacks, no renderer imports.
 pub(crate) const STACK_BYTES: usize = 512 * 1024;
 pub(crate) fn mask(worker: usize) -> i32 {
+    #[cfg(feature = "vita_renderer")]
+    if crate::render::vita_renderer::config().sim_overlap_normal {
+        // Worker zero remains eligible when the CPU1 worker is parked.
+        return [0x40000, 0x20000][worker];
+    }
     if crate::spike_log::cpu1_reserved() {
         0x40000
     } else {

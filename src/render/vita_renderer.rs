@@ -543,6 +543,9 @@ pub struct Config {
     pub replay_record: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sim_overlap: bool,
+    /// Select the CPU layout on map install. Legacy overlap diagnostics use a static layout.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sim_overlap_normal: bool,
     /// Maps eligible for lag one during playback or an opted-in live chapter run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sim_overlap_maps: Vec<String>,
@@ -814,6 +817,7 @@ impl Default for Config {
             route_world_wish: false,
             replay_record: String::new(),
             sim_overlap: false,
+            sim_overlap_normal: false,
             sim_overlap_maps: Vec::new(),
             sim_overlap_live: false,
             sim_overlap_cap_30: false,
@@ -885,7 +889,7 @@ impl Config {
             && self.fx_prepare_cache && !self.actor_layer_reuse && self.renderer=="vita"
     }
     pub(crate) fn cpu1_reserved(&self) -> bool {
-        self.diag_overlap || self.sim_overlap
+        self.diag_overlap || (self.sim_overlap && !self.sim_overlap_normal)
     }
     pub(crate) fn snapshot_log_enabled(&self) -> bool {
         self.diag_snapshot && self.diag_snapshot_log.unwrap_or(!self.sim_overlap)
@@ -900,6 +904,12 @@ impl Config {
             "phase_census_window requires replay_play, explicit positive spike frame bounds, and phase_census off");
         ensure!(!self.sim_overlap || self.replay_record.is_empty(), "replay_record and sim_overlap are exclusive");
         ensure!(!self.sim_overlap || self.renderer == "vita", "sim_overlap requires renderer=vita");
+        ensure!(!self.sim_overlap_normal || (
+            self.sim_overlap && !self.sim_overlap_maps.is_empty()
+                && !self.diag_overlap && !self.sim_overlap_live
+                && self.skin_workers == 2 && self.skin_overlap
+                && self.audio_pcm_worker && self.audio_producer_affinity == 0x40000
+        ), "sim_overlap_normal requires two overlapping skin workers, a sim_overlap map allowlist and buffered audio on CPU2, without legacy layout diagnostics");
         ensure!(self.sim_overlap_maps.is_empty()
             || (self.sim_overlap && (!self.replay_play.is_empty() || self.sim_overlap_live)),
             if self.sim_overlap_live { "sim_overlap_maps requires sim_overlap in live play" }
@@ -6688,6 +6698,28 @@ mod tests {
 #[cfg(test)]
 mod overlap_probe_tests {
     use super::Config;
+    #[test]
+    fn normal_overlap_swaps_the_worker_pins_and_keeps_static_reservation_off() {
+        let mut config = Config {
+            sim_overlap: true,
+            sim_overlap_normal: true,
+            sim_overlap_maps: vec!["potears2".into()],
+            replay_play: "fixture.lgtape".into(),
+            skin_workers: 2,
+            audio_pcm_worker: true,
+            audio_producer_affinity: 0x40000,
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        assert!(!config.cpu1_reserved());
+        super::with_config(|current| *current = config.clone(), || {
+            assert_eq!(crate::skin_worker::mask(0), 0x40000);
+            assert_eq!(crate::skin_worker::mask(1), 0x20000);
+        });
+        config.skin_workers = 1;
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn cpu1_reservation_requires_the_reserved_layout_in_each_arm() {
         for (diag, sim) in [(false, false), (true, false), (false, true), (true, true)] {

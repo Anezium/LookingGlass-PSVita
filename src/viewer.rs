@@ -1327,6 +1327,27 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let sim_overlap = false;
     let mut sim_audit = sim_audit::Audit::new();
     let mut sim_worker = sim_overlap.then(|| blocked_step::Worker::new(&sim_audit)).transpose()?;
+    let mut pending: Option<lag_frame::Frame> = None;
+    #[cfg(feature = "vita_renderer")]
+    let layout_config = crate::render::vita_renderer::config();
+    #[cfg(feature = "vita_renderer")]
+    let mut reserved_visit = None;
+    macro_rules! commit_sim_layout {
+        ($map:expr, $visit:expr) => {{
+            #[cfg(feature = "vita_renderer")]
+            if layout_config.sim_overlap_normal {
+                assert!(pending.is_none(), "layout switch before retained presentation drained");
+                assert!(sim_worker.as_ref().is_some_and(blocked_step::Worker::idle));
+                let map = $map;
+                let visit = $visit.id();
+                let reserved = layout_config.sim_overlap_maps.iter().any(|name| name == map);
+                crate::character::skinning::overlap::park_cpu1(reserved);
+                reserved_visit = reserved.then_some(visit);
+                let workers = if reserved { 1 } else { 2 };
+                eprintln!("[lg/sim-layout] map={map} visit={visit} active_skin_workers={workers}");
+            }
+        }};
+    }
     let mut worker_generation = 0u64;
     let mut dispatched_frames = 0u64;
     let mut retained_frames = 0u64;
@@ -1479,6 +1500,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             audio.load(&mut assets, &maps[current], &scene.map);
             audio.install_story_voices(&mut story, &maps[current]);
             install_timing.mark("audio_load");
+            commit_sim_layout!(&maps[current], level_art.snapshot_visit);
             clock.pause();
             paused = $pause;
             menu = false;
@@ -1521,6 +1543,15 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     if save::bench_scene(validated) == save::BenchScene::ReuseValidated {
         // The restored scene's build and its install are one load window.
         let _share = crate::texture::load_scope();
+        #[cfg(feature = "vita_renderer")]
+        let _layout_loading = if layout_config.sim_overlap_normal {
+            let destination = &prepared.as_ref().unwrap().game.level()?.map;
+            let loading = crate::loading_screen::begin("startup-restore", destination);
+            crate::loading_screen::show().await;
+            Some(loading)
+        } else {
+            None
+        };
         let mut timing = crate::startup::Phase::new("restore_resources");
         power_art = crate::powerups::Art::load(&mut assets)?;
         timing.mark("power_art");
@@ -1692,6 +1723,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         level_art.prepare(&mut assets, &scene, &interactions, true)?;
         entry_timing.mark("level_art");
         crate::loading_screen::between("level_art").await;
+        commit_sim_layout!(&maps[current], level_art.snapshot_visit);
         drop(boot_loading);
         campaign = Campaign::default();
         #[cfg(feature = "native_timing")]
@@ -1830,6 +1862,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     // level art, particles or decoded level PCM survive into the build.
     macro_rules! unload_scene {
         () => {{
+            #[cfg(feature = "vita_renderer")]
+            if layout_config.sim_overlap_normal {
+                assert!(pending.is_none(), "scene unload before retained presentation drained");
+                assert!(sim_worker.as_ref().is_some_and(blocked_step::Worker::idle));
+            }
             // The recycle slot shares the outgoing World geometry. Release it
             // before budgeting the destination build.
             if sim_overlap { drop(acoustic_view.take()); }
@@ -1844,7 +1881,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     }
     macro_rules! rollback_resources {
         ($checkpoint:expr, $outgoing:expr, $particles:expr, $audio:expr, $reload_alice:expr, $guards:ident) => {{
-            if let Some((art, cast, particles, level)) = $outgoing.take() {
+            let character = if let Some((art, cast, particles, level)) = $outgoing.take() {
                 level_art = art; npcs = cast; steam = particles;
                 Loaded { scene, world } = level;
                 None
@@ -1867,7 +1904,9 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 audio.reload_story_voices(&mut assets, &maps[current]);
                 audio.restore_transition($audio);
                 character
-            }
+            };
+            commit_sim_layout!(&maps[current], level_art.snapshot_visit);
+            character
         }};
     }
     macro_rules! restore_transition {
@@ -1957,7 +1996,6 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         };
     }
     let mut art_ops = Vec::new();
-    let mut pending: Option<lag_frame::Frame> = None;
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     let mut pending_probe = crate::sim_maps::probe::StepRows::default();
     #[cfg(feature = "vita_renderer")]
@@ -2172,6 +2210,9 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let head_started = sim_trace.mark(frame);
         let lag_map = lag_maps.iter().any(|name| name == &maps[current])
             && (live_chapter || replay.as_ref().is_some_and(|r| r.running() && r.replaying()));
+        #[cfg(feature = "vita_renderer")]
+        let lag_map = lag_map && (!layout_config.sim_overlap_normal
+            || reserved_visit == Some(level_art.snapshot_visit.id()));
         #[cfg(feature = "native_timing")]
         let lag_map = lag_map && timing.recorder.is_none();
         debug_assert!(audio_step.ops.is_empty());
@@ -3474,6 +3515,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                         audio.load(&mut assets, &maps[selected], &scene.map);
                         audio.install_story_voices(&mut story, &maps[selected]);
                         current = selected;
+                        commit_sim_layout!(&maps[current], level_art.snapshot_visit);
                         campaign = Campaign::default();
                         played = true;
                         pickup_clock = 0.;
@@ -3827,6 +3869,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                     step_locals.weapon_click = None;
                     weapon_buttons.block();
                     level_art = next.art;
+                    commit_sim_layout!(&maps[current], level_art.snapshot_visit);
                     skip_scene = crate::cinematic::Skip::default();
                     autosave_requested = options.frames.is_none();
                     retry.remember(game_snapshot!());

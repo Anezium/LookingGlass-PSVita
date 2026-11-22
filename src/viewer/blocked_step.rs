@@ -98,6 +98,11 @@ impl Drop for StackReport {
 }
 
 impl Worker {
+    #[cfg(feature = "vita_renderer")]
+    pub(super) fn idle(&self) -> bool {
+        self.flight.is_none()
+    }
+
     pub(super) fn new(audit: &Audit) -> Result<Self> {
         // The V2 24 MiB budget covers both slots' retained bytes, skin-held
         // backing and this sim stack. The other thread stacks are separate.

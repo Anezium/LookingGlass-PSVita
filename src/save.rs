@@ -717,7 +717,7 @@ impl CheckpointWriter {
             .spawn(move || {
                 #[cfg(target_os = "vita")]
                 {
-                    let policy = crate::audio::thread_policy(191, 0);
+                    let policy = crate::audio::background_service_policy();
                     eprintln!("[lg/worker-probe] role=save-writer {}", policy.describe());
                 }
                 for mut job in jobs {
