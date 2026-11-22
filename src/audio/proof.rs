@@ -106,3 +106,29 @@ pub(super) fn named_enqueue(
         "sha256": format!("{:x}", pcm_hash(&pcm.clip.samples)),
     }));
 }
+
+/// Playback proof for resident Alice player cues across one-shot and loop paths.
+pub(super) fn player_enqueue(
+    path: &str,
+    pcm: &super::Pcm,
+    origin: Option<macroquad::prelude::Vec3>,
+    gain: f32,
+    loop_id: Option<usize>,
+) {
+    if !enabled() || !super::PLAYER_CUES.contains(&path) {
+        return;
+    }
+    let output_sample = MIX.with(|mix| mix.borrow().0);
+    println!("AUDIO_PLAYER_ENQUEUE {}", serde_json::json!({
+        "frame": crate::sim_maps::probe::frame(),
+        "output_sample": output_sample,
+        "path": path,
+        "origin_bits": origin.map(|p| p.to_array().map(f32::to_bits)),
+        "gain_bits": gain.to_bits(),
+        "loop_id": loop_id,
+        "index": pcm.index,
+        "rate": pcm.clip.rate,
+        "samples": pcm.clip.samples.len(),
+        "sha256": format!("{:x}", pcm_hash(&pcm.clip.samples)),
+    }));
+}
