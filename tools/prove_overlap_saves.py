@@ -288,6 +288,8 @@ def run_viewer(binary, data_dir, config_path, sim_path, work_dir, tape_src=None,
         retained_frames=retained_frames,
         files=files,
         elapsed_s=round(time.time() - started, 2),
+        stdout_lines=proc.stdout.splitlines(),
+        stderr_lines=proc.stderr.splitlines(),
     )
 
 

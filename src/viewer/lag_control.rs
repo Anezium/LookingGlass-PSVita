@@ -139,7 +139,7 @@ pub(super) enum SaveAction {
 #[derive(Default)]
 pub(super) struct SaveActions {
     #[cfg(not(target_os = "vita"))]
-    entries: Vec<(u64, SaveAction)>,
+    entries: Vec<(u64, SaveAction, Option<String>)>,
 }
 
 impl SaveActions {
@@ -163,6 +163,13 @@ impl SaveActions {
                 anyhow::bail!("invalid lag save action {item:?}");
             };
             let frame: u64 = frame.parse()?;
+            // `natural-exit=<map>` names the exit's destination; plain `natural-exit` keeps
+            // LOOKING_GLASS_TRANSITION_DESTINATION.
+            let (kind, destination) = match kind.split_once('=') {
+                Some(("natural-exit", map)) if !map.is_empty() => ("natural-exit", Some(map.to_owned())),
+                Some(_) => anyhow::bail!("invalid lag save action {item:?}"),
+                None => (kind, None),
+            };
             let action = match kind {
                 "menu-save" => SaveAction::MenuSave,
                 "resume" => SaveAction::Resume,
@@ -171,7 +178,7 @@ impl SaveActions {
                 "retry" => SaveAction::Retry,
                 _ => anyhow::bail!("unknown lag save action {kind:?}"),
             };
-            entries.push((frame, action));
+            entries.push((frame, action, destination));
         }
         Ok(Self { entries })
     }
@@ -179,8 +186,12 @@ impl SaveActions {
     pub(super) fn take(&mut self, frame: u64) -> Option<SaveAction> {
         #[cfg(not(target_os = "vita"))]
         {
-            let index = self.entries.iter().position(|&(scheduled, _)| scheduled == frame)?;
-            Some(self.entries.remove(index).1)
+            let index = self.entries.iter().position(|(scheduled, _, _)| *scheduled == frame)?;
+            let (_, action, destination) = self.entries.remove(index);
+            if let Some(map) = destination {
+                std::env::set_var("LOOKING_GLASS_TRANSITION_DESTINATION", map);
+            }
+            Some(action)
         }
         #[cfg(target_os = "vita")]
         {
@@ -204,6 +215,11 @@ mod tests {
         assert_eq!(actions.take(45), Some(SaveAction::Retry));
         assert_eq!(actions.take(50), Some(SaveAction::NaturalExit));
         assert!(SaveActions::parse("bad").is_err());
+        let mut exits = SaveActions::parse("5:natural-exit=potears3").unwrap();
+        assert_eq!(exits.take(5), Some(SaveAction::NaturalExit));
+        assert_eq!(std::env::var("LOOKING_GLASS_TRANSITION_DESTINATION").as_deref(), Ok("potears3"));
+        assert!(SaveActions::parse("5:natural-exit=").is_err());
+        assert!(SaveActions::parse("5:retry=potears3").is_err());
         assert!(SaveActions::parse("30:unknown").is_err());
     }
 }
