@@ -40,7 +40,9 @@ fn main() {
         // Startup tracing and actor diagnostics grow code/exception metadata.
         // Reserve SCE metadata slack (>=3348 bytes),
         // and verify the final program headers for every packaged build.
-        println!("cargo:rustc-link-arg=-Wl,--section-start=.init_array=0x82080000");
+        // The integrated v1.1 code grew past 0x82080000.
+
+        println!("cargo:rustc-link-arg=-Wl,--section-start=.init_array=0x82180000");
         if std::env::var_os("CARGO_FEATURE_VITA_RENDERER").is_some() {
             println!("cargo:rustc-link-arg=-Wl,--wrap=invoke_splashscreen");
         }
