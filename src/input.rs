@@ -5,7 +5,7 @@ use macroquad::prelude::*;
 // Recorded or replayed input when a tape is active; otherwise the macroquad calls.
 use crate::replay::input::{
     self as replay_input, is_key_down, is_key_pressed, is_mouse_button_down, is_mouse_button_pressed,
-    mouse_wheel, ClockView, Frame, StepClockGuard,
+    mouse_wheel, ClockView, Frame,
 };
 use std::collections::HashSet;
 
@@ -372,9 +372,7 @@ pub(crate) struct StepInput {
     pub step: u64,
     pub frame: Frame,
     pub focused: bool,
-    pub dt: f32,
-    pub clock_bits: u64,
-    instant: std::time::Instant,
+    pub clock: Option<ClockView>,
     pointer: PointerFrame,
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     scripted_keys: Vec<(String, bool, bool)>,
@@ -406,19 +404,9 @@ impl StepInput {
         next
     }
 
-    pub(crate) fn refresh_clock(&mut self) {
-        let clock = ClockView::capture();
-        self.dt = clock.dt;
-        self.clock_bits = clock.clock_bits;
-        self.instant = clock.instant;
-    }
-
-    pub(crate) fn clock(&self) -> ClockView {
-        ClockView { dt: self.dt, clock_bits: self.clock_bits, instant: self.instant }
-    }
-
-    pub(crate) fn enter_clock(&self) -> StepClockGuard {
-        self.clock().enter()
+    #[cfg(test)]
+    fn enter_clock(&self) -> replay_input::StepClockGuard {
+        self.clock.unwrap().enter()
     }
 }
 
@@ -467,11 +455,11 @@ pub struct Input {
 }
 impl Input {
     pub fn update(&mut self, prefs: &Preferences, focused: bool) {
-        let step = self.capture_step(0, focused);
-        self.apply_step(&step, prefs);
+        let step = self.capture_step(0, focused, false);
+        self.apply_step(step, prefs);
     }
 
-    pub(crate) fn capture_step(&mut self, step: u64, focused: bool) -> StepInput {
+    pub(crate) fn capture_step(&mut self, step: u64, focused: bool, sample_clock: bool) -> StepInput {
         // The host probe disables live input. Playback still owns its taped controls.
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         let tape_controls = crate::sim_maps::probe::enabled() && replay_input::replaying();
@@ -499,9 +487,8 @@ impl Input {
             // Keep the recording's SceCtrl sample at the gameplay capture point.
             frame.pad = crate::replay::input::vita_pad();
         }
-        let clock = ClockView::capture();
         StepInput {
-            step, focused, dt: clock.dt, clock_bits: clock.clock_bits, instant: clock.instant,
+            step, focused, clock: sample_clock.then(ClockView::capture),
             pointer: PointerFrame::capture(&frame), frame,
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
             scripted_keys: scripted_keys(),
@@ -512,12 +499,12 @@ impl Input {
         }
     }
 
-    pub(crate) fn apply_step(&mut self, step: &StepInput, prefs: &Preferences) {
-        self.update_from(&step.frame, prefs, step.focused);
+    pub(crate) fn apply_step(&mut self, step: StepInput, prefs: &Preferences) {
+        self.update_from(step.frame, prefs, step.focused);
         self.pointer = step.pointer;
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         {
-            self.scripted_keys.clone_from(&step.scripted_keys);
+            self.scripted_keys = step.scripted_keys;
             self.recovery_key.set(step.recovery_key);
         }
     }
@@ -545,7 +532,7 @@ impl Input {
         self.suppress_with(|name| captured_binding(&frame, name, false));
     }
 
-    pub fn update_from(&mut self, frame: &Frame, prefs: &Preferences, focused: bool) {
+    fn update_from(&mut self, frame: Frame, prefs: &Preferences, focused: bool) {
         self.disconnected = self.pad.connected && frame.desktop_pad.is_none() && self.using_pad;
         self.pad.update(frame.desktop_pad, focused, prefs.pad_deadzone, frame.dt.min(0.1));
         if frame.vita_analog {
@@ -559,9 +546,9 @@ impl Input {
             self.pad.look_axis = resumed_axis(look, &mut self.vita_look_neutral);
         }
         if !focused {
-            self.suppress_with(|name| captured_binding(frame, name, false));
+            self.suppress_with(|name| captured_binding(&frame, name, false));
         }
-        self.blocked.retain(|name| captured_binding(frame, name, false) && !captured_binding(frame, name, true));
+        self.blocked.retain(|name| captured_binding(&frame, name, false) && !captured_binding(&frame, name, true));
         if focused
             && (self.pad.pressed != 0
                 || self.pad.move_axis != Vec2::ZERO
@@ -579,7 +566,7 @@ impl Input {
             self.using_pad = false;
         }
         self.focused = focused;
-        self.frame.clone_from(frame);
+        self.frame = frame;
     }
     /// On menus/load/focus boundaries, held inputs must be released before reuse.
     pub fn suppress(&mut self) {
@@ -799,7 +786,7 @@ mod tests {
                 desktop_pad: Some(RawPad { buttons: 8, lx: 31000, ..Default::default() }),
                 chars: vec!['a'], quit: true, vita_analog: true,
             },
-            focused: true, dt: 0.02, clock_bits: 147, instant: std::time::Instant::now(),
+            focused: true, clock: Some(ClockView { dt: 0.02, clock_bits: 147, instant: std::time::Instant::now() }),
             pointer: PointerFrame { position: (9., 5.), dpi: 2., width: 640., height: 480. },
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
             scripted_keys: vec![("Space".into(), true, true)],
@@ -813,8 +800,9 @@ mod tests {
         });
         assert_eq!(next.pointer.position, physical.pointer.position);
         assert_eq!(next.pointer.dpi, physical.pointer.dpi);
-        assert_eq!((next.step, next.dt, next.clock_bits, next.instant),
-                   (5, physical.dt, physical.clock_bits, physical.instant));
+        let fields = |clock: ClockView| (clock.dt, clock.clock_bits, clock.instant);
+        assert_eq!(next.step, 5);
+        assert_eq!(next.clock.map(fields), physical.clock.map(fields));
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         {
             assert_eq!(next.scripted_keys, vec![("Space".into(), false, true)]);
@@ -829,9 +817,7 @@ mod tests {
             step: 12,
             frame: Frame::default(),
             focused: true,
-            dt: 0.05,
-            clock_bits: 0.6000000089406967f64.to_bits(),
-            instant,
+            clock: Some(ClockView { dt: 0.05, clock_bits: 0.6000000089406967f64.to_bits(), instant }),
             pointer: PointerFrame::default(),
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
             scripted_keys: Vec::new(),
@@ -841,8 +827,8 @@ mod tests {
         std::thread::spawn(move || {
             let _step = replay_input::StepGuard::enter();
             let _clock = step.enter_clock();
-            assert_eq!(replay_input::get_time().to_bits(), step.clock_bits);
-            assert_eq!(replay_input::get_frame_time().to_bits(), step.dt.to_bits());
+            assert_eq!(replay_input::get_time().to_bits(), step.clock.unwrap().clock_bits);
+            assert_eq!(replay_input::get_frame_time().to_bits(), step.clock.unwrap().dt.to_bits());
             assert_eq!(replay_input::now(), instant);
         }).join().unwrap();
     }

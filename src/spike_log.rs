@@ -395,14 +395,12 @@ pub(crate) fn actor_glow_subset(triangles: u32) {
 }
 #[cfg(feature = "vita_renderer")]
 pub(crate) fn actor_routes(culled: bool, lean_lit: bool, full: bool) {
-    if on() {
-        FRAME.with(|f| {
-            let mut f = f.borrow_mut();
-            f.actor_routes[0] += u32::from(culled);
-            f.actor_routes[1] += u32::from(lean_lit);
-            f.actor_routes[2] += u32::from(full);
-        });
-    }
+    FRAME.with(|f| {
+        let mut f = f.borrow_mut();
+        f.actor_routes[0] += u32::from(culled);
+        f.actor_routes[1] += u32::from(lean_lit);
+        f.actor_routes[2] += u32::from(full);
+    });
 }
 /// One NPC kind's update this frame, from `npc::profile`: actors updated and milliseconds in think,
 /// movement, animation and combat.
@@ -563,8 +561,11 @@ pub(crate) fn cpu1_reserved() -> bool {
     #[cfg(not(feature="vita_renderer"))]
     { false }
 }
+pub(crate) fn world_reads_enabled() -> bool {
+    on() && split_enabled()
+}
 pub(crate) fn world_last_read() {
-    if on() && split_enabled() { FRAME.with(|f| f.borrow_mut().world_last = Some(Instant::now())); }
+    FRAME.with(|f| f.borrow_mut().world_last = Some(Instant::now()));
 }
 pub(crate) fn overlap_burn(ms: f64, render_ms: f64, bytes: u64) {
     if on() { FRAME.with(|f| { let mut f=f.borrow_mut(); f.burn_ms=ms; f.burn_render_ms=render_ms; f.burn_bytes=bytes; }); }

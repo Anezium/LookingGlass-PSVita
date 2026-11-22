@@ -50,6 +50,77 @@ pub(super) struct SimState {
     pub(super) played: bool,
 }
 
+/// In-place gameplay access shared by the owner and the worker.
+pub(super) struct StepState<'a> {
+    pub(super) world: &'a mut World,
+    pub(super) interactions: &'a mut Interactions,
+    pub(super) alice: &'a mut character::AliceSim,
+    pub(super) npcs: &'a mut crate::npc::NpcSim,
+    pub(super) steam: &'a mut crate::particles::SteamSim,
+    pub(super) input: &'a mut crate::input::Input,
+    pub(super) weapon_buttons: &'a mut crate::weapon_rules::Buttons,
+    pub(super) pickup_feedback: &'a mut inventory::PickupFeedback,
+    pub(super) third_person: &'a mut bool,
+    pub(super) follow_camera: &'a mut crate::camera::Follow,
+    pub(super) camera_handoff: &'a mut crate::camera::Handoff,
+    pub(super) rail_camera: &'a mut crate::camera::Follow,
+    pub(super) clock: &'a mut FixedClock,
+    pub(super) recovery: &'a mut Recovery,
+    pub(super) paused: &'a mut bool,
+    pub(super) post_game: &'a mut bool,
+    pub(super) hints: &'a mut crate::cheshire::Hints,
+    pub(super) entry_spawn: &'a mut Option<String>,
+    pub(super) stats: &'a mut Stats,
+    pub(super) pickups: &'a mut Vec<inventory::Pickup>,
+    pub(super) pickup_clock: &'a mut f32,
+    pub(super) environment_clock: &'a mut f32,
+    pub(super) story: &'a mut crate::story::Story,
+    pub(super) pos: &'a mut Vec3,
+    pub(super) yaw: &'a mut f32,
+    pub(super) pitch: &'a mut f32,
+    pub(super) flying: &'a mut bool,
+    pub(super) spawn_landing: &'a mut bool,
+    pub(super) player: &'a mut Player,
+    pub(super) played: &'a mut bool,
+}
+
+impl SimState {
+    fn borrow_step(&mut self) -> StepState<'_> {
+        StepState {
+            world: &mut self.world,
+            interactions: &mut self.interactions,
+            alice: &mut self.alice,
+            npcs: &mut self.npcs,
+            steam: &mut self.steam,
+            input: &mut self.input,
+            weapon_buttons: &mut self.weapon_buttons,
+            pickup_feedback: &mut self.pickup_feedback,
+            third_person: &mut self.third_person,
+            follow_camera: &mut self.follow_camera,
+            camera_handoff: &mut self.camera_handoff,
+            rail_camera: &mut self.rail_camera,
+            clock: &mut self.clock,
+            recovery: &mut self.recovery,
+            paused: &mut self.paused,
+            post_game: &mut self.post_game,
+            hints: &mut self.hints,
+            entry_spawn: &mut self.entry_spawn,
+            stats: &mut self.stats,
+            pickups: &mut self.pickups,
+            pickup_clock: &mut self.pickup_clock,
+            environment_clock: &mut self.environment_clock,
+            story: &mut self.story,
+            pos: &mut self.pos,
+            yaw: &mut self.yaw,
+            pitch: &mut self.pitch,
+            flying: &mut self.flying,
+            spawn_landing: &mut self.spawn_landing,
+            player: &mut self.player,
+            played: &mut self.played,
+        }
+    }
+}
+
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<SimState>();
@@ -155,23 +226,27 @@ impl StepJob {
     }
 }
 
-pub(super) struct StepAInput {
+pub(super) struct StepAInput<Map = Arc<crate::bsp::Bsp>, Prefs = Arc<crate::preferences::Preferences>> {
     pub(super) gameplay: bool,
-    pub(super) map: Arc<crate::bsp::Bsp>,
-    pub(super) preferences: Arc<crate::preferences::Preferences>,
+    pub(super) map: Map,
+    pub(super) preferences: Prefs,
     pub(super) saves_writable: bool,
     pub(super) host_natural_exit: bool,
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     pub(super) force_checkpoint: bool,
 }
 
-pub(super) struct StepBInput {
+pub(super) struct StepBInput<
+    MapName = String,
+    Prefs = Arc<crate::preferences::Preferences>,
+    Pose = crate::cinematic::ActorPose,
+> {
     pub(super) story_active: bool,
     pub(super) dispatched: bool,
-    pub(super) map_name: String,
-    pub(super) preferences: Arc<crate::preferences::Preferences>,
+    pub(super) map_name: MapName,
+    pub(super) preferences: Prefs,
     pub(super) aspect: f32,
-    pub(super) handoff_pose: Option<crate::cinematic::ActorPose>,
+    pub(super) handoff_pose: Option<Pose>,
     pub(super) loot_visit: String,
     pub(super) loot_before: Vec<crate::loot::Source>,
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
@@ -241,19 +316,53 @@ pub(super) fn step_due(
     }
 }
 
-/// Gameplay movement when its arm is active, followed by the common story suffix.
-pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScopes) -> (StepJob, Result<(bool, Due)>) {
-    let StepJob {
-        sim,
-        locals: step,
-        art_ops,
-        hud_ops,
-        audio_step,
-        console,
+pub(super) fn step_a(
+    mut job: StepJob, input: StepAInput, scopes: &mut StepScopes,
+) -> (StepJob, Result<(bool, Due)>) {
+    let StepAInput {
+        gameplay,
+        map,
+        preferences,
+        saves_writable,
+        host_natural_exit,
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        force_checkpoint,
+    } = input;
+    let result = step_a_in_place(
+        &mut job.sim.borrow_step(),
+        &mut job.locals,
+        &mut job.art_ops,
+        &mut job.hud_ops,
+        &mut job.audio_step,
+        &mut job.console,
         #[cfg(feature = "vita_renderer")]
-        route_control,
-        ..
-    } = &mut job;
+        job.route_control.as_mut(),
+        StepAInput {
+            gameplay,
+            map: &map,
+            preferences: &preferences,
+            saves_writable,
+            host_natural_exit,
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            force_checkpoint,
+        },
+        scopes,
+    );
+    (job, result)
+}
+
+/// Gameplay movement when its arm is active, followed by the common story suffix.
+pub(super) fn step_a_in_place(
+    sim: &mut StepState<'_>,
+    step: &mut StepLocals,
+    art_ops: &mut Vec<ArtOp>,
+    hud_ops: &mut Vec<HudOp>,
+    audio_step: &mut AudioStep,
+    console: &mut ConsoleOps,
+    #[cfg(feature = "vita_renderer")] route_control: Option<&mut crate::route_replay::Control>,
+    input: StepAInput<&crate::bsp::Bsp, &crate::preferences::Preferences>,
+    scopes: &mut StepScopes,
+) -> Result<(bool, Due)> {
     let StepLocals {
         simulate,
         overlay_before,
@@ -281,7 +390,6 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
     } = input;
     #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
     let force_checkpoint = false;
-    let preferences = &preferences;
     let mut advance_dialogue = step.advance_dialogue;
     let mut pending_transition = step.pending_transition.take();
     macro_rules! pressed {
@@ -299,30 +407,30 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
             if !scripted_view && !bench {
                 #[cfg(target_os = "vita")]
                 sim.input
-                    .vita_look(preferences, elapsed, &mut sim.yaw, &mut sim.pitch);
+                    .vita_look(preferences, elapsed, sim.yaw, sim.pitch);
                 #[cfg(not(target_os = "vita"))]
                 if crate::replay::input::cross() {
                     sim.input
-                        .vita_look(preferences, elapsed, &mut sim.yaw, &mut sim.pitch);
+                        .vita_look(preferences, elapsed, sim.yaw, sim.pitch);
                 } else {
                     let look = sim.input.look(preferences);
-                    sim.yaw -= look.x * dt * 2.5;
-                    sim.pitch += look.y * dt * 2.;
+                    *sim.yaw -= look.x * dt * 2.5;
+                    *sim.pitch += look.y * dt * 2.;
                 }
             }
             if !scripted_view && held!(KeyCode::Left) {
-                sim.yaw += dt * 1.3;
+                *sim.yaw += dt * 1.3;
             }
             if !scripted_view && held!(KeyCode::Right) {
-                sim.yaw -= dt * 1.3;
+                *sim.yaw -= dt * 1.3;
             }
             if !scripted_view && held!(KeyCode::Up) {
-                sim.pitch += dt;
+                *sim.pitch += dt;
             }
             if !scripted_view && held!(KeyCode::Down) {
-                sim.pitch -= dt;
+                *sim.pitch -= dt;
             }
-            sim.pitch = sim.pitch.clamp(-1.5, 1.5);
+            *sim.pitch = sim.pitch.clamp(-1.5, 1.5);
             let forward = vec3(
                 sim.yaw.cos() * sim.pitch.cos(),
                 sim.yaw.sin() * sim.pitch.cos(),
@@ -342,13 +450,13 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
             if held!(KeyCode::A) {
                 movement -= right;
             }
-            if sim.flying {
+            if *sim.flying {
                 sim.player.release_rope();
             }
-            if sim.flying && held!(KeyCode::E) {
+            if *sim.flying && held!(KeyCode::E) {
                 movement.z += 1.;
             }
-            if sim.flying && held!(KeyCode::Q) {
+            if *sim.flying && held!(KeyCode::Q) {
                 movement.z -= 1.;
             }
             let speed = if held!(KeyCode::LeftShift) {
@@ -356,8 +464,8 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
             } else {
                 220.
             };
-            if sim.flying {
-                sim.pos += movement.normalize_or_zero() * speed * dt;
+            if *sim.flying {
+                *sim.pos += movement.normalize_or_zero() * speed * dt;
                 sim.clock.pause();
             } else {
                 // Looking up/down must not change walking speed or produce flight.
@@ -409,7 +517,7 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                 if use_pressed && owner == UseOwner::Talk {
                     if let Some(talk) = talk {
                         if let Some(result) =
-                            sim.interactions.start_conversation(talk, &mut sim.story)
+                            sim.interactions.start_conversation(talk, sim.story)
                         {
                             sim.npcs.begin_talk(talk.actor());
                             events.merge(result);
@@ -429,8 +537,8 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                 }
                 events.merge(sim.interactions.update(
                     world_dt,
-                    &map,
-                    &mut sim.world,
+                    map,
+                    sim.world,
                     &sim.player,
                     aim,
                     use_pressed && owner == UseOwner::World,
@@ -490,16 +598,16 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                 #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
                 if crate::sim_maps::probe::mover_replay_enabled() {
                     if let Some(s) = &sim.interactions.school2 {
-                        crate::sim_maps::probe::mover_ride(s.moving_tops(), &mut sim.player);
+                        crate::sim_maps::probe::mover_ride(s.moving_tops(), sim.player);
                     }
                 }
                 {
                     let _time = crate::sim_maps::timer("r26_movers_ns");
                     sim.interactions.advance_school(
                         mover_dt,
-                        &map,
-                        &mut sim.world,
-                        &mut sim.player,
+                        map,
+                        sim.world,
+                        sim.player,
                     )?;
                 }
                 #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
@@ -530,24 +638,24 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     1,
                 );
                 if was_cinematic && !sim.interactions.scripted() {
-                    sim.yaw = sim.player.script_facing;
-                    sim.pitch = 0.;
+                    *sim.yaw = sim.player.script_facing;
+                    *sim.pitch = 0.;
                     sim.clock.pause();
-                    sim.spawn_landing = true;
+                    *sim.spawn_landing = true;
                 }
                 let before_feet = sim.player.feet;
                 let before_water = sim.player.immersion;
                 let before_drowning = sim.player.breath.hits;
                 let before_air_warning = sim.player.breath.warning_age().is_some();
-                sim.stats.prepare_player(&mut sim.player);
+                sim.stats.prepare_player(sim.player);
                 let before_grounded = sim.player.grounded;
                 // A supported spawn has already landed before its first tick.
                 // Its first later fall must receive ordinary fall damage.
                 if before_grounded {
-                    sim.spawn_landing = false;
+                    *sim.spawn_landing = false;
                 }
                 sim.interactions
-                    .prepare_player(&mut sim.stats, &mut sim.player);
+                    .prepare_player(sim.stats, sim.player);
                 let before_jumps = sim.player.jumps;
                 let before_landings = sim.player.landings;
                 let before_fall = sim.player.velocity.z;
@@ -593,7 +701,7 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     .interactions
                     .pandemonium
                     .as_mut()
-                    .is_some_and(|p| p.control(world_dt, &sim.world, &mut sim.player, control));
+                    .is_some_and(|p| p.control(world_dt, &sim.world, sim.player, control));
                 if !controlled
                     && !scripted_view
                     && !sim.interactions.scripted()
@@ -621,19 +729,19 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     #[cfg(feature = "vita_renderer")]
                     if let Some(route) = route_control {
                         sim.clock
-                            .advance_route(elapsed as f64, &sim.world, &mut sim.player, |p| {
-                                route.control(&sim.world, p, &mut sim.yaw, &mut sim.pitch)
+                            .advance_route(elapsed as f64, &sim.world, sim.player, |p| {
+                                route.control(&sim.world, p, sim.yaw, sim.pitch)
                             });
                     } else {
                         sim.clock
-                            .advance(elapsed as f64, &sim.world, &mut sim.player, control);
+                            .advance(elapsed as f64, &sim.world, sim.player, control);
                     }
                     #[cfg(not(feature = "vita_renderer"))]
                     sim.clock
-                        .advance(elapsed as f64, &sim.world, &mut sim.player, control);
+                        .advance(elapsed as f64, &sim.world, sim.player, control);
                 }
                 drop(control_hooks);
-                sim.pos = sim.player.eye();
+                *sim.pos = sim.player.eye();
                 audio_step.ops.push(AudioOp::Movement {
                     distance: (sim.player.feet - before_feet).truncate().length(),
                     grounded: sim.player.grounded
@@ -670,12 +778,12 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     hud_ops.push(HudOp::Announce("Harmful liquid / Sanity lost".into()));
                 }
                 if sim.player.landings > before_landings {
-                    let lost = if sim.spawn_landing {
+                    let lost = if *sim.spawn_landing {
                         0.
                     } else {
                         sim.stats.fall(sim.player.landing_speed)
                     };
-                    sim.spawn_landing = false;
+                    *sim.spawn_landing = false;
                     if lost > 0. {
                         hud_ops.push(HudOp::Announce(
                             format!("Hard landing / -{lost:.0} Sanity").into(),
@@ -702,19 +810,19 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     pending_transition = events.transition.or(pending_transition.take());
                     if let Some((feet, angle)) = events.teleport {
                         if sim.world.body_clear(feet) {
-                            sim.player = Player::new(feet);
-                            sim.yaw = angle;
-                            sim.pos = sim.player.eye();
+                            *sim.player = Player::new(feet);
+                            *sim.yaw = angle;
+                            *sim.pos = sim.player.eye();
                             art_ops.push(ArtOp::RetireAliceBody);
                             sim.alice.clear_water();
                             art_ops.push(ArtOp::ResetWaterEmitter);
                             sync_water(sim, art_ops);
-                            sim.alice.reset(&sim.player, sim.yaw);
+                            sim.alice.reset(&sim.player, *sim.yaw);
                             art_ops.push(ArtOp::ClearAliceEffects);
                             sim.follow_camera.reset();
                             sim.camera_handoff.reset();
                             sim.clock.pause();
-                            sim.spawn_landing = true;
+                            *sim.spawn_landing = true;
                             sim.recovery.clear();
                             hud_ops.push(HudOp::Announce("Teleported".into()));
                         } else {
@@ -734,7 +842,7 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     let dice_before = sim.stats.copies(6);
                     let rage_before = sim.stats.powers.rage;
                     if let Some(s) = &mut sim.interactions.school {
-                        let e = s.collect_secret(&mut sim.stats, sim.player.feet, &sim.world);
+                        let e = s.collect_secret(sim.stats, sim.player.feet, &sim.world);
                         if let Some(m) = e.message {
                             hud_ops.push(HudOp::Announce(m.into()));
                         }
@@ -743,14 +851,14 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                         }
                     }
                     for message in inventory::collect_with(
-                        &mut sim.stats,
+                        sim.stats,
                         &sim.pickups,
                         sim.player.feet,
                         &sim.world,
                         |item| {
                             art_ops.push(ArtOp::PickupCollected {
                                 item: item.clone(),
-                                clock: sim.pickup_clock,
+                                clock: *sim.pickup_clock,
                             })
                         },
                     ) {
@@ -764,17 +872,17 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     }
                     if sim.player.script_motion == 0 {
                         sim.recovery
-                            .observe(&sim.world, &sim.interactions, &sim.player, sim.yaw);
+                            .observe(&sim.world, &sim.interactions, &sim.player, *sim.yaw);
                     }
                 }
             }
         }
-        let story_active = !sim.paused
+        let story_active = !*sim.paused
             && !menu
             && !inventory_menu
             && !console_input
             && focused
-            && !sim.flying
+            && !*sim.flying
             && sim.stats.alive();
         if simulate {
             scopes.census(crate::phase_census::Region::StoryWeapons);
@@ -791,14 +899,14 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
             }
             sim.hints.sync(&sim.interactions);
             if (summon_cat || (story_active && pressed!(KeyCode::C))) && !in_transport {
-                let outcome = if !sim.stats.alive() || sim.flying {
+                let outcome = if !sim.stats.alive() || *sim.flying {
                     Err("Return to walking and retry before summoning Cheshire.")
                 } else {
                     sim.hints.summon(
-                        &mut sim.story,
+                        sim.story,
                         &sim.world,
                         sim.player.feet,
-                        sim.yaw,
+                        *sim.yaw,
                         sim.player.swimming,
                     )
                 };
@@ -818,11 +926,11 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                 }
             }
             sim.interactions
-                .sync_pickups(&sim.stats, &mut sim.pickups, &mut sim.story);
+                .sync_pickups(&sim.stats, sim.pickups, sim.story);
             if let Some(b) = &mut sim.interactions.beyond {
-                b.bind_rage_player(&mut sim.player, sim.alice.facing());
+                b.bind_rage_player(sim.player, sim.alice.facing());
             }
-            let story_ready = sim.interactions.prepare_story(&mut sim.story);
+            let story_ready = sim.interactions.prepare_story(sim.story);
             if let Some(request) = sim.story.update(
                 if story_active && story_ready && sim.hints.prepare_story(&sim.story) {
                     elapsed
@@ -888,7 +996,7 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                 }
             }
             if let Some(s) = &mut sim.interactions.school {
-                s.sync_inventory(&mut sim.stats);
+                s.sync_inventory(sim.stats);
             }
             if let Some(d) = &mut sim.interactions.duchess {
                 if story_active && sim.stats.alive() {
@@ -902,9 +1010,9 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                 let f = d.update(
                     if story_active { world_dt } else { 0. },
                     &sim.world,
-                    &mut sim.player,
-                    &mut sim.stats,
-                    &mut sim.story,
+                    sim.player,
+                    sim.stats,
+                    sim.story,
                 );
                 for &hit in &f.summon_hits {
                     sim.alice.hit_summon(hit);
@@ -916,12 +1024,12 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
                     sim.recovery.clear();
                 }
                 if in_transport && !d.cinematic() {
-                    sim.yaw = sim.player.script_facing;
-                    sim.pitch = 0.;
+                    *sim.yaw = sim.player.script_facing;
+                    *sim.pitch = 0.;
                     sim.clock.pause();
-                    sim.spawn_landing = true;
+                    *sim.spawn_landing = true;
                 }
-                sim.pos = sim.player.eye();
+                *sim.pos = sim.player.eye();
             }
         }
         // The host control reaches the same owner continuation as an
@@ -932,9 +1040,9 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
             step_due(
                 saves_writable,
                 story_active,
-                sim.post_game,
-                &mut sim.interactions,
-                &mut sim.story,
+                *sim.post_game,
+                sim.interactions,
+                sim.story,
                 &mut pending_transition,
                 host_natural_exit,
             )
@@ -945,20 +1053,63 @@ pub(super) fn step_a(mut job: StepJob, input: StepAInput, scopes: &mut StepScope
     })();
     step.advance_dialogue = advance_dialogue;
     step.pending_transition = pending_transition;
-    (job, result)
+    result
+}
+
+pub(super) fn step_b(
+    mut job: StepJob, input: StepBInput, scopes: &mut StepScopes,
+) -> (StepJob, StepView) {
+    let StepBInput {
+        story_active,
+        dispatched,
+        map_name,
+        preferences,
+        aspect,
+        handoff_pose,
+        loot_visit,
+        loot_before,
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        frame,
+        #[cfg(target_os = "vita")]
+        bench_camera,
+    } = input;
+    let view = step_b_in_place(
+        job.stamp,
+        &mut job.sim.borrow_step(),
+        &mut job.locals,
+        &mut job.art_ops,
+        &mut job.hud_ops,
+        &mut job.audio_step,
+        StepBInput {
+            story_active,
+            dispatched,
+            map_name: &map_name,
+            preferences: &preferences,
+            aspect,
+            handoff_pose: handoff_pose.as_ref(),
+            loot_visit,
+            loot_before,
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            frame,
+            #[cfg(target_os = "vita")]
+            bench_camera,
+        },
+        scopes,
+    );
+    (job, view)
 }
 
 /// Particles, combat, camera and listener commands at their original serial cut.
-pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScopes) -> (StepJob, StepView) {
-    let stamp = job.stamp;
-    let StepJob {
-        sim,
-        locals: step,
-        art_ops,
-        hud_ops,
-        audio_step,
-        ..
-    } = &mut job;
+pub(super) fn step_b_in_place(
+    stamp: crate::sim_pipeline::Stamp,
+    sim: &mut StepState<'_>,
+    step: &mut StepLocals,
+    art_ops: &mut Vec<ArtOp>,
+    hud_ops: &mut Vec<HudOp>,
+    audio_step: &mut AudioStep,
+    input: StepBInput<&str, &crate::preferences::Preferences, &crate::cinematic::ActorPose>,
+    scopes: &mut StepScopes,
+) -> StepView {
     let StepLocals {
         simulate,
         menu,
@@ -985,7 +1136,6 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
         #[cfg(target_os = "vita")]
         bench_camera,
     } = input;
-    let preferences = &preferences;
     let loot_visit = loot_visit.as_str();
     let loot_before = loot_before.as_slice();
     macro_rules! held {
@@ -1006,13 +1156,13 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             crate::frame_profile::set_owner(crate::frame_profile::Owner::None);
             crate::phase_census::set_owner(crate::phase_census::Owner::Other);
         }
-        if !sim.paused && !menu && !inventory_menu && !console_input && focused && sim.stats.alive()
+        if !*sim.paused && !menu && !inventory_menu && !console_input && focused && sim.stats.alive()
         {
-            sim.environment_clock += world_dt;
+            *sim.environment_clock += world_dt;
             {
                 #[cfg(target_os = "vita")]
                 let _hotspot = crate::frame_profile::span("steam_animate");
-                sim.steam.animate(sim.environment_clock);
+                sim.steam.animate(*sim.environment_clock);
             }
             if sim
                 .interactions
@@ -1031,14 +1181,14 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
                 {
                     #[cfg(target_os = "vita")]
                     let _hotspot = crate::frame_profile::span("village_particle_bindings");
-                    v.place_particles(&mut sim.steam);
+                    v.place_particles(sim.steam);
                 }
             }
             if let Some(p) = &sim.interactions.pandemonium {
-                p.gate_particles(&mut sim.steam);
+                p.gate_particles(sim.steam);
             }
-            sim.interactions.place_level_particles(&mut sim.steam);
-            sim.steam.update_clocks(dt, world_dt, sim.pos, &sim.world);
+            sim.interactions.place_level_particles(sim.steam);
+            sim.steam.update_clocks(dt, world_dt, *sim.pos, &sim.world);
         }
     } // simulation: particles
     scopes.census(crate::phase_census::Region::StoryWeapons);
@@ -1066,35 +1216,35 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
         if handoff_pose.is_some() {
             assert!(!dispatched, "dispatched step consumed a draw-produced handoff pose");
         }
-        if !sim.third_person {
+        if !*sim.third_person {
             sim.camera_handoff.skip();
         }
-        sim.yaw = sim.player.script_facing;
-        sim.pitch = 0.;
-        sim.pos = sim.player.eye();
+        *sim.yaw = sim.player.script_facing;
+        *sim.pitch = 0.;
+        *sim.pos = sim.player.eye();
         sim.clock.pause();
-        sim.spawn_landing = true;
+        *sim.spawn_landing = true;
         step.weapon_click = None;
         sim.weapon_buttons.block();
         sim.alice
-            .resume_scene(&sim.player, sim.yaw, handoff_pose.as_ref());
+            .resume_scene(&sim.player, *sim.yaw, handoff_pose);
     }
     let direction = vec3(
         sim.yaw.cos() * sim.pitch.cos(),
         sim.yaw.sin() * sim.pitch.cos(),
         sim.pitch.sin(),
     );
-    let active = !sim.paused
+    let active = !*sim.paused
         && !menu
         && !inventory_menu
         && !console_input
         && focused
-        && !sim.flying
+        && !*sim.flying
         && sim.stats.alive();
     if active && simulate {
-        sim.played = true;
+        *sim.played = true;
         sim.stats.update(dt);
-        sim.pickup_clock += dt;
+        *sim.pickup_clock += dt;
     }
     // Keep conversation participants safe while listening. Exploration continues;
     // enemies and attacks resume after the conversation.
@@ -1118,7 +1268,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             sim.alice.cancel_weapon_action();
             sim.alice.dismiss_summon();
         }
-        if sim.flying {
+        if *sim.flying {
             sim.alice.cancel_weapon_action();
         }
         if sim
@@ -1206,9 +1356,9 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             let f = sim.interactions.levels_step(&mut crate::level::Combat {
                 dt,
                 world: &sim.world,
-                player: &mut sim.player,
-                stats: &mut sim.stats,
-                story: &mut sim.story,
+                player: sim.player,
+                stats: sim.stats,
+                story: sim.story,
                 notarget,
                 summon,
                 threatens: &threatens,
@@ -1256,7 +1406,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             sim.player.eye(),
         );
         if let Some(v) = &sim.interactions.village {
-            v.cinema.apply_npc_sim(&mut sim.npcs);
+            v.cinema.apply_npc_sim(sim.npcs);
         }
         for &hit in &feedback.summon_hits {
             sim.alice.hit_summon(hit);
@@ -1290,7 +1440,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
         }
     } // simulation: combat, encounters and NPC poses
     let death_animation =
-        !sim.stats.alive() && focused && !sim.paused && !menu && !inventory_menu && !console_input;
+        !sim.stats.alive() && focused && !*sim.paused && !menu && !inventory_menu && !console_input;
     crate::spike_log::sim(crate::spike_log::Sim::Alice);
     #[cfg(target_os = "vita")]
     if simulate {
@@ -1336,7 +1486,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             sim.input.running(preferences, held!(KeyCode::LeftShift)),
             character::WeaponInput {
                 dice: sim.stats.copies(6),
-                first_person: !sim.third_person && !sim.flying,
+                first_person: !*sim.third_person && !*sim.flying,
                 selected: sim.stats.equipped().unwrap_or(crate::weapons::UNARMED),
                 click: step.weapon_click,
                 aim: direction,
@@ -1345,7 +1495,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
                 world: &sim.world,
                 targets: &targets,
             },
-            Some(&mut sim.stats),
+            Some(sim.stats),
         );
         if let Some(message) = sim.alice.take_weapon_notice() {
             hud_ops.push(HudOp::Announce(message.into()));
@@ -1427,7 +1577,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
                 if let Some(sound) = e.sound {
                     audio_step.effect(sound, Some(hit_origin));
                 }
-                sim.interactions.sync(&mut sim.world);
+                sim.interactions.sync(sim.world);
                 continue;
             }
             if hit.id >= crate::school2::ENEMY_BASE {
@@ -1447,11 +1597,11 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             }
         }
         sim.world.set_weapon_obstacles(sim.alice.ice_targets());
-        if active && loot_visit == save::visit_key(&map_name, sim.entry_spawn.as_deref()) {
+        if active && loot_visit == save::visit_key(map_name, sim.entry_spawn.as_deref()) {
             let mut after = sim.interactions.loot_sources();
             after.extend(sim.npcs.loot_sources());
             for message in crate::loot::tick_with(
-                &mut sim.stats,
+                sim.stats,
                 loot_visit,
                 world_dt,
                 loot_before,
@@ -1461,7 +1611,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
                 |item| {
                     art_ops.push(ArtOp::PickupCollected {
                         item: item.clone(),
-                        clock: sim.pickup_clock,
+                        clock: *sim.pickup_clock,
                     })
                 },
             ) {
@@ -1622,7 +1772,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
         if let Some(pose) = bench_camera {
             return pose;
         }
-        if sim.third_person && !sim.flying {
+        if *sim.third_person && !*sim.flying {
             sim.follow_camera.update(
                 &sim.world,
                 sim.player.feet,
@@ -1632,7 +1782,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             )
         } else {
             sim.follow_camera.reset();
-            (sim.pos, sim.pos + direction, false)
+            (*sim.pos, *sim.pos + direction, false)
         }
     })();
     drop(census_leaf);
@@ -1732,7 +1882,7 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
             dt: elapsed,
             world_dt,
             yaw: listen_direction.y.atan2(listen_direction.x),
-            paused: console_input || menu || sim.paused || inventory_menu || !focused,
+            paused: console_input || menu || *sim.paused || inventory_menu || !focused,
             voice_paused: !story_active,
         });
     } // simulation: audio listener and clocks
@@ -1771,12 +1921,12 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
         alice_shadow: show_alice && sim.stats.invisible <= 0.,
         alice_ghost: sim.stats.invisible > 0.,
         alice_effects: show_alice,
-        environment_clock: sim.environment_clock,
-        pickup_clock: sim.pickup_clock,
+        environment_clock: *sim.environment_clock,
+        pickup_clock: *sim.pickup_clock,
         transforms,
         ..Default::default()
     };
-    let view = StepView {
+    StepView {
         stamp,
         presentation,
         camera_out,
@@ -1789,11 +1939,10 @@ pub(super) fn step_b(mut job: StepJob, input: StepBInput, scopes: &mut StepScope
         show_alice,
         #[cfg(target_os = "vita")]
         gameplay_alice,
-    };
-    (job, view)
+    }
 }
 
-fn sync_water(sim: &mut SimState, art_ops: &mut Vec<ArtOp>) {
+fn sync_water(sim: &mut StepState<'_>, art_ops: &mut Vec<ArtOp>) {
     if sim.alice.water_appearance(&sim.player) {
         art_ops.push(ArtOp::ResetWaterEmitter);
     }

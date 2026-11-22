@@ -1080,7 +1080,7 @@ mod free_render;
 mod lag_frame;
 mod lag_control;
 use step::{
-    step_a, step_b, step_due, Due, SimState, ConsoleOps, StepAInput, StepBInput, StepJob, StepLocals, StepScopes,
+    step_a_in_place, step_b_in_place, step_due, Due, SimState, StepState, ConsoleOps, StepAInput, StepBInput, StepJob, StepLocals, StepScopes,
     StepView,
 };
 
@@ -1948,6 +1948,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         };
     }
     let mut overlap_probe = crate::overlap_probe::Probe::configured();
+    let spike_world_reads = crate::spike_log::world_reads_enabled();
     // Early exits and post-HUD saves leave their notices for the next HUD block.
     let mut hud_ops = Vec::new();
     let mut audio_step = AudioStep::default();
@@ -2022,13 +2023,13 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         };
     }
     macro_rules! flush_pending {
-        ($frame:expr, $guards:ident, $input:ident) => {
+        ($frame:expr, $guards:ident, $clock:ident) => {
             if pending.is_some() {
                 forced_flush = true;
                 let restore_clock = $guards.take().is_some();
                 render_pending!($frame, alice.art_mut(), npcs.art_mut(), steam.art());
                 if restore_clock {
-                    $guards = Some((StepGuard::enter(), $input.enter_clock()));
+                    $guards = Some((StepGuard::enter(), $clock.expect("pending step clock").enter()));
                 }
             }
         };
@@ -2141,23 +2142,67 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         }};
     }
     macro_rules! run_step {
-        ($function:ident, $locals:ident, $scopes:ident, $step_input:expr,
-            $stamp:expr, $worker:expr, $clock:expr, $cut:ident, $scope:ident,
-            $send:expr, $reply:pat => $value:expr $(,)?) => {{
-            let (job, art) = take_step!($locals, $stamp);
-            let step_input = $step_input;
-            let (job, result) = if let Some(worker) = $worker {
-                let (job, result) = worker.run(job, $clock, $send(step_input), &mut sim_trace)?;
+        ($worker:expr, $locals:ident, $stamp:expr, $clock:expr,
+            $owned_input:expr, $reply:pat => $value:expr,
+            ($state:ident, $art:ident, $hud:ident, $audio:ident, $console:ident) => $owner:expr,
+            $cut:ident, $scope:ident $(,)?) => {{
+            if let Some(worker) = $worker {
+                let (job, art) = take_step!($locals, $stamp);
+                let (job, result) = worker.run(job, $clock, $owned_input, &mut sim_trace)?;
                 let $reply = result else { unreachable!("unexpected sim worker reply"); };
-                (job, $value)
+                let result = $value;
+                let console_ops = restore_step!(job, art, $locals);
+                (result, console_ops)
             } else {
-                let started = sim_trace.mark(job.stamp.frame.frame);
-                let (job, result) = $function(job, step_input, &mut $scopes);
-                sim_trace.owner(job.stamp, sim_timing::Scope::$scope, Some(sim_timing::Cut::$cut), started);
-                (job, result)
-            };
-            let console_ops = restore_step!(job, art, $locals);
-            (result, console_ops)
+                let started = sim_trace.mark($stamp.frame.frame);
+                let mut state = StepState {
+                    world: &mut world,
+                    interactions: &mut interactions,
+                    alice: alice.sim_mut(),
+                    npcs: npcs.sim_mut(),
+                    steam: steam.sim_mut(),
+                    input: &mut input,
+                    weapon_buttons: &mut weapon_buttons,
+                    pickup_feedback: &mut pickup_feedback,
+                    third_person: &mut third_person,
+                    follow_camera: &mut follow_camera,
+                    camera_handoff: &mut camera_handoff,
+                    rail_camera: &mut rail_camera,
+                    clock: &mut clock,
+                    recovery: &mut recovery,
+                    paused: &mut paused,
+                    post_game: &mut post_game,
+                    hints: &mut hints,
+                    entry_spawn: &mut entry_spawn,
+                    stats: &mut stats,
+                    pickups: &mut pickups,
+                    pickup_clock: &mut pickup_clock,
+                    environment_clock: &mut environment_clock,
+                    story: &mut story,
+                    pos: &mut pos,
+                    yaw: &mut yaw,
+                    pitch: &mut pitch,
+                    flying: &mut flying,
+                    spawn_landing: &mut spawn_landing,
+                    player: &mut player,
+                    played: &mut played,
+                };
+                let mut console_ops = ConsoleOps::default();
+                let result = {
+                    let ($state, $art, $hud, $audio, $console) = (
+                        &mut state, &mut art_ops, &mut hud_ops, &mut audio_step, &mut console_ops,
+                    );
+                    $owner
+                };
+                sim_trace.owner($stamp, sim_timing::Scope::$scope, Some(sim_timing::Cut::$cut), started);
+                // Match the worker join: apply art before returning console commands.
+                for op in art_ops.drain(..) {
+                    if let Some(body) = op.apply(alice.art_mut(), &mut power_art) {
+                        alice.sim_mut().recycle_body_input(body);
+                    }
+                }
+                (result, console_ops)
+            }
         }};
     }
     loop {
@@ -2372,17 +2417,20 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         // Inside the bench, retain physics with neutral input, including sticks.
         let mut step_guards = None;
         let mut input_started = sim_trace.input(frame);
-        let mut step_input = input.capture_step(
+        let step_input = input.capture_step(
             replay.as_ref().filter(|r| r.running()).map_or(frame, |r| r.current_step() - 1),
             physical_input && window_focused() && !bench && !route_running,
+            sim_overlap,
         );
-        input.apply_step(&step_input, &preferences);
+        // The serial owner only needs the clock sampled immediately before the step.
+        let mut step_clock = step_input.clock;
+        input.apply_step(step_input, &preferences);
         #[cfg(feature="native_timing")]
         timing.with(|r| {if r.schedule.is_some(){r.schedule_input(input.diagnostic_activity());}});
         preview_throttle.advance_frame();
         let host_transition = crate::transition_memory::host_action(frame);
         if !host_transition.is_empty() {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
         }
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         if host_transition.is_empty() && std::env::var_os("LOOKING_GLASS_TRANSITION_RESUME").is_some() { paused = false; }
@@ -2399,7 +2447,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             }
         }
         if host_transition == "chapter" {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             let destination = crate::transition_memory::host_destination();
             let choice = level_choices.iter().find(|c| maps[c.map] == destination).context("probe destination")?;
             chapter_requested = Some(crate::campaign::LevelChoice { map: choice.map, entry: choice.entry, title: choice.title.clone() });
@@ -2421,7 +2469,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             || (replay.as_ref().is_some_and(|r| r.replaying()) && macroquad::input::is_quit_requested());
         quit_after_frame |= host_transition == "quit" || lag_control.quit == Some(frame);
         if lag_control.quit == Some(frame) || (quit_after_frame && !throttle_normal) {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             finish_replay_step!("quit");
             flush_audio!("quit");
             break;
@@ -2431,11 +2479,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 && !menu
                 && !inventory_menu
             {
-                flush_pending!(frame, step_guards, step_input);
+                flush_pending!(frame, step_guards, step_clock);
                 flush_audio!("escape-open");
                 escape_menu.open(crate::menu::Page::Main, &preferences, audio.settings);
             } else if is_key_pressed(KeyCode::F3) {
-                flush_pending!(frame, step_guards, step_input);
+                flush_pending!(frame, step_guards, step_clock);
                 menu = false;
                 inventory_menu = false;
                 flush_audio!("escape-open");
@@ -2444,7 +2492,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         }
         // Start ends a recording; the menu then runs on the live pad. A replay never opens it.
         if escape_menu.page.is_some() {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             if let Some(r) = replay.as_mut().filter(|r| r.running()) {
                 r.stop("menu");
                 if r.replaying() { flush_audio!("menu-replay-end"); break; }
@@ -2655,7 +2703,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 "new-game", &maps[current], "gvillage"));
             #[cfg(feature = "native_timing")]
             timing.with(|r| r.discontinuity(crate::native_timing::Milestone::OpeningEnter, crate::native_timing::CINEMA));
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             flush_audio!("opening-film");
             match owner_yield!(step_guards, crate::movie::play(
                 &mut assets,
@@ -2920,7 +2968,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         // Retry input; neither may overwrite its selected destination/checkpoint.
         if new_campaign_memory.is_some() || pending_menu_newgame.is_some() { load_requested = None; }
         if let Some(slot) = load_requested {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             // A load reads the slot as it is now, which a later replay cannot rely on.
             if let Some(r) = replay.as_mut().filter(|r| r.running()) {
                 r.stop("load");
@@ -2971,8 +3019,9 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         }
         // Install the sampled clock before the owner head.
         let step = StepGuard::enter();
-        step_input.refresh_clock();
-        step_guards = Some((step, step_input.enter_clock()));
+        let clock_view = ClockView::capture();
+        step_clock = Some(clock_view);
+        step_guards = Some((step, clock_view.enter()));
         macro_rules! pressed {
             ($key:expr) => { focused && !console_input && input.key(&preferences, $key, true) };
         }
@@ -3000,7 +3049,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         }
         let mut audio_changed = false;
         if pressed!(KeyCode::M) {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             audio.settings.muted = !audio.settings.muted;
             audio_changed = true;
         }
@@ -3221,7 +3270,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             || (bench && skip_id.is_some() && !paused && !menu && !inventory_menu
                 && !console_input && focused && !flying && stats.alive());
         if skip_requested {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             let speaking = skip_id.is_some_and(|id| story.progress(id).is_some());
             if interactions.skip_cinematic(&scene.map, &mut world, &mut player, &mut story)? {
                 #[cfg(feature = "native_timing")]
@@ -3253,7 +3302,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let mut gameplay = false;
         if new_campaign_memory.is_none() && pending_menu_newgame.is_none()
             && saves_enabled && !stats.alive() && (recover || restart || console_restart) {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             #[cfg(feature = "native_timing")]
             timing.with(|r| r.discontinuity(crate::native_timing::Milestone::LoadAttempt, crate::native_timing::OPERATION));
             finish_checkpoint!(true);
@@ -3297,7 +3346,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             }).into()));
         }
         if (recover || restart || console_restart) && !in_transport {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             #[cfg(feature = "native_timing")]
             timing.with(|r| r.discontinuity(crate::native_timing::Milestone::Recovery, crate::native_timing::OPERATION));
             let entry = interaction::spawn_with_static(&scene.map, entry_spawn.as_deref(), Some(world.audio_geometry()));
@@ -3376,7 +3425,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             }
         }
         if (console_fly || (pressed!(KeyCode::F4) && !menu && !inventory_menu)) && stats.alive() {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             if flying {
                 let feet = pos - Vec3::Z * EYE_HEIGHT;
                 if world.body_clear(feet) {
@@ -3403,7 +3452,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             clock.pause();
         }
         if menu || console_map {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
             clock.pause();
             let mut chapter_action = None;
             if menu && !console_map {
@@ -3569,7 +3618,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let dispatchable = step_overlap && w0_eligible;
         let lag_dispatch = lag_map && dispatchable;
         if !lag_dispatch {
-            flush_pending!(frame, step_guards, step_input);
+            flush_pending!(frame, step_guards, step_clock);
         }
         if dispatchable {
             worker_generation = worker_generation.checked_add(1).expect("sim slot generation exhausted");
@@ -3601,15 +3650,20 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             frame: Some(viewer_block),
             census: Some(census_block),
         };
-        let input_a = StepAInput {
-            gameplay,
-            map: scene.map.clone(),
-            preferences: preferences.clone(),
-            saves_writable: saves_writable && pending_checkpoint.is_none(),
-            host_natural_exit: host_transition == "natural-exit",
-            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-            force_checkpoint: force_checkpoint_frame == Some(frame),
-        };
+        macro_rules! input_a {
+            ($map:expr, $preferences:expr) => {
+                StepAInput {
+                    gameplay,
+                    map: $map,
+                    preferences: $preferences,
+                    saves_writable: saves_writable && pending_checkpoint.is_none(),
+                    host_natural_exit: host_transition == "natural-exit",
+                    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                    force_checkpoint: force_checkpoint_frame == Some(frame),
+                }
+            };
+        }
+        let worker_input_a = dispatchable.then(|| input_a!(scene.map.clone(), preferences.clone()));
         let mut joined_b = None;
         let (step_a_result, console_ops) = if lag_dispatch {
             let seal = replay.as_ref().and_then(|r| {
@@ -3635,14 +3689,14 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             let (owner_peer, worker_peer) = lag_control.pair(pending.is_some());
             render_peer = owner_peer;
             sim_audit.event("dispatch", frame_stamp);
-            worker.submit(job, step_input.clock(),
-                blocked_step::Input::Lag(input_a, input_b, acoustic_view.take(), seal, worker_peer),
+            worker.submit(job, clock_view,
+                blocked_step::Input::Lag(worker_input_a.unwrap(), input_b, acoustic_view.take(), seal, worker_peer),
                 &mut sim_trace)?;
             let serial_reply = lag_control.serial.then(|| worker.join(&mut sim_trace)).transpose()?;
             let restore_clock = step_guards.take().is_some();
             render_pending!(frame, &mut alice_art, &mut npcs_art, &steam_art);
             if restore_clock {
-                step_guards = Some((StepGuard::enter(), step_input.enter_clock()));
+                step_guards = Some((StepGuard::enter(), clock_view.enter()));
             }
             let (job, output) = match serial_reply {
                 Some(reply) => reply,
@@ -3654,9 +3708,18 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             (due, console_ops)
         } else {
             if dispatchable { sim_audit.event("dispatch", frame_stamp); }
-            run_step!(step_a, step_locals, step_scopes, input_a,
-                frame_stamp, sim_worker.as_mut().filter(|_| dispatchable), step_input.clock(), A, StepA,
-                blocked_step::Input::A, blocked_step::Output::A(result) => result)
+            run_step!(
+                sim_worker.as_mut().filter(|_| dispatchable), step_locals, frame_stamp, clock_view,
+                blocked_step::Input::A(worker_input_a.unwrap()),
+                blocked_step::Output::A(result) => result,
+                (state, art_ops, hud_ops, audio_step, console_ops) => step_a_in_place(
+                    state, &mut step_locals, art_ops, hud_ops, audio_step, console_ops,
+                    #[cfg(feature = "vita_renderer")]
+                    route_session.as_mut().map(crate::route_replay::Session::control_mut),
+                    input_a!(scene.map.as_ref(), preferences.as_ref()), &mut step_scopes,
+                ),
+                A, StepA,
+            )
         };
         if console_ops.close { console.open = false; }
         if let Some(message) = console_ops.message { console.print(message); }
@@ -3870,33 +3933,48 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 worker_seal = seal.map(|(stamp, probe)| (stamp, probe, "tail"));
                 view
         } else {
-            run_step!(step_b, step_locals, step_scopes, StepBInput {
-            story_active,
-            dispatched: worker_complete,
-            map_name: maps[current].clone(),
-            preferences: preferences.clone(),
-            aspect: screen_width() / screen_height(),
-            handoff_pose: if snapshot_handoff && level_art.pool.is_some() {
-                handoff_return.pose(&level_art.snapshot_visit).cloned()
+            let handoff_pose = if snapshot_handoff && level_art.pool.is_some() {
+                handoff_return.pose(&level_art.snapshot_visit)
             } else {
-                level_art.handoff_pose().cloned()
-            },
-            loot_visit,
-            loot_before,
-            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-            frame,
-            #[cfg(target_os = "vita")]
-            bench_camera,
-        }, frame_stamp, sim_worker.as_mut().filter(|_| worker_complete), step_input.clock(), B, StepB,
-            |input| blocked_step::Input::B(input, acoustic_view.take(), seal_request),
-            blocked_step::Output::B(result) => {
-                let (view, acoustic, present, seal) = result?;
-                worker_present = Some(present);
-                acoustic_view = Some(acoustic);
-                worker_seal = seal.map(|(stamp, probe)| (stamp, probe, "tail"));
-                view
-            }).0
-
+                level_art.handoff_pose()
+            };
+            macro_rules! input_b {
+                ($map_name:expr, $preferences:expr, $handoff_pose:expr) => {
+                    StepBInput {
+                        story_active,
+                        dispatched: worker_complete,
+                        map_name: $map_name,
+                        preferences: $preferences,
+                        aspect: screen_width() / screen_height(),
+                        handoff_pose: $handoff_pose,
+                        loot_visit,
+                        loot_before,
+                        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                        frame,
+                        #[cfg(target_os = "vita")]
+                        bench_camera,
+                    }
+                };
+            }
+            run_step!(
+                sim_worker.as_mut().filter(|_| worker_complete), step_locals, frame_stamp, clock_view,
+                blocked_step::Input::B(
+                    input_b!(maps[current].clone(), preferences.clone(), handoff_pose.cloned()),
+                    acoustic_view.take(), seal_request,
+                ),
+                blocked_step::Output::B(result) => {
+                    let (view, acoustic, present, seal) = result?;
+                    worker_present = Some(present);
+                    acoustic_view = Some(acoustic);
+                    worker_seal = seal.map(|(stamp, probe)| (stamp, probe, "tail"));
+                    view
+                },
+                (state, art_ops, hud_ops, audio_step, _console_ops) => step_b_in_place(
+                    frame_stamp, state, &mut step_locals, art_ops, hud_ops, audio_step,
+                    input_b!(maps[current].as_str(), preferences.as_ref(), handoff_pose), &mut step_scopes,
+                ),
+                B, StepB,
+            ).0
         };
         let StepView {
             stamp: present_stamp, presentation, camera_out, dynamic: mut dynamic_input, active, direction, targets, pand_cinematic, scripted_camera, show_alice,
@@ -4505,7 +4583,7 @@ interactions
         // All simulation queries and rejection decisions precede this boundary.
         // Remaining families/failures keep the conservative end-of-3D marker.
         let captured_hud_view = snapshot_world_free.then(|| HudView::capture(&input));
-        crate::spike_log::world_last_read();
+        if spike_world_reads { crate::spike_log::world_last_read(); }
         let lag_free = lag_dispatch && worker_complete && snapshot_world_free && active && focused
             && stats.alive() && !paused && !menu && !inventory_menu && !console.open && !console_input
             && !audio.settings.muted
@@ -4551,7 +4629,7 @@ interactions
                 "pickup_clock": pickup_clock, "transforms": dynamic_input.transforms,
             }));
             pending = Some(lag_frame::Frame {
-                stamp: present_stamp, clock: step_input.clock(), camera: world_camera, dynamic: dynamic_input,
+                stamp: present_stamp, clock: clock_view, camera: world_camera, dynamic: dynamic_input,
                 level: level_dispatch.expect("validated lag level input"),
                 aim: aim_input.expect("validated lag aim input"),
                 shadow: shadow_input.expect("captured lag shadow"),
@@ -4965,7 +5043,7 @@ interactions
         }
         }
         sim_trace.owner(present_stamp, sim_timing::Scope::Render, None, render_started);
-        if !snapshot_world_free {crate::spike_log::world_last_read();}
+        if spike_world_reads && !snapshot_world_free { crate::spike_log::world_last_read(); }
         #[cfg(feature="vita_renderer")]
         crate::render::vita_renderer::present_3d();
         let census_capture = crate::phase_census::span(crate::phase_census::Region::RenderCapture);
@@ -5424,7 +5502,7 @@ interactions
         crate::spike_log::cpu_end();
         // Save completion and optional diagnostics are serial fences. Ordinary
         // enabled frames have consumed owned HUD and timing inputs above.
-        if snapshot_tail_fenced { crate::spike_log::world_last_read(); }
+        if spike_world_reads && snapshot_tail_fenced { crate::spike_log::world_last_read(); }
         #[cfg(target_os = "vita")]
         {
             crate::frame_phases::mark(3);
@@ -5508,7 +5586,7 @@ interactions
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         crate::phase_census::accept(active, frame > 60);
         if quit_after_frame {
-            if snapshot_tail_fenced { crate::spike_log::world_last_read(); }
+            if spike_world_reads && snapshot_tail_fenced { crate::spike_log::world_last_read(); }
             flush_audio!("quit-after-frame");
             break;
         }
@@ -5530,7 +5608,7 @@ interactions
             assert!(!free_tail, "free tail would suppress simulation input");
             input.suppress();
         }
-        if snapshot_tail_fenced { crate::spike_log::world_last_read(); }
+        if spike_world_reads && snapshot_tail_fenced { crate::spike_log::world_last_read(); }
         crate::frame_phases::mark(9);
         drop(census_tail);
         #[cfg(feature = "vita_renderer")]
@@ -5560,7 +5638,7 @@ interactions
         if let Some(s)=&mut r13_survey {
             s.presented(&maps[current],tail_snapshot.as_ref().map_or_else(|| stats.alive(), |s| s.alive),is_key_pressed(KeyCode::Tab))?;
             if s.take_snapshot() {
-                crate::spike_log::world_last_read();
+                if spike_world_reads { crate::spike_log::world_last_read(); }
                 crate::allocation_census::snapshot("presented");
                 if crate::allocation_census::enabled() {
                     crate::allocation_census::payload("live_collision",world.census_payload());
@@ -5568,7 +5646,7 @@ interactions
                 }
             }
         }
-        if snapshot_tail_fenced { crate::spike_log::world_last_read(); }
+        if spike_world_reads && snapshot_tail_fenced { crate::spike_log::world_last_read(); }
     }
     assert!(pending.is_none(), "viewer exited with an unpublished presentation");
     sim_audit.finish(frame);
