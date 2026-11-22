@@ -5,6 +5,7 @@ use std::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+#[cfg(any(debug_assertions, not(target_os = "vita")))]
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ActorId(u64);
@@ -44,10 +45,29 @@ pub(crate) fn enter_sim_worker() {
 }
 
 // Render instances and publication generations are allocated on the owner.
+// Release builds on the console pay a plain per-thread counter: the sim
+// worker is the only other thread and never allocates. The worker assertion
+// stays where it is cheap, in debug or host builds, and the id sequence is
+// unchanged everywhere.
 pub(crate) fn next_art_instance() -> u64 {
+    #[cfg(any(debug_assertions, not(target_os = "vita")))]
     assert!(!SIM_WORKER.get(), "sim worker allocated an art instance");
-    NEXT_INSTANCE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .expect("skin instance overflow")
+    #[cfg(any(debug_assertions, not(target_os = "vita")))]
+    {
+        NEXT_INSTANCE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("skin instance overflow")
+    }
+    #[cfg(all(not(debug_assertions), target_os = "vita"))]
+    {
+        thread_local! {
+            static NEXT: Cell<u64> = const { Cell::new(1) };
+        }
+        NEXT.with(|next| {
+            let id = next.get().checked_add(1).expect("skin instance overflow");
+            next.set(id);
+            id
+        })
+    }
 }
 impl Default for ActorId {
     fn default() -> Self {
