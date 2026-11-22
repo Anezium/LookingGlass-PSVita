@@ -1479,6 +1479,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             audio.load(&mut assets, &maps[current], &scene.map);
             audio.install_story_voices(&mut story, &maps[current]);
             install_timing.mark("audio_load");
+            scene.prepare_level_gpu();
             clock.pause();
             paused = $pause;
             menu = false;
@@ -1521,6 +1522,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     if save::bench_scene(validated) == save::BenchScene::ReuseValidated {
         // The restored scene's build and its install are one load window.
         let _share = crate::texture::load_scope();
+        #[cfg(feature = "vita_renderer")]
+        let _loading = if crate::render::vita_renderer::config().eager_level_gpu {
+            let destination = &prepared.as_ref().unwrap().game.level()?.map;
+            crate::loading_screen::begin("startup-restore", destination)
+        } else { None };
         let mut timing = crate::startup::Phase::new("restore_resources");
         power_art = crate::powerups::Art::load(&mut assets)?;
         timing.mark("power_art");
@@ -1692,6 +1698,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         level_art.prepare(&mut assets, &scene, &interactions, true)?;
         entry_timing.mark("level_art");
         crate::loading_screen::between("level_art").await;
+        scene.prepare_level_gpu();
         drop(boot_loading);
         campaign = Campaign::default();
         #[cfg(feature = "native_timing")]
@@ -1866,6 +1873,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 audio.reload_failed_transition(&mut assets, &maps[current], &scene.map);
                 audio.reload_story_voices(&mut assets, &maps[current]);
                 audio.restore_transition($audio);
+                scene.prepare_level_gpu();
                 character
             }
         }};
@@ -3473,6 +3481,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                         environment_clock = 0.;
                         audio.load(&mut assets, &maps[selected], &scene.map);
                         audio.install_story_voices(&mut story, &maps[selected]);
+                        scene.prepare_level_gpu();
                         current = selected;
                         campaign = Campaign::default();
                         played = true;
@@ -3813,6 +3822,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                     );
                     audio.load(&mut assets, &name, &scene.map);
                     audio.install_story_voices(&mut story, &name);
+                    scene.prepare_level_gpu();
                     eprintln!("[lg/transition] destination={name} resources_audio_ms={:.3}", transition_started.elapsed().as_secs_f64()*1000.);
                     // A blocked entrance already failed the exit, so there is no flight fallback.
                     (pos, yaw) = (arrived_eye, arrived_yaw);
@@ -4966,6 +4976,10 @@ interactions
         }
         sim_trace.owner(present_stamp, sim_timing::Scope::Render, None, render_started);
         if !snapshot_world_free {crate::spike_log::world_last_read();}
+        #[cfg(all(feature = "vita_renderer", feature = "sim_maps_probe", not(target_os = "vita")))]
+        if frame == 0 && std::env::var_os("LOOKING_GLASS_FIRST_FRAME_DEPTH").is_some() {
+            crate::render::vita_renderer::probe_first_frame_depth()?;
+        }
         #[cfg(feature="vita_renderer")]
         crate::render::vita_renderer::present_3d();
         let census_capture = crate::phase_census::span(crate::phase_census::Region::RenderCapture);

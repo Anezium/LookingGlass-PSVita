@@ -300,6 +300,8 @@ pub struct Config {
     /// stage boundaries of chapter, console, natural-exit, save-load and death-retry transitions,
     /// instead of a black screen. Frames only between stages. Default off.
     pub loading_screen: bool,
+    /// Create the destination's retained FX and scaled target during level loading.
+    pub eager_level_gpu: bool,
     /// A collision world built from the same map with a hull set bit-identical to a live world's
     /// shares that world's immutable hulls, tree and SAH instead of building them again.
     /// Exact by construction; saves one tree and SAH build per such world. Default off.
@@ -746,7 +748,7 @@ impl Default for Config {
             sky: true,
             authored_sky: false,
             defer_immediate_fx: false,
-            loading_screen: false,
+            loading_screen: false, eager_level_gpu: false,
             collision_geometry_share: false,
             water_normals: false,
             low_fog: false,
@@ -1236,6 +1238,9 @@ pub(crate) fn apply_world_viewport() {
     if let Some((x,y,w,h))=world_viewport() { unsafe { get_internal_gl().quad_context.apply_viewport(x,y,w,h); } }
 }
 pub(crate) fn prepare_3d(bg:Color){scale::prepare(bg);}
+pub(super) fn prewarm_3d() { scale::prewarm(); }
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+pub(crate) use scale::probe_depth as probe_first_frame_depth;
 pub(crate) fn display_clear_skipped() -> bool { config().display_clear_skip && config().render_scale < 1. }
 pub(crate) fn begin_3d_pass(action:PassAction){scale::begin(action);}
 pub(crate) fn set_3d_camera(camera:&Camera3D){scale::camera(camera);}
@@ -3186,6 +3191,11 @@ impl Renderer {
     pub(super) fn begin_fx(&mut self) {
         self.prepared.clear();
     }
+    pub(super) fn prewarm_fx(&mut self, gpu_skin_actors: bool) {
+        self.fx_gpu.get_or_insert_with(|| {
+            crate::render_fx::retained::Gpu::prewarm(gpu_skin_actors).expect("retained actor shader")
+        });
+    }
     pub(super) fn finish_fx(&mut self, interop_flush: bool) -> (usize, usize) {
         let probe_finish = water_probe::tick();
         let _pass_clock = crate::pass_clock::scope(crate::pass_clock::FX_FINISH);
@@ -4388,7 +4398,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);
@@ -6233,6 +6243,14 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn eager_level_gpu_defaults_off_and_requires_a_boolean() {
+        assert!(!Config::default().eager_level_gpu);
+        let config: Config = serde_json::from_str(r#"{"eager_level_gpu":true}"#).unwrap();
+        assert!(config.eager_level_gpu);
+        assert!(serde_json::from_str::<Config>(r#"{"eager_level_gpu":1}"#).is_err());
+    }
+
     #[test]
     fn scaled_target_defaults_to_resolve_and_names_its_modes() {
         assert_eq!(Config::default().scaled_target, "resolve");
