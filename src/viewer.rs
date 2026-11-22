@@ -1864,8 +1864,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         () => {{
             #[cfg(feature = "vita_renderer")]
             if layout_config.sim_overlap_normal {
-                assert!(pending.is_none(), "scene unload before retained presentation drained");
-                assert!(sim_worker.as_ref().is_some_and(blocked_step::Worker::idle));
+                assert_unload_ready(pending.is_some(), sim_worker.as_ref());
             }
             // The recycle slot shares the outgoing World geometry. Release it
             // before budgeting the destination build.
@@ -6169,5 +6168,41 @@ mod snapshot_dispatch_tests {
         input.registered.push(false); assert!(!input.valid(&art)); input.registered.clear();
         let restored = LevelArt::default(); assert!(!input.valid(&restored));
         input.visit = 0; assert!(!input.valid(&art));
+    }
+}
+
+#[cfg(feature = "vita_renderer")]
+fn assert_unload_ready(pending_retained: bool, sim_worker: Option<&blocked_step::Worker>) {
+    assert!(!pending_retained, "scene unload before retained presentation drained");
+    assert!(
+        sim_worker.is_none_or(blocked_step::Worker::idle),
+        "scene unload while sim worker is busy"
+    );
+}
+
+#[cfg(all(test, feature = "vita_renderer"))]
+mod unload_ready_tests {
+    use super::*;
+
+    #[test]
+    fn scene_unload_accepts_idle_worker_and_exit_after_drop() {
+        let mut sim_worker = Some(blocked_step::Worker::new(&sim_audit::Audit::default()).unwrap());
+        assert_unload_ready(false, sim_worker.as_ref());
+        drop(sim_worker.take());
+        assert_unload_ready(false, sim_worker.as_ref());
+    }
+
+    #[test]
+    #[should_panic(expected = "scene unload while sim worker is busy")]
+    fn scene_unload_rejects_busy_worker() {
+        let mut sim_worker = Some(blocked_step::Worker::new(&sim_audit::Audit::default()).unwrap());
+        sim_worker.as_mut().unwrap().set_test_flight(true);
+        assert_unload_ready(false, sim_worker.as_ref());
+    }
+
+    #[test]
+    #[should_panic(expected = "scene unload before retained presentation drained")]
+    fn scene_unload_rejects_pending_presentation() {
+        assert_unload_ready(true, None);
     }
 }
