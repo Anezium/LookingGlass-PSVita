@@ -1863,7 +1863,7 @@ pub(super) fn step_b_in_place(
             gameplay_alice && camera.distance(sim.player.feet + Vec3::Z * 32.) > 30.
         };
     drop(census_leaf);
-    if simulate {
+    let liquid_contents = if simulate {
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         {
             scopes.frame("frame_audio_mix");
@@ -1876,21 +1876,22 @@ pub(super) fn step_b_in_place(
             crate::phase_census::set_owner(crate::phase_census::Owner::Other);
         }
         let listen_direction = target - camera;
+        let liquid_contents = sim.world.liquid_at(camera);
         audio_step.ops.push(AudioOp::Listen {
             listener: camera,
-            submerged: sim.world.liquid_at(camera) != 0,
+            submerged: liquid_contents != 0,
             dt: elapsed,
             world_dt,
             yaw: listen_direction.y.atan2(listen_direction.x),
             paused: console_input || menu || *sim.paused || inventory_menu || !focused,
             voice_paused: !story_active,
         });
-    } // simulation: audio listener and clocks
-    let presentation = crate::presentation_input::PresentationInput::capture(
-        &sim.world,
-        camera,
-        &sim.interactions,
-    );
+        liquid_contents
+    } else {
+        sim.world.liquid_at(camera)
+    };
+    let presentation =
+        crate::presentation_input::PresentationInput::capture(liquid_contents, &sim.interactions);
     let camera_out = CameraOut {
         position: camera,
         target,

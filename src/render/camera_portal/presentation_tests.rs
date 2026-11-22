@@ -166,7 +166,7 @@ fn captured_presentation_matches_direct_writes() {
     let mut expected = scene_fixture();
 
     for camera in [Vec3::ZERO, Vec3::splat(2.)] {
-        let input = PresentationInput::capture(&world, camera, &interactions);
+        let input = PresentationInput::capture(world.liquid_at(camera), &interactions);
         actual.apply_presentation(&input);
         apply_direct(&mut expected, &world, camera, &interactions);
         assert_same_writes(&actual, &expected);
