@@ -106,6 +106,10 @@ pub struct Config {
     /// Lean fragment programs for actor packets with no dynamic light and no appearance effect:
     /// the actor program minus the lines such a packet cannot run. Default off.
     pub actor_lean_shader: bool,
+    /// Cull provably zero dynamic lights from bounded retained actor packets. Default off.
+    pub actor_light_cull: bool,
+    /// Use lean actor programs with the first two dynamic-light slots. Default off.
+    pub actor_lean_lights: bool,
     /// Skip fully certified zero-RGB actor glow following opaque, depth-writing skin.
     pub actor_zero_glow: bool,
     pub actor_glow_subset: bool,
@@ -624,6 +628,8 @@ impl Default for Config {
             actor_discard_free_shader: false,
             actor_cutout_discard_free: false,
             actor_lean_shader: false,
+            actor_light_cull: false,
+            actor_lean_lights: false,
             actor_zero_glow: false,
             actor_glow_subset: false,
             actor_glow_subset_maps: None,
@@ -4260,7 +4266,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);

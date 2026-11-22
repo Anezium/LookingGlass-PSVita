@@ -399,14 +399,30 @@ pub(crate) enum Route {
     ActorLean,
     /// `actor_lean_shader`: the lean actor program for packets already drawn without `discard`.
     ActorLeanOpaque,
+    ActorLeanLit,
+    ActorLeanLitOpaque,
+}
+
+impl Route {
+    fn is_lean_lit(self) -> bool {
+        matches!(self, Self::ActorLeanLit | Self::ActorLeanLitOpaque)
+    }
+
+    fn is_cutout_lean(self) -> bool {
+        matches!(self, Self::ActorLean | Self::ActorLeanLit)
+    }
 }
 /// `actor_lean_shader`: the lean program that replaces the full program (`programs[0]`) or the
 /// discard-free program (`programs[1]`) for one admitted packet. Effect routes are untouched,
 /// and a packet stays where it was when its lean program or pipeline is missing.
-fn actor_lean_route(base: Route, programs: [bool; 2], admitted: impl Fn() -> bool) -> Route {
+fn actor_lean_route(base: Route, programs: [bool; 2], lit: bool, admitted: impl Fn() -> bool) -> Route {
     match base {
-        Route::Full if programs[0] && admitted() => Route::ActorLean,
-        Route::CorpseOpaque if programs[1] && admitted() => Route::ActorLeanOpaque,
+        Route::Full if programs[0] && admitted() => {
+            if lit { Route::ActorLeanLit } else { Route::ActorLean }
+        }
+        Route::CorpseOpaque if programs[1] && admitted() => {
+            if lit { Route::ActorLeanLitOpaque } else { Route::ActorLeanOpaque }
+        }
         other => other,
     }
 }
@@ -437,6 +453,8 @@ fn submit_key(key: (usize, bool), route: Route, depth_write: bool) -> (usize, bo
         Route::AddFogFree => 4 * crate::render::BLEND_COUNT,
         Route::ActorLean => 5 * crate::render::BLEND_COUNT,
         Route::ActorLeanOpaque => 6 * crate::render::BLEND_COUNT,
+        Route::ActorLeanLit => 7 * crate::render::BLEND_COUNT,
+        Route::ActorLeanLitOpaque => 8 * crate::render::BLEND_COUNT,
     };
     (key.0 + offset, key.1, depth_write)
 }
@@ -450,15 +468,15 @@ pub(crate) struct Gpu {
     corpse_opaque: Option<Lite>,
     /// `fx_add_lean` and `fx_add_fog_free`: the two additive effect programs.
     fx_add: [Option<Lite>; 2],
-    /// `actor_lean_shader`: the lean actor program and its discard-free twin.
-    actor_lean: [Option<Lite>; 2],
+    /// `actor_lean_shader`: the unlit and lit actor programs and their discard-free twins.
+    actor_lean: [Option<Lite>; 4],
     buffers: Vec<Buffers>,
     white: Texture2D,
     ring_frame: usize,
     ring_phase: usize,
     stats: Stats,
     preparation: [Vec<super::prepared::Cache>; 2],
-    packet_storage: Vec<(usize, usize, usize, [f32; UNIFORM_FLOATS])>,
+    packet_storage: Vec<(usize, usize, usize, [f32; UNIFORM_FLOATS], bool)>,
     range_storage: Vec<std::ops::Range<usize>>,
     shared_storage: std::collections::HashMap<usize, usize>,
     alpha_storage: Vec<(f32, Source)>,
@@ -485,7 +503,7 @@ fn emit_actor_geometry(zero_glow: bool) -> bool {
 /// The specialized program bank of a route: 0 lean/unlit-exact, 1 corpse, 2 and 3 additive,
 /// 4 and 5 lean actor. It borrows only the bank fields, so the full program's caches stay usable.
 fn program_bank<'a>(lite: &'a mut Option<Lite>, corpse: &'a mut Option<Lite>, fx_add: &'a mut [Option<Lite>; 2],
-    actor_lean: &'a mut [Option<Lite>; 2], bank: Option<usize>) -> Option<&'a mut Lite> {
+    actor_lean: &'a mut [Option<Lite>; 4], bank: Option<usize>) -> Option<&'a mut Lite> {
     match bank? {
         0 => lite.as_mut(),
         1 => corpse.as_mut(),
@@ -564,13 +582,20 @@ impl Gpu {
                 .map_err(|e| eprintln!("[lg/vita-renderer] warning {} program failed, key off: {e:?}", add_program::NAMES[i])).ok()
         }).flatten().map(|shader| Lite { uniforms: UniformCache::default(), shader, pipelines: BTreeMap::new(), fields: crate::render::uniform_fields::Cache::new(meta()) }));
         let sources = actor_lean::sources();
-        let actor_lean = [0, 1].map(|i| c.actor_lean_shader.then(|| {
+        let lit_variant = c.actor_lean_lights || c.actor_light_cull && c.actor_lean_shader;
+        let actor_fragments = [0, 1, 2, 3].map(|i| {
+            (if i < 2 { c.actor_lean_shader } else { lit_variant }).then(|| {
+                let source = if i < 2 { sources[i].clone() } else { actor_lean::lit_source(i == 3) };
+                crate::environment::fragment(&source)
+            })
+        });
+        let actor_lean = std::array::from_fn(|i| actor_fragments[i].as_ref().and_then(|fragment| {
             crate::frame_profile::shader_creation();
             let _shader_name = crate::shader_cache::Name::new(actor_lean::NAMES[i]);
             ctx.new_shader(ShaderSource::Glsl { vertex: crate::render::VERTEX,
-                fragment: &crate::environment::fragment(&sources[i]) }, meta())
+                fragment }, meta())
                 .map_err(|e| eprintln!("[lg/vita-renderer] warning {} program failed, key off: {e:?}", actor_lean::NAMES[i])).ok()
-        }).flatten().map(|shader| Lite { uniforms: UniformCache::default(), shader, pipelines: BTreeMap::new(), fields: crate::render::uniform_fields::Cache::new(meta()) }));
+        }).map(|shader| Lite { uniforms: UniformCache::default(), shader, pipelines: BTreeMap::new(), fields: crate::render::uniform_fields::Cache::new(meta()) }));
         println!(
             "[lg/vita-renderer] actor READY grouped alpha, actor_max_layers={}",
             crate::render::vita_renderer::config().actor_max_layers
@@ -579,13 +604,14 @@ impl Gpu {
             _game_thread: crate::game_thread::GameThread::new(),
             shader,
             skin: (c.gpu_skin_ants || FRAME.with(|f| f.borrow().gpu_skin_actors)).then(|| {
-                // The same fragment sources as the four actor routes above.
-                let sources = actor_lean::sources();
+                // Use the same fragment sources as the CPU actor routes.
                 gpu_skin::Gpu::new([
                     Some(fragment.clone()),
                     corpse_opaque.is_some().then(|| crate::lighting::fragment(&crate::environment::fragment(&super::corpse_opaque::fragment()))),
-                    actor_lean[0].is_some().then(|| crate::environment::fragment(&sources[0])),
-                    actor_lean[1].is_some().then(|| crate::environment::fragment(&sources[1])),
+                    actor_fragments[0].clone().filter(|_| actor_lean[0].is_some()),
+                    actor_fragments[1].clone().filter(|_| actor_lean[1].is_some()),
+                    actor_fragments[2].clone().filter(|_| c.actor_lean_lights && actor_lean[2].is_some()),
+                    actor_fragments[3].clone().filter(|_| c.actor_lean_lights && actor_lean[3].is_some()),
                 ]).map_err(|e|eprintln!("[lg/gpu-skin] CPU fallback: {e:#}")).ok()
             }).flatten(),
             pipelines: BTreeMap::new(),
@@ -765,10 +791,11 @@ impl Gpu {
         });
         }
     }
-    /// Return whether this packet used the cutout-preserving lean program.
+    /// Return the actual cutout-preserving lean route for the next layer.
     #[allow(clippy::too_many_arguments)]
     fn draw(&mut self, p: &Pass, slot: usize, u: &[f32; UNIFORM_FLOATS], depth_write: bool,
-        ant_dead: Option<bool>, zero_glow: bool, subset: Option<&zero_glow::Subset>) -> bool {
+        ant_dead: Option<bool>, zero_glow: bool, culled_to_zero: bool,
+        subset: Option<(Route, &zero_glow::Subset)>) -> Option<Route> {
         let _owner = crate::render_tail::owner(if p.effect { crate::light_profile::RenderPhase::Fx } else { crate::light_profile::RenderPhase::Actors });
         let started = crate::render::vita_renderer::config().render_draw_timing
             .then(MetricInstant::now);
@@ -799,9 +826,28 @@ impl Gpu {
             .unwrap_or_else(|| route(p, opaque, self.lite.is_some()));
         let program = actor_lean_route(program,
             [0, 1].map(|i| self.actor_lean[i].as_ref().is_some_and(|l| l.pipelines.contains_key(&key))),
-            || actor_lean::admitted(p, u));
+            false, || !culled_to_zero && actor_lean::admitted(p, u));
+        // Keep the RGB light-add expression after a cull to zero. Omitting it
+        // changed native GL rounding on a replay even with a zero light sum.
+        let program = if c.actor_lean_lights || culled_to_zero && c.actor_lean_shader {
+            actor_lean_route(program, [2, 3].map(|i| {
+                self.actor_lean[i].as_ref().is_some_and(|l| l.pipelines.contains_key(&key))
+                    && (p.gpu_skin.is_none() || self.skin.as_ref().is_some_and(|skin| skin.supports(i + 2)))
+            }), true, || actor_lean::admitted_lit(p, u, culled_to_zero))
+        } else { program };
+        let variant = match program {
+            Route::CorpseOpaque => 1, Route::ActorLean => 2, Route::ActorLeanOpaque => 3,
+            Route::ActorLeanLit => 4, Route::ActorLeanLitOpaque => 5, _ => 0,
+        };
+        let actual = if p.gpu_skin.is_some() && !self.skin.as_ref().unwrap().supports(variant) {
+            Route::Full
+        } else { program };
+        if !p.effect {
+            crate::spike_log::actor_routes(culled_to_zero, actual.is_lean_lit(), actual == Route::Full);
+        }
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-        actor_lean::census(p, u, depth_write, program);
+        actor_lean::census(p, u, depth_write, actual, culled_to_zero);
+        let subset = subset.and_then(|(previous, subset)| (actual == previous).then_some(subset));
         let lite = program == Route::Lite;
         if lite { count(if crate::render::vita_renderer::config().fx_unlit_exact {
             "vita_fx_unlit_exact_draws"
@@ -815,8 +861,7 @@ impl Gpu {
         }
         if let Some(skin)=&p.gpu_skin {
             // Only the vertex program changes: keep the fragment route of the CPU twin.
-            let variant = match program { Route::CorpseOpaque => 1, Route::ActorLean => 2, Route::ActorLeanOpaque => 3, _ => 0 };
-            let lean = self.skin.as_mut().expect("accepted skin program").draw(
+            self.skin.as_mut().expect("accepted skin program").draw(
                 p, skin, variant, u, depth_write, &self.white, c.actor_frontface_cull, zero_glow, subset);
             // The skin program, pipeline and bindings replaced the CPU programs' state. Their
             // uniform values are per program in GL and stay valid: keep the field caches.
@@ -831,7 +876,7 @@ impl Gpu {
             metrics.draws += 1; metrics.pipelines += 1; metrics.depth_states += 1; metrics.bindings += 1;
             metrics.texture_bind_slots += 3; metrics.uniform_uploads += 1;
             if let Some(started) = started { metrics.cpu_ns += started.elapsed().as_nanos() as u64; }
-            return lean;
+            return actual.is_cutout_lean().then_some(actual);
         }
         // This draw applies another program's state: the next skin draw reapplies its own.
         if let Some(skin) = &mut self.skin { skin.interrupt_state(); }
@@ -844,6 +889,8 @@ impl Gpu {
             Route::AddFogFree => Some(3),
             Route::ActorLean => Some(4),
             Route::ActorLeanOpaque => Some(5),
+            Route::ActorLeanLit => Some(6),
+            Route::ActorLeanLitOpaque => Some(7),
         };
         let pipeline = *match bank {
             None => self.pipelines.get(&key),
@@ -859,7 +906,7 @@ impl Gpu {
         let ctx = unsafe { get_internal_gl() }.quad_context;
         let c = crate::render::vita_renderer::config();
         let b = &self.buffers[slot].bindings;
-        let subset = subset.filter(|_| program == Route::ActorLean);
+        let subset = subset.filter(|_| program.is_cutout_lean());
         let (index, index_count) = subset.map_or((b.index_buffer, p.geometry().indices.len() as i32),
             |subset| subset.draw_count(b.index_buffer));
         let apply = if c.fx_submit_state_cache {
@@ -984,7 +1031,7 @@ impl Gpu {
                 apply[0],apply[1],traffic.calls,traffic.bytes,started.map_or(0,|t|t.elapsed().as_nanos()));
         }
         if let Some(started) = started { metrics.cpu_ns += started.elapsed().as_nanos() as u64; }
-        program == Route::ActorLean
+        program.is_cutout_lean().then_some(program)
     }
 }
 fn ring_slot(slot: usize, frame: usize, phase: usize, safe: bool) -> usize {
@@ -1744,13 +1791,14 @@ pub(crate) fn finish_world(
                         let skin_clock = (!p.effect).then(|| crate::character::skinning::timing::leaf("uniform_build"));
                         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
                         let actor_leaf = (!p.effect).then(|| crate::character::skinning::census::leaf("uniform_build",p.mesh.texture.as_ref().map(Texture2D::raw_miniquad_id)));
-                        let u = if c.fx_prepare_cache { prepared_uniforms(p, &mut uniform_templates) }
+                        let mut u = if c.fx_prepare_cache { prepared_uniforms(p, &mut uniform_templates) }
                             else { FRAME.with(|f| uniforms(p, &f.borrow())) };
                         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
                         drop(actor_leaf);
         drop(skin_clock);
                         leaves.add(1,uniform_leaf);
-                        packets.push((group_id, pass_id, b, u));
+                        let culled_to_zero = c.actor_light_cull && actor_lean::cull_lights(p, &mut u);
+                        packets.push((group_id, pass_id, b, u, culled_to_zero));
                     }
                     Err(e) => {
                         eprintln!("[lg/vita-renderer] rejected actor packet: {e:#}");
@@ -1784,9 +1832,9 @@ pub(crate) fn finish_world(
         let _census = crate::phase_census::span(if groups[id].passes.iter().all(|p| p.effect) {crate::phase_census::Region::FxSubmit} else {crate::phase_census::Region::ActorSubmit});
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         let census_start=crate::character::skinning::census::active().then(std::time::Instant::now);
-        let mut previous_lean = false;
+        let mut previous_lean = None;
         for i in ranges[id].clone() {
-            let (group, pass, b, u) = &packets[i];
+            let (group, pass, b, u, culled_to_zero) = &packets[i];
             #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
             if crate::character::skinning::census::active() {
                 let p=&groups[*group].passes[*pass];
@@ -1812,24 +1860,20 @@ pub(crate) fn finish_world(
                 && gpu.actor_lean[0].as_ref().is_some_and(|lean|
                     lean.pipelines.contains_key(&(1, false)) && lean.pipelines.contains_key(&(2, false)))
                 && {
-                    let (base_group, base_pass, base_slot, base_uniforms) = &packets[i - 1];
+                    let (base_group, base_pass, base_slot, base_uniforms, _) = &packets[i - 1];
                     base_group == group && *base_pass == 0
                         && zero_glow::certified(&groups[*base_group].passes[*base_pass], base_uniforms, p, u, base_slot == b)
                 };
-            let subset = if actor_glow_subset && previous_lean && !groups[id].transparent
-                && *pass == 1 && ranges[id].len() == 2
-            {
-                let (base_group, base_pass, base_slot, base_uniforms) = &packets[i - 1];
-                if base_group == group && *base_pass == 0 {
-                    zero_glow::subset(&groups[*base_group].passes[*base_pass], base_uniforms, p, u,
-                        base_slot == b, groups[id].glow_cpu_bounded)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            previous_lean = gpu.draw(p, *b, u, !groups[id].transparent, groups[id].ant_dead, zero_glow, subset);
+            let subset = previous_lean.filter(|_| actor_glow_subset && !groups[id].transparent
+                && *pass == 1 && ranges[id].len() == 2).and_then(|previous: Route| {
+                let (base_group, base_pass, base_slot, base_uniforms, _) = &packets[i - 1];
+                if base_group != group || *base_pass != 0 { return None; }
+                zero_glow::subset(&groups[*base_group].passes[*base_pass], base_uniforms, p, u,
+                    base_slot == b, groups[id].glow_cpu_bounded, previous.is_lean_lit())
+                    .map(|subset| (previous, subset))
+            });
+            previous_lean = gpu.draw(p, *b, u, !groups[id].transparent, groups[id].ant_dead,
+                zero_glow, *culled_to_zero, subset);
         }
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         if crate::character::skinning::census::active() && groups[id].passes.iter().any(|p|!p.effect) {
@@ -1971,26 +2015,26 @@ mod tests {
     fn the_lean_actor_route_replaces_only_the_full_and_the_discard_free_program() {
         let calls = std::cell::Cell::new(0);
         let yes = || { calls.set(calls.get() + 1); true };
-        assert_eq!(actor_lean_route(Route::Full, [true, true], yes), Route::ActorLean);
-        assert_eq!(actor_lean_route(Route::CorpseOpaque, [true, true], yes), Route::ActorLeanOpaque);
+        assert_eq!(actor_lean_route(Route::Full, [true, true], false, yes), Route::ActorLean);
+        assert_eq!(actor_lean_route(Route::CorpseOpaque, [true, true], false, yes), Route::ActorLeanOpaque);
         assert_eq!(calls.get(), 2);
         for effect in [Route::Lite, Route::AddLean, Route::AddFogFree, Route::ActorLean, Route::ActorLeanOpaque] {
-            assert_eq!(actor_lean_route(effect, [true, true], yes), effect);
+            assert_eq!(actor_lean_route(effect, [true, true], false, yes), effect);
         }
         assert_eq!(calls.get(), 2, "other routes never ask");
         // A missing program, or a blend it has no pipeline for, leaves the packet where it was.
-        assert_eq!(actor_lean_route(Route::Full, [false, true], yes), Route::Full);
-        assert_eq!(actor_lean_route(Route::CorpseOpaque, [true, false], yes), Route::CorpseOpaque);
+        assert_eq!(actor_lean_route(Route::Full, [false, true], false, yes), Route::Full);
+        assert_eq!(actor_lean_route(Route::CorpseOpaque, [true, false], false, yes), Route::CorpseOpaque);
         assert_eq!(calls.get(), 2, "a missing program is decided before the payload is read");
-        assert_eq!(actor_lean_route(Route::Full, [true, true], || false), Route::Full);
-        assert_eq!(actor_lean_route(Route::CorpseOpaque, [true, true], || false), Route::CorpseOpaque);
+        assert_eq!(actor_lean_route(Route::Full, [true, true], false, || false), Route::Full);
+        assert_eq!(actor_lean_route(Route::CorpseOpaque, [true, true], false, || false), Route::CorpseOpaque);
         // The discard-free twin never serves a packet the full program was drawing.
-        assert_eq!(actor_lean_route(Route::Full, [false, true], || true), Route::Full);
+        assert_eq!(actor_lean_route(Route::Full, [false, true], false, || true), Route::Full);
     }
     #[test]
     fn every_program_owns_its_submit_cache_slots_and_the_lean_blends_are_the_named_ones() {
         let routes = [Route::Full, Route::Lite, Route::CorpseOpaque, Route::AddLean, Route::AddFogFree,
-            Route::ActorLean, Route::ActorLeanOpaque];
+            Route::ActorLean, Route::ActorLeanOpaque, Route::ActorLeanLit, Route::ActorLeanLitOpaque];
         let mut keys = std::collections::BTreeSet::new();
         for route in routes {
             for blend in [0, 1, crate::render::BLEND_COUNT - 1] {
@@ -2727,7 +2771,7 @@ mod tests {
         sequence.push(harmless);
         let counts = sequence.iter().fold([0u64; 3], |mut counts, p| {
             counts[match route(p, false, true) { Route::Full => 0, Route::Lite => 1, Route::CorpseOpaque => 2,
-                Route::AddLean | Route::AddFogFree | Route::ActorLean | Route::ActorLeanOpaque =>
+                Route::AddLean | Route::AddFogFree | Route::ActorLean | Route::ActorLeanOpaque | Route::ActorLeanLit | Route::ActorLeanLitOpaque =>
                     unreachable!("route never returns an additive or a lean actor program") }] += 1;
             counts
         });

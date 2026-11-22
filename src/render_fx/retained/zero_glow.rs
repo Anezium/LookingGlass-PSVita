@@ -102,14 +102,19 @@ pub(crate) fn cpu_bounds(bounds: Option<(Vec3, Vec3)>) -> impl Drop {
 
 pub(crate) fn cpu_bounded() -> bool { CPU_BOUNDED.get() }
 
-fn compatible_pair(base: &Pass, bu: &[f32; UNIFORM_FLOATS], glow: &Pass, gu: &[f32; UNIFORM_FLOATS]) -> bool {
+fn compatible_pair(base: &Pass, bu: &[f32; UNIFORM_FLOATS], glow: &Pass, gu: &[f32; UNIFORM_FLOATS], lit: bool) -> bool {
     !base.effect && !glow.effect
         && base.blend_index == 1 && glow.blend_index == 2 && !base.depth_equal && !glow.depth_equal
         && base.cutout == 1. && glow.cutout == 0. && glow.fog == 1.
         && !base.clamp && !glow.clamp && base.gain.w == 1. && glow.gain == Vec4::ONE
         && bu[..32] == gu[..32] && bu[..32].iter().all(|x| x.is_finite())
         && bu[48..52] == [0.; 4] && gu[48..52] == [0.; 4]
-        && actor_lean::admitted(base, bu) && actor_lean::admitted(glow, gu)
+        && if lit {
+            actor_lean::admitted_lit(base, bu, true) && actor_lean::admitted_lit(glow, gu, true)
+                && actor_lean::bounded_glow_lights(gu)
+        } else {
+            actor_lean::admitted(base, bu) && actor_lean::admitted(glow, gu)
+        }
 }
 
 fn bounded_fog(gu: &[f32; UNIFORM_FLOATS]) -> bool {
@@ -120,7 +125,7 @@ fn bounded_fog(gu: &[f32; UNIFORM_FLOATS]) -> bool {
 
 /// The caller checks that both draws select the same linked lean program.
 pub(super) fn certified(base: &Pass, bu: &[f32; UNIFORM_FLOATS], glow: &Pass, gu: &[f32; UNIFORM_FLOATS], same_slot: bool) -> bool {
-    if !compatible_pair(base, bu, glow, gu) { return false; }
+    if !compatible_pair(base, bu, glow, gu, false) { return false; }
     let (Some(base_texture), Some(glow_texture)) = (&base.mesh.texture, &glow.mesh.texture) else {
         return false;
     };
@@ -247,18 +252,18 @@ impl Subset {
 /// matching glow fragment stays in the list and saturates destination alpha.
 /// Other deleted fragments have already established their own opaque depth.
 pub(super) fn subset<'a>(base: &Pass, bu: &[f32; UNIFORM_FLOATS], glow: &'a Pass,
-    gu: &[f32; UNIFORM_FLOATS], same_slot: bool, cpu_bounded: bool) -> Option<&'a Subset> {
+    gu: &[f32; UNIFORM_FLOATS], same_slot: bool, cpu_bounded: bool, lit: bool) -> Option<&'a Subset> {
     let surface = glow.mesh.surface.as_ref()?;
     let subset = surface.glow_subset.as_ref()?;
     if !base.mesh.surface.as_ref().is_some_and(|b| std::rc::Rc::ptr_eq(b, surface))
-        || !compatible_pair(base, bu, glow, gu)
+        || !compatible_pair(base, bu, glow, gu, lit)
         || base.geometry().indices.len() != subset.original
         || glow.geometry().indices.len() != subset.original
         || base.mesh.texture.as_ref() != surface.layers[0].textures.first()
         || glow.mesh.texture.as_ref() != surface.layers[1].textures.first()
         || !skin_pair(base, glow, same_slot)
         || !bounded_fog(gu)
-        || (glow.gpu_skin.is_none() && !cpu_bounded && (gu[136] > 0. || gu[146] > 0.)) {
+        || (glow.gpu_skin.is_none() && !cpu_bounded && (lit || gu[136] > 0. || gu[146] > 0.)) {
         return None;
     }
     Some(subset)
