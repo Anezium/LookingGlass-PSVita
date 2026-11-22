@@ -234,6 +234,9 @@ impl Encounter {
         self.data.points[&format!("get_me{}", self.saved.essence + 1)].translation + Vec3::Z * 16.
     }
 }
+impl Encounter {
+}
+
 impl LevelController for Encounter {
     fn id(&self) -> &'static str {
         "rchess1"
@@ -474,6 +477,9 @@ impl LevelController for Encounter {
     }
     fn checkpoint_written(&mut self) {
         self.saved.checkpoint = false;
+    }
+    fn checkpoint_failed(&mut self) {
+        self.saved.checkpoint = true;
     }
     fn music_mood(&self) -> Option<&'static str> {
         Some(if self.saved.phase == Phase::Fight {

@@ -341,6 +341,11 @@ impl Interactions {
             .map(|s| (s.reg.id.to_owned(), s.ctl.snapshot()))
             .collect()
     }
+    pub fn checkpoint_written(&mut self) {
+        for slot in &mut self.levels {
+            slot.ctl.checkpoint_written();
+        }
+    }
     pub(super) fn restore_levels(
         &mut self,
         saved: &BTreeMap<String, serde_json::Value>,

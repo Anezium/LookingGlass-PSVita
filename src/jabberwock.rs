@@ -382,6 +382,9 @@ impl Encounter {
         self.saved.wave_count += 1;
     }
 }
+impl Encounter {
+}
+
 impl LevelController for Encounter {
     fn particles(&self, steam: &mut crate::particles::Steam) {
         // The reward scene draws this altar itself. Its placed copy must never
@@ -570,6 +573,9 @@ impl LevelController for Encounter {
     }
     fn checkpoint_written(&mut self) {
         self.saved.checkpoint = false;
+    }
+    fn checkpoint_failed(&mut self) {
+        self.saved.checkpoint = true;
     }
     fn advance(
         &mut self,

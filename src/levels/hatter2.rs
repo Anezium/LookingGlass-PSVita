@@ -374,6 +374,9 @@ impl Encounter {
         }
     }
 }
+impl Encounter {
+}
+
 impl LevelController for Encounter {
     fn id(&self) -> &'static str {
         "hatter2"
@@ -509,6 +512,9 @@ impl LevelController for Encounter {
     }
     fn checkpoint_written(&mut self) {
         self.saved.checkpoint = false;
+    }
+    fn checkpoint_failed(&mut self) {
+        self.saved.checkpoint = true;
     }
     fn advance(
         &mut self,

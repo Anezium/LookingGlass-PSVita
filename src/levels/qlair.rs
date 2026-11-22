@@ -328,6 +328,9 @@ impl Queen {
         )]
     }
 }
+impl Queen {
+}
+
 impl LevelController for Queen {
     fn id(&self) -> &'static str {
         "qlair"
@@ -550,6 +553,9 @@ impl LevelController for Queen {
     }
     fn checkpoint_written(&mut self) {
         self.saved.checkpoint_saved = true;
+    }
+    fn checkpoint_failed(&mut self) {
+        self.saved.checkpoint_saved = false;
     }
     fn ending_ready(&self) -> bool {
         self.saved.phase == Phase::Done

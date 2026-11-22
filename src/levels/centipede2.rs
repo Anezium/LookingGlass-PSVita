@@ -148,6 +148,9 @@ impl Centipede {
         self.data.points[["get_me1", "get_me2", "get_me3"][self.saved.essence]].translation
     }
 }
+impl Centipede {
+}
+
 impl LevelController for Centipede {
     fn id(&self) -> &'static str {
         "centipede2"
@@ -398,6 +401,9 @@ impl LevelController for Centipede {
     }
     fn checkpoint_written(&mut self) {
         self.saved.checkpoint = false;
+    }
+    fn checkpoint_failed(&mut self) {
+        self.saved.checkpoint = true;
     }
     fn snapshot(&self) -> serde_json::Value {
         state::save(&self.saved)

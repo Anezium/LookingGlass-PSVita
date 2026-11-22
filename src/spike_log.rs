@@ -364,6 +364,23 @@ pub(crate) fn voice(path: &str, cached: bool, elapsed: std::time::Duration) {
     }
 }
 
+/// Keep checkpoint profiling out of the spike it is trying to explain. Silent unless the spike
+/// log is on: an unbuffered console line costs milliseconds on the frame it would describe.
+pub(crate) fn checkpoint_submit(frame: u64, stages: std::fmt::Arguments<'_>) {
+    if !on() { return; }
+    let active_frame = FRAME.with(|f| {
+        let f = f.borrow();
+        f.begin.map(|_| f.number)
+    });
+    if let Some(number) = active_frame {
+        OUT.with(|o| o.borrow_mut().push(|line| {
+            let _ = write!(line, "[lg/checkpoint-submit] frame={number} {stages}");
+        }));
+    } else {
+        println!("[lg/checkpoint-submit] frame={frame} {stages}");
+    }
+}
+
 /// A loader call outside any load phase. `name` is printed when given.
 pub(crate) fn late(kind: usize, ms: f64, name: Option<&str>, bytes: Option<usize>) {
     if !on() { return; }
