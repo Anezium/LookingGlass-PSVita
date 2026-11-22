@@ -254,9 +254,12 @@ fn settings_path() -> PathBuf {
 // Decoded mono effects only. Music and dialogue keep their compressed sources
 // and decode incrementally through rodio; never predecode those into this cache.
 const CACHE_SAMPLES: usize = 24 * 1024 * 1024 / std::mem::size_of::<f32>();
-fn audio_memory(event: &str, cache_samples: usize) {
+fn audio_memory(event: &str, cache_samples: usize, player: Option<PlayerPcm>) {
     let time_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis();
+    // Key off: `player` is None and the line keeps its earlier bytes.
+    let player = player.map_or_else(String::new, |p| format!(" player_bytes={} audio_pcm_bytes={}",
+        p.resident, cache_samples * 4 + p.unshared));
     #[cfg(target_os = "vita")]
     {
         // VitaSDK newlib malloc.h: ten 32-bit size_t fields.
@@ -266,11 +269,11 @@ fn audio_memory(event: &str, cache_samples: usize) {
             fordblks: usize, keepcost: usize }
         extern "C" { fn mallinfo() -> MallInfo; }
         let heap = unsafe { mallinfo() };
-        eprintln!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used={} heap_free_arena={} heap_arena={}",
+        eprintln!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used={} heap_free_arena={} heap_arena={}{player}",
             cache_samples * 4, CACHE_SAMPLES * 4, heap.uordblks, heap.fordblks, heap.arena);
     }
     #[cfg(not(target_os = "vita"))]
-    eprintln!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used=unavailable heap_free_arena=unavailable",
+    eprintln!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used=unavailable heap_free_arena=unavailable{player}",
         cache_samples * 4, CACHE_SAMPLES * 4);
 }
 #[cfg(test)]
@@ -290,7 +293,7 @@ mod named_prefetch_tests {
         assert_eq!(named.staged_bytes, [80_000, 0]);
         let mut cache = BTreeMap::new();
         let mut samples = 0;
-        named.finish("utemple", &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
+        named.finish("utemple", &PlayerCache::default(), &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
         assert_eq!(samples, 20_000);
         assert_eq!(cache[path].as_ref().unwrap().samples[0].to_bits(), 0.5f32.to_bits());
     }
@@ -302,7 +305,7 @@ mod named_prefetch_tests {
         let mut cache = BTreeMap::from([(existing.clone(), Some(clip(1., 1)))]);
         let mut samples = CACHE_SAMPLES - 2;
         named.stage_reject(UTEMPLE_CUES[0], Some(clip(0., 25_000)));
-        named.finish("utemple", &mut cache, &mut samples, |path| {
+        named.finish("utemple", &PlayerCache::default(), &mut cache, &mut samples, |path| {
             assert_eq!(path, KNIFE_CUES[1]);
             Some(clip(0., 3))
         });
@@ -312,7 +315,7 @@ mod named_prefetch_tests {
 
         let mut cache = BTreeMap::new();
         let mut samples = 0;
-        NamedPrefetch::for_map("wchess1", true, true).finish("wchess1", &mut cache, &mut samples, |path| {
+        NamedPrefetch::for_map("wchess1", true, true).finish("wchess1", &PlayerCache::default(), &mut cache, &mut samples, |path| {
             Some(clip(0., if path == KNIFE_CUES[0] { 60_050 } else { 2 }))
         });
         assert_eq!(samples, 2);
@@ -320,7 +323,7 @@ mod named_prefetch_tests {
         assert!(cache.contains_key(KNIFE_CUES[1]));
         for (enabled, has_knife) in [(false, true), (true, false)] {
             NamedPrefetch::for_map("wchess1", enabled, has_knife).finish(
-                "wchess1", &mut cache, &mut samples, |_| panic!("inactive path decoded"),
+                "wchess1", &PlayerCache::default(), &mut cache, &mut samples, |_| panic!("inactive path decoded"),
             );
         }
         assert_eq!(samples, 2);
@@ -377,7 +380,7 @@ mod named_prefetch_tests {
             assert_eq!(named.staged_bytes, [limit, 0], "{map}");
             let mut cache = BTreeMap::new();
             let mut samples = 0;
-            named.finish(map, &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
+            named.finish(map, &PlayerCache::default(), &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
             assert_eq!(cache.len(), entries.len(), "{map}");
             assert_eq!(samples * 4, limit, "{map}");
 
@@ -386,7 +389,7 @@ mod named_prefetch_tests {
             let mut over_cache = BTreeMap::new();
             let mut over_samples = 0;
             let last = entries.last().unwrap().0;
-            over.finish(map, &mut over_cache, &mut over_samples, |path| {
+            over.finish(map, &PlayerCache::default(), &mut over_cache, &mut over_samples, |path| {
                 let len = entries.iter().find(|&&(p, _)| p == path).unwrap().1;
                 Some(clip(0.25, len + usize::from(path == last)))
             });
@@ -397,7 +400,7 @@ mod named_prefetch_tests {
             let mut off_cache = BTreeMap::new();
             let mut off_samples = 0;
             NamedPrefetch::for_map(map, false, true).finish(
-                map, &mut off_cache, &mut off_samples, |_| panic!("key off decoded on {map}"),
+                map, &PlayerCache::default(), &mut off_cache, &mut off_samples, |_| panic!("key off decoded on {map}"),
             );
             assert!(off_cache.is_empty() && off_samples == 0);
         }
@@ -479,6 +482,38 @@ mod player_prefetch_tests {
         });
         assert!(!over.clips.contains_key(last));
         assert_eq!(over.clips.len(), MEASURED_PLAYER_CUES.len() - 1);
+    }
+
+    #[test]
+    fn memory_logs_count_resident_player_pcm_once_and_only_with_the_key_on() {
+        #[cfg(feature = "native_timing")]
+        let _music_serial = output::native_music_test_guard();
+        let mut audio = Audio::new(true, None);
+        audio.player_cache.ensure("wchess1", false, |_| panic!("key off decoded"));
+        assert!(audio.player_pcm().is_none());
+        assert!(audio.census_payload().get("player_pcm_bytes").is_none());
+
+        audio.player_cache.ensure("wchess1", true, |path| {
+            let len = MEASURED_PLAYER_CUES.iter().find(|&&(p, _)| p == path).unwrap().1;
+            Some(clip(0.25, len))
+        });
+        let pain = "sound/character/alice/pain1.wav";
+        let pain_clip = audio.player_cache.get(pain).unwrap().clone();
+        let pain_bytes = pain_clip.samples.len() * 4;
+        assert_eq!(pain_bytes, 41_536);
+        let all = audio.player_pcm().unwrap();
+        assert_eq!((all.resident, all.unshared), (PLAYER_PREFETCH_BYTES, PLAYER_PREFETCH_BYTES));
+
+        // A load-time list charges pain1 to the level cache as the same Arc: count it once.
+        audio.world_clips.insert(pain.into(), pain_clip);
+        audio.world_clips.insert("sound/world/level_only.wav".into(), clip(0.1, 100));
+        audio.cache_samples = pain_bytes / 4 + 100;
+        let shared = audio.player_pcm().unwrap();
+        assert_eq!((shared.resident, shared.unshared), (PLAYER_PREFETCH_BYTES, PLAYER_PREFETCH_BYTES - pain_bytes));
+        let census = audio.census_payload();
+        assert_eq!(census["player_pcm_bytes"], PLAYER_PREFETCH_BYTES);
+        assert_eq!(census["audio_pcm_bytes"], PLAYER_PREFETCH_BYTES + 400);
+        assert_eq!(census["cache_pcm_bytes"], pain_bytes + 400);
     }
 
     #[test]
@@ -737,6 +772,14 @@ const PLAYER_CUES: &[&str] = &[
 /// Exact mono f32 PCM size of the 10 cues in `PLAYER_CUES` (253,122 samples).
 const PLAYER_PREFETCH_BYTES: usize = 1_012_488;
 
+/// `resident`: every cue the player cache holds. `unshared`: the part the level
+/// cache does not also charge, so cache bytes plus `unshared` counts each PCM block once.
+#[derive(Clone, Copy)]
+struct PlayerPcm {
+    resident: usize,
+    unshared: usize,
+}
+
 #[derive(Default)]
 struct PlayerCache {
     clips: BTreeMap<String, Clip>,
@@ -750,6 +793,15 @@ impl PlayerCache {
     }
     fn bytes(&self) -> usize {
         self.samples * std::mem::size_of::<f32>()
+    }
+    /// Resident PCM for the memory logs once the key has loaded the cache. `charged`
+    /// names the cues the level cache also counts, as the same shared `Arc`.
+    fn pcm(&self, charged: impl Fn(&str) -> bool) -> Option<PlayerPcm> {
+        self.loaded.then(|| PlayerPcm {
+            resident: self.bytes(),
+            unshared: self.clips.iter().filter(|(path, _)| !charged(path))
+                .map(|(_, clip)| std::mem::size_of_val(&*clip.samples)).sum(),
+        })
     }
     fn ensure(&mut self, map: &str, enabled: bool, mut decode: impl FnMut(&str) -> Option<Clip>) {
         if !enabled {
@@ -828,6 +880,7 @@ impl NamedPrefetch {
     fn finish(
         mut self,
         name: &str,
+        player_cache: &PlayerCache,
         cache: &mut BTreeMap<String, Option<Clip>>,
         cache_samples: &mut usize,
         mut decode: impl FnMut(&str) -> Option<Clip>,
@@ -856,7 +909,8 @@ impl NamedPrefetch {
                 #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
                 proof::decode("named", path, &clip.samples);
                 cache.insert(path.to_owned(), Some(clip));
-                audio_memory(&format!("named:{path}"), *cache_samples);
+                audio_memory(&format!("named:{path}"), *cache_samples,
+                    player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))));
             }
         }
         let allowance: usize = self.cues.iter().map(|cues| cues.limit).sum();
@@ -938,7 +992,8 @@ fn prefetch_level_clips(
         }
         let _ = from_player;
         cache.insert(path.to_owned(), Some(clip));
-        audio_memory(&format!("prefetch:{path}"), *cache_samples);
+        audio_memory(&format!("prefetch:{path}"), *cache_samples,
+            player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))));
     };
     for path in &candidates {
         admit(path);
@@ -1280,7 +1335,8 @@ fn looping_clip(
     if retain && *cache_samples + clip.samples.len() <= CACHE_SAMPLES {
         *cache_samples += clip.samples.len();
         world_clips.insert(path.to_owned(), clip.clone());
-        audio_memory(&format!("loop:{path}"), *cache_samples);
+        audio_memory(&format!("loop:{path}"), *cache_samples,
+            player_cache.pcm(|p| world_clips.contains_key(p)));
     }
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     proof::decode("loop", path, &clip.samples);
@@ -1634,7 +1690,19 @@ pub(crate) struct TransitionCheckpoint {
 #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
 thread_local!{static SAH_MIXER:std::cell::RefCell<Option<output::Mixer>>=const{std::cell::RefCell::new(None)};}
 impl Audio {
+    fn player_pcm(&self) -> Option<PlayerPcm> {
+        self.player_cache.pcm(|path| self.world_clips.contains_key(path))
+    }
     pub(crate) fn census_payload(&self)->serde_json::Value {
+        let mut payload = self.census_level_payload();
+        // Key on only: the resident player cues outlive the level cache counted above.
+        if let Some(player) = self.player_pcm() {
+            payload["player_pcm_bytes"] = player.resident.into();
+            payload["audio_pcm_bytes"] = (self.cache_samples * 4 + player.unshared).into();
+        }
+        payload
+    }
+    fn census_level_payload(&self)->serde_json::Value {
         serde_json::json!({"cache_pcm_bytes":self.cache_samples*4,"cache_limit_bytes":CACHE_SAMPLES*4,
             "world_clips":self.world_clips.len(),"retiring_sinks":self.retiring.len(),
             "effects":self.effects.len(),"ambient_emitters":self.emitters.len(),
@@ -1778,14 +1846,14 @@ impl Audio {
         self.release_level();
         let started = std::time::Instant::now();
         if self.playback.is_none() {
-            audio_memory(&format!("level:{name}:disabled"), self.cache_samples);
+            audio_memory(&format!("level:{name}:disabled"), self.cache_samples, self.player_pcm());
             return;
         }
         if let Err(e) = self.load_inner(assets, name, map, knife_available) {
             eprintln!("Audio level error in {name}: {e:#}");
             self.status = "Some level audio could not be loaded".into();
         }
-        audio_memory(&format!("level:{name}"), self.cache_samples);
+        audio_memory(&format!("level:{name}"), self.cache_samples, self.player_pcm());
         eprintln!("[lg/audio-load] level={name} elapsed_ms={:.3}", started.elapsed().as_secs_f64() * 1000.);
     }
     /// The same level boundary as load(), before destination scene construction.
@@ -1865,7 +1933,8 @@ impl Audio {
                     "Level audio cache limit reached"
                 );
                 cache_samples += clip.samples.len();
-                audio_memory(&format!("preload:{path}"), cache_samples);
+                audio_memory(&format!("preload:{path}"), cache_samples,
+                    self.player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))));
                 Ok(clip)
             });
             match result {
@@ -1903,7 +1972,7 @@ impl Audio {
                 cache_samples * std::mem::size_of::<f32>()
             );
         }
-        named.finish(name, &mut cache, &mut cache_samples, |path| {
+        named.finish(name, &self.player_cache, &mut cache, &mut cache_samples, |path| {
             assets.read(path).and_then(decode_clip).ok()
         });
         self.cache_samples = cache_samples;
@@ -2207,7 +2276,7 @@ impl Audio {
                         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
                         proof::decode("runtime", &request.path, &clip.samples);
                         self.world_clips.insert(request.path.clone(), clip);
-                        audio_memory(&format!("runtime:{}", request.path), self.cache_samples);
+                        audio_memory(&format!("runtime:{}", request.path), self.cache_samples, self.player_pcm());
                     }
                     Err(error) => {
                         eprintln!("Requested audio unavailable: {}: {error:#}", request.path);
