@@ -1,5 +1,6 @@
 //! Cached local geometry for opt-in moving brush and patch collision.
 use super::*;
+use std::sync::OnceLock;
 #[derive(Debug)]
 struct Convex {
     source: Vec<Plane>,
@@ -182,23 +183,23 @@ struct EagerCache {
 #[derive(Debug)]
 pub struct Template {
     geometry: std::sync::Arc<Geometry>,
-    eager: std::cell::RefCell<EagerCache>,
-    last_lazy: std::cell::RefCell<Option<([u32; 7], Collider)>>,
+    eager: std::sync::Mutex<EagerCache>,
+    last_lazy: std::sync::Mutex<Option<([u32; 7], Collider)>>,
 }
 #[derive(Debug)]
 pub(super) struct Placed {
     geometry: std::sync::Arc<Geometry>,
     origin: Vec3,
     rotation: Quat,
-    hulls: std::sync::OnceLock<Vec<Hull>>,
-    candidates: std::sync::OnceLock<Candidates>,
+    hulls: ShapeCache<Vec<Hull>>,
+    candidates: ShapeCache<Candidates>,
 }
 /// Immutable transformed vertices and exact prism bounds, with bevel planes
 /// materialized only for intersecting queries. Order is the original primitive order.
 #[derive(Debug)]
 struct Candidates {
     brushes: Vec<Hull>,
-    triangles: Vec<([Vec3; 3], Bounds, std::sync::OnceLock<Option<Hull>>)>,
+    triangles: Vec<([Vec3; 3], Bounds, ShapeCache<Option<Hull>>)>,
 }
 fn prism_bounds([a, b, c]: [Vec3; 3]) -> Option<Bounds> {
     let cross = (b - a).cross(c - a);
@@ -209,25 +210,177 @@ fn prism_bounds([a, b, c]: [Vec3; 3]) -> Option<Bounds> {
     Some(Bounds { min: points.into_iter().reduce(Vec3::min).unwrap(),
         max: points.into_iter().reduce(Vec3::max).unwrap() })
 }
+// The serial cache keeps the original in-place OnceLock. An overlap
+// placement can be read by the next step while audio still holds its view.
+// Publish only completed values so a descheduled builder holds no claim.
+#[derive(Debug)]
+enum ShapeCache<T> {
+    Serial(OnceLock<T>),
+    #[cfg(feature = "vita_renderer")]
+    Overlap(once_cell::race::OnceBox<T>),
+}
+
+impl<T> ShapeCache<T> {
+    fn for_placement() -> Self {
+        #[cfg(feature = "vita_renderer")]
+        if crate::render::vita_renderer::config().sim_overlap {
+            return Self::Overlap(once_cell::race::OnceBox::new());
+        }
+        Self::Serial(OnceLock::new())
+    }
+
+    fn empty_like<U>(&self) -> ShapeCache<U> {
+        match self {
+            Self::Serial(_) => ShapeCache::Serial(OnceLock::new()),
+            #[cfg(feature = "vita_renderer")]
+            Self::Overlap(_) => ShapeCache::Overlap(once_cell::race::OnceBox::new()),
+        }
+    }
+
+    #[inline]
+    fn get(&self) -> Option<&T> {
+        match self {
+            Self::Serial(cell) => cell.get(),
+            #[cfg(feature = "vita_renderer")]
+            Self::Overlap(cell) => cell.get(),
+        }
+    }
+
+    #[inline]
+    fn get_or_init(&self, init: impl FnOnce() -> T, published: impl FnOnce()) -> &T {
+        match self {
+            Self::Serial(cell) => cell.get_or_init(|| {
+                let value = init();
+                published();
+                value
+            }),
+            #[cfg(feature = "vita_renderer")]
+            Self::Overlap(cell) => {
+                if let Some(value) = cell.get() { return value; }
+                if cell.set(Box::new(init())).is_ok() { published(); }
+                cell.get().expect("lazy shape publication missing")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LazyShape { Hulls, Candidates, Bevel }
+
+#[inline]
+fn lazy_shape<T>(cache: &ShapeCache<T>, kind: LazyShape, init: impl FnOnce() -> T, published: impl FnOnce()) -> &T {
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    if lazy_profile::enabled() {
+        if let Some(value) = cache.get() { return value; }
+        let start = std::time::Instant::now();
+        let mut built = false;
+        let value = cache.get_or_init(|| {
+            built = true;
+            init()
+        }, published);
+        lazy_profile::record(kind, built, start.elapsed().as_nanos() as u64);
+        return value;
+    }
+    let _ = kind;
+    cache.get_or_init(init, published)
+}
+
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+pub(crate) mod lazy_profile {
+    use super::LazyShape;
+    use std::sync::{OnceLock, atomic::{AtomicU64, Ordering::Relaxed}};
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum Lane { Owner, Audio, Worker }
+
+    thread_local! {
+        static LANE: std::cell::Cell<Lane> = const { std::cell::Cell::new(Lane::Owner) };
+    }
+
+    // These markers stay on the execution thread, including through unwinding.
+    pub(crate) fn enter(lane: Lane) -> Option<impl Drop> {
+        struct Restore(Lane);
+        impl Drop for Restore {
+            fn drop(&mut self) { LANE.set(self.0); }
+        }
+        enabled().then(|| Restore(LANE.replace(lane)))
+    }
+
+    // Index by shape and by whether this cold caller ran the initializer.
+    // A cold caller may also observe a value published before get_or_init.
+    struct Sample {
+        count: AtomicU64,
+        sum_ns: AtomicU64,
+        max_ns: AtomicU64,
+    }
+
+    impl Sample {
+        const fn new() -> Self {
+            Self { count: AtomicU64::new(0), sum_ns: AtomicU64::new(0), max_ns: AtomicU64::new(0) }
+        }
+    }
+
+    static SAMPLES: [[Sample; 2]; 3] = [const { [const { Sample::new() }; 2] }; 3];
+
+    pub(super) fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("LOOKING_GLASS_SIM_LAZY_PROFILE").is_some())
+    }
+
+    pub(super) fn record(kind: LazyShape, built: bool, ns: u64) {
+        let sample = &SAMPLES[kind as usize][usize::from(built)];
+        sample.count.fetch_add(1, Relaxed);
+        sample.sum_ns.fetch_add(ns, Relaxed);
+        sample.max_ns.fetch_max(ns, Relaxed);
+        if built {
+            let counter = match LANE.get() {
+                Lane::Owner => "lazy_cold_owner_ns",
+                Lane::Audio => "lazy_cold_audio_ns",
+                Lane::Worker => "lazy_cold_worker_ns",
+            };
+            crate::sim_maps::count(counter, ns);
+        }
+    }
+
+    pub(crate) fn report() {
+        if !enabled() { return; }
+        for (kind, [published, build]) in ["hulls", "candidates", "bevel"].into_iter().zip(&SAMPLES) {
+            println!("[lg/sim-lazy] kind={kind} build_attempts={} build_attempt_sum_ns={} build_attempt_max_ns={} found_published={} found_published_sum_ns={} found_published_max_ns={}",
+                build.count.load(Relaxed), build.sum_ns.load(Relaxed), build.max_ns.load(Relaxed),
+                published.count.load(Relaxed), published.sum_ns.load(Relaxed), published.max_ns.load(Relaxed));
+        }
+    }
+}
+
 impl Placed {
+    fn candidates(&self) -> &Candidates {
+        lazy_shape(&self.candidates, LazyShape::Candidates, || self.build_candidates(), || {
+            crate::sim_maps::count("triangle_candidate_placements", 1);
+            crate::sim_maps::count("triangle_candidate_bounds", self.geometry.mesh.as_ref()
+                .map_or(self.geometry.patches.len(), |mesh| mesh.triangles.len()) as u64);
+        })
+    }
+
+    fn build_candidates(&self) -> Candidates {
+        #[cfg(any(target_os = "vita", feature = "sim_maps_probe"))]
+        crate::viewer::sim_audit::sample_stack("build_candidates");
+        let brushes = self.geometry.brushes.iter().map(|s| s.at(self.origin, self.rotation)).collect();
+        let triangles = if let Some(mesh) = &self.geometry.mesh {
+            let points: Vec<_> = mesh.vertices.iter().map(|v| self.origin + self.rotation * *v).collect();
+            mesh.triangles.iter().map(|t| t.map(|i| points[i])).collect::<Vec<_>>()
+        } else {
+            self.geometry.patches.iter().map(|t| t.map(|v| self.origin + self.rotation * v)).collect()
+        };
+        let triangles = triangles.into_iter().filter_map(|t| {
+            prism_bounds(t).map(|b| (t, b, self.candidates.empty_like()))
+        }).collect();
+        Candidates { brushes, triangles }
+    }
+
     pub(super) fn visit_query(&self, query: &SweepBounds, mut visit: impl FnMut(&Hull)) {
         // Other consumers may already have requested the complete collider.
         if let Some(hulls) = self.hulls.get() { for h in hulls { visit(h); } return; }
-        let candidates = self.candidates.get_or_init(|| {
-            crate::sim_maps::count("triangle_candidate_placements", 1);
-            let brushes = self.geometry.brushes.iter().map(|s| s.at(self.origin, self.rotation)).collect();
-            let triangles = if let Some(mesh) = &self.geometry.mesh {
-                let points: Vec<_> = mesh.vertices.iter().map(|v| self.origin + self.rotation * *v).collect();
-                mesh.triangles.iter().map(|t| t.map(|i| points[i])).collect::<Vec<_>>()
-            } else {
-                self.geometry.patches.iter().map(|t| t.map(|v| self.origin + self.rotation * v)).collect()
-            };
-            let triangles = triangles.into_iter().filter_map(|t| {
-                crate::sim_maps::count("triangle_candidate_bounds", 1);
-                prism_bounds(t).map(|b| (t, b, std::sync::OnceLock::new()))
-            }).collect();
-            Candidates { brushes, triangles }
-        });
+        let candidates = self.candidates();
         for h in &candidates.brushes { visit(h); }
         for (triangle, bounds, hull) in &candidates.triangles {
             // Non-finite data cannot certify a broad-phase rejection.
@@ -235,21 +388,23 @@ impl Placed {
                 crate::sim_maps::count("triangle_candidate_rejections", 1);
                 continue;
             }
-            if let Some(h) = hull.get_or_init(|| triangle_hull(triangle[0], triangle[1], triangle[2])) { visit(h); }
+            if let Some(h) = lazy_shape(hull, LazyShape::Bevel, || triangle_hull(triangle[0], triangle[1], triangle[2]), || {}) { visit(h); }
         }
     }
 
     #[cfg(test)]
     pub(super) fn pending(&self) -> bool { self.hulls.get().is_none() && self.candidates.get().is_none() }
     pub(super) fn hulls(&self) -> &[Hull] {
-        self.hulls
-            .get_or_init(|| {
+        lazy_shape(&self.hulls, LazyShape::Hulls, || {
                 #[cfg(target_os = "vita")]
                 let _profile = crate::frame_profile::span("collider_lazy_build");
+                #[cfg(any(target_os = "vita", feature = "sim_maps_probe"))]
+                crate::viewer::sim_audit::sample_stack("build_hulls");
+                self.geometry.at(self.origin, self.rotation)
+            }, || {
                 #[cfg(target_os = "vita")]
                 add_counter(Counter::LazyHullBuilds, 1);
                 crate::sim_maps::count("lazy_hull_builds", 1);
-                self.geometry.at(self.origin, self.rotation)
             })
     }
 }
@@ -341,7 +496,7 @@ impl Template {
         let mut key = [0; 7];
         key[..3].copy_from_slice(&origin.to_array().map(f32::to_bits));
         key[3..].copy_from_slice(&rotation.to_array().map(f32::to_bits));
-        let mut last = self.last_lazy.borrow_mut();
+        let mut last = self.last_lazy.lock().unwrap();
         if let Some((old, collider)) = &*last {
             if *old == key { return collider.clone(); }
         }
@@ -407,8 +562,8 @@ impl Template {
             .zip(points.iter().copied().reduce(Vec3::max))
             .map(|(min, max)| Bounds { min, max });
         Self {
-            eager: std::cell::RefCell::default(),
-            last_lazy: std::cell::RefCell::default(),
+            eager: std::sync::Mutex::default(),
+            last_lazy: std::sync::Mutex::default(),
             geometry: std::sync::Arc::new(Geometry {
                 mesh: None,
                 brushes,
@@ -425,7 +580,7 @@ impl Template {
     pub fn at_eager(&self, origin: Vec3, rotation: Quat) -> Collider {
         #[cfg(target_os = "vita")]
         let _transform_profile = crate::frame_profile::span("collider_transform");
-        let mut cache = self.eager.borrow_mut();
+        let mut cache = self.eager.lock().unwrap();
         let origin_key = origin.to_array().map(f32::to_bits);
         if cache.rotation == Some(rotation.to_array().map(f32::to_bits)) {
             if let Some((key, collider)) = &cache.last {
@@ -473,6 +628,8 @@ impl Template {
                 max: (max + padding).to_array().map(f32::next_up).into(),
             }
         });
+        let hulls = ShapeCache::for_placement();
+        let candidates = hulls.empty_like();
         Collider {
             hulls: std::sync::Arc::new(Vec::new()),
             bounds,
@@ -480,8 +637,8 @@ impl Template {
                 geometry: self.geometry.clone(),
                 origin,
                 rotation,
-                hulls: std::sync::OnceLock::new(),
-                candidates: std::sync::OnceLock::new(),
+                hulls,
+                candidates,
             })),
         }
     }
@@ -493,6 +650,79 @@ impl Template {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "vita_renderer")]
+    #[test]
+    fn overlap_worker_traces_while_owner_is_building_each_lazy_shape() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        fn while_owner_builds<T: Send + Sync>(
+            cache: &ShapeCache<T>,
+            kind: LazyShape,
+            build: impl FnOnce() -> T + Send,
+            trace: impl FnOnce() -> Trace + Send,
+        ) -> Trace {
+            thread::scope(|threads| {
+                let (started, owner_started) = mpsc::channel();
+                let (release, released) = mpsc::channel();
+                let (done, worker_done) = mpsc::channel();
+                threads.spawn(move || {
+                    let returned = lazy_shape(cache, kind, || {
+                        started.send(()).unwrap();
+                        released.recv().unwrap();
+                        build()
+                    }, || {});
+                    assert!(std::ptr::eq(returned, cache.get().unwrap()));
+                });
+                let timeout = Duration::from_secs(5);
+                owner_started.recv_timeout(timeout).expect("owner did not enter initializer");
+                threads.spawn(move || done.send(trace()).unwrap());
+                let result = worker_done.recv_timeout(timeout);
+                // Release and join the owner even if the worker parked.
+                let winner = cache.get();
+                release.send(()).unwrap();
+                assert!(winner.is_some(), "worker returned before publishing the shape");
+                result.expect("worker waited for the owner's lazy shape initializer")
+            })
+        }
+
+        let triangle = [Vec3::ZERO, vec3(18., 0., 1.), vec3(0., 18., -1.)];
+        let template = Template::triangles(&[triangle, triangle.map(|p| p + Vec3::X * 100.)]);
+        let at = || template.at(Vec3::ZERO, Quat::IDENTITY);
+        let overlap = || crate::render::vita_renderer::with_config(|c| c.sim_overlap = true, at);
+        let start = vec3(3., 3., 10.);
+        let end = vec3(3., 3., -10.);
+        let trace = |collider: &Collider, candidates| {
+            crate::sim_maps::with_r2_switches([candidates, false, false], || {
+                collider.trace(start, end, Vec3::ZERO)
+            })
+        };
+        let expected = trace(&at(), false);
+        assert!(expected.fraction < 1.);
+
+        let full = overlap();
+        let placement = full.lazy.as_ref().unwrap();
+        let actual = while_owner_builds(&placement.hulls, LazyShape::Hulls,
+            || placement.geometry.at(placement.origin, placement.rotation),
+            || trace(&full, false));
+        assert_eq!(sight_log::bits(actual), sight_log::bits(expected));
+
+        let candidates = overlap();
+        let placement = candidates.lazy.as_ref().unwrap();
+        let actual = while_owner_builds(&placement.candidates, LazyShape::Candidates,
+            || placement.build_candidates(), || trace(&candidates, true));
+        assert_eq!(sight_log::bits(actual), sight_log::bits(expected));
+        assert!(placement.candidates().triangles[1].2.get().is_none());
+
+        let bevels = overlap();
+        let placement = bevels.lazy.as_ref().unwrap();
+        let triangles = &placement.candidates().triangles;
+        let ([a, b, c], _, near) = &triangles[0];
+        let actual = while_owner_builds(near, LazyShape::Bevel, || triangle_hull(*a, *b, *c),
+            || trace(&bevels, true));
+        assert_eq!(sight_log::bits(actual), sight_log::bits(expected));
+        assert!(triangles[1].2.get().is_none());
+    }
+
     #[test]
     fn triangle_candidates_preserve_exact_bounds_order_and_sweeps() {
         let mut triangles = (0..32).map(|i| {
@@ -1098,6 +1328,19 @@ mod mesh_tests {
                 .map(f32::to_bits).collect::<Vec<_>>()
         }).collect()
     }
+    #[test]
+    fn template_clones_share_both_placement_caches() {
+        use std::sync::Arc;
+        let template = Arc::new(Template::triangles(&[[Vec3::ZERO, Vec3::X, Vec3::Y]]));
+        let other = Arc::clone(&template);
+        let a = template.at_eager(Vec3::ZERO, Quat::IDENTITY);
+        let b = other.at_eager(Vec3::ZERO, Quat::IDENTITY);
+        assert!(Arc::ptr_eq(&a.hulls, &b.hulls));
+        let a = template.at_reused(Vec3::ZERO, Quat::IDENTITY);
+        let b = other.at_reused(Vec3::ZERO, Quat::IDENTITY);
+        assert!(Arc::ptr_eq(a.lazy.as_ref().unwrap(), b.lazy.as_ref().unwrap()));
+    }
+
     #[test]
     fn indexed_mesh_placements_preserve_world_hull_bits_and_contacts() {
         let t = vec![

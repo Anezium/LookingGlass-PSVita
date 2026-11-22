@@ -102,6 +102,10 @@ impl State {
     pub fn interrupt(&mut self) {
         self.performing = false;
     }
+    /// Render values only; animation blending and its local pose stay in simulation.
+    pub(crate) fn render_state(&self) -> Self {
+        Self { form: self.form, age: self.age, performing: self.performing, ..Self::default() }
+    }
     pub fn skin(&self) -> Option<Form> {
         self.form.filter(|_| self.age >= 2.5)
     }
@@ -130,7 +134,7 @@ impl State {
 }
 
 pub struct Performance {
-    clips: BTreeMap<String, Animation>,
+    clips: std::sync::Arc<BTreeMap<String, Animation>>,
     pub state: State,
 }
 impl Performance {
@@ -155,7 +159,7 @@ impl Performance {
             );
         }
         Ok(Self {
-            clips,
+            clips: std::sync::Arc::new(clips),
             state: State::fresh(),
         })
     }

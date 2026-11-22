@@ -1,8 +1,12 @@
 //! Placed, animated characters with bounded local reactions. No original AI/scripts run.
 use crate::mesh::Mesh;
+use std::sync::Arc;
 mod ambient;
+#[cfg(all(feature="sim_maps_probe", not(target_os="vita")))]
+pub(crate) mod snapshot_check;
 pub(crate) mod profile;
 mod visual_lod;
+mod owner_thread;
 pub(crate) mod attack_fx;
 mod garden;
 pub(crate) fn garden_check(a:&mut Assets)->Result<()> { garden::check(a) }
@@ -351,8 +355,10 @@ fn metadata(text: &str) -> Result<Metadata> {
     }
     Ok(result)
 }
-struct Data {
+struct ModelData {
     visual_radius: f32,
+    mouth_rig: crate::facial::Rig,
+    ambient_art_free: bool,
     card_cut: Option<crate::dismember::Recipe>,
     card_muzzle: Option<(usize, Vec3)>,
     ladybug_timing: Option<crate::ladybug::Timing>,
@@ -382,7 +388,7 @@ const OFF_NORM_TAGS: &[(&str, &[&str], &str)] = &[(
     &["tag_left_hand", "tag_right_hand"],
     "authored hand tags are stored at a reduced length (squared length about 0.60 to 0.75); they skin nothing and are renormalised on load",
 )];
-impl Data {
+impl ModelData {
     fn load(assets: &mut Assets, name: &str, extra: &[String]) -> Result<Self> {
         let path = format!("models/{name}.tik");
         let def = Definition::load(assets, &path)?;
@@ -611,6 +617,10 @@ impl Data {
             .fold(0., f32::max) + 128.;
         Ok(Self {
             visual_radius,
+            // CPU-only checks do not animate a face. The paired model loader
+            // installs the authored rig before sharing this value.
+            mouth_rig: crate::facial::Rig::new(&skeleton, &Default::default()),
+            ambient_art_free: false,
             card_muzzle,
             card_cut: if name == "cardguard_spade" {
                 Some(crate::dismember::card::recipe(assets)?)
@@ -721,7 +731,7 @@ fn family(def: &Definition, base: &str) -> Vec<String> {
         .map(|(name, _)| name.clone())
         .collect()
 }
-struct Model {
+struct ModelArt {
     glow_subset: bool,
     skin_identity: crate::character::skinning::identity::ActorId,
     // Keep the inherited Puppet visibility/lighting policy. The optional lever
@@ -730,7 +740,6 @@ struct Model {
     afterimage_normals: bool,
     live_skin_current: bool,
     current_skin: Option<crate::character::skinning::overlap::OwnedSkin>,
-    bone_scales: Vec<(usize, f32)>,
     frozen: Option<std::rc::Rc<crate::frozen::Art>>,
     electric: Option<std::rc::Rc<crate::electric::Art>>,
     burst: Option<crate::dismember::burst::Art>,
@@ -740,47 +749,220 @@ struct Model {
     magma_skins: Option<magma_art::Skins>,
     own_effect: Option<crate::particles::Attached>,
     _material_layers: Vec<std::rc::Rc<crate::render_fx::Surface>>,
-    face: crate::facial::Face,
-    data: Data,
+    blink: crate::facial::BlinkArt,
+    data: Arc<ModelData>,
     meshes: Vec<Option<Mesh>>,
     attachments: Vec<(usize, f32, Prop)>,
     electric_attachments: Vec<usize>,
     electric_props: Vec<String>,
 }
+#[derive(Clone, Default)]
+struct PoseOverrides {
+    hidden: BTreeMap<String, bool>,
+    bone_scales: Vec<(usize, f32)>,
+    mouth_angle: Option<f32>,
+}
+impl PoseOverrides {
+    fn set_mouth_angle(&mut self, degrees: f32) {
+        if degrees.is_finite() && (0. ..=90.).contains(&degrees) {
+            self.mouth_angle = Some(degrees.to_radians());
+        }
+    }
+}
+/// Everything a script Puppet's pose is computed from. `Puppet` and `PuppetRig` both sample
+/// through this view, so the simulation and the art share one arithmetic path.
+struct PoseSource<'a> {
+    data: &'a ModelData,
+    attachments: bool,
+    mouth: f32,
+    handoff: bool,
+    watch: &'a crate::facial::Watch,
+    overrides: &'a PoseOverrides,
+}
+impl PoseSource<'_> {
+    fn extract_draw(&self, clip: &str, time: f32, looping: bool,
+        transform: Transform, scale: f32) -> PuppetInput {
+        let d = self.data;
+        let animation = d.clips.get(clip).unwrap_or(&d.clips[&d.idle]);
+        let mut local = animation.sample(time, looping);
+        self.watch.apply(&d.skeleton, &mut local);
+        let handoff = self.handoff.then(|| crate::cinematic::ActorPose {
+            rendered: None, local: local.clone(), transform, scale });
+        let mut pose = d.mouth_rig.pose(&d.skeleton, &local, self.mouth, self.overrides.mouth_angle);
+        let scales = if self.overrides.bone_scales.is_empty() { Vec::new() } else {
+            crate::skeletal::scale_pose(&d.skeleton, &mut pose, &self.overrides.bone_scales)
+        };
+        PuppetInput { pose, scales, handoff,
+            visual: d.events.visual(clip, time, animation.duration(), animation.frame_time, looping),
+            time, alive: !clip.starts_with("death"), transform, scale,
+            attachments: self.attachments, frozen: clip == "death_frozen", hidden: self.overrides.hidden.clone() }
+    }
+    fn sample_tag(
+        &self,
+        name: &str,
+        clip: &str,
+        time: f32,
+        transform: Transform,
+        scale: f32,
+        looping: bool,
+    ) -> Option<Transform> {
+        let d = self.data;
+        let tag = d.skeleton.bones.iter().position(|b| b.name == name)?;
+        let mut local = d.clips.get(clip)?.sample(time, looping);
+        self.watch.apply(&d.skeleton, &mut local);
+        let mut pose = d.skeleton.global_pose(&local);
+        crate::skeletal::scale_pose(&d.skeleton, &mut pose, &self.overrides.bone_scales);
+        Some(Transform {
+            translation: transform.point(pose[tag].translation * d.def.scale * scale),
+            rotation: transform.rotation * pose[tag].rotation,
+        })
+    }
+}
+/// The CPU side of a script Puppet: the shared model data and the per-instance pose state.
+/// The simulation samples poses and tags from it without the Puppet's art.
+#[derive(Clone)]
+pub(crate) struct PuppetRig {
+    data: Arc<ModelData>,
+    attachments: bool,
+    mouth: f32,
+    handoff: bool,
+    watch: crate::facial::Watch,
+    overrides: PoseOverrides,
+}
+impl PuppetRig {
+    fn source(&self) -> PoseSource<'_> {
+        PoseSource { data: &self.data, attachments: self.attachments, mouth: self.mouth,
+            handoff: self.handoff, watch: &self.watch, overrides: &self.overrides }
+    }
+    pub(crate) fn snapshot_bones(&self) -> usize { self.data.skeleton.bones.len() }
+    pub(crate) fn extract_draw(&self, clip: &str, time: f32, looping: bool,
+        transform: Transform, scale: f32) -> PuppetInput {
+        self.source().extract_draw(clip, time, looping, transform, scale)
+    }
+    pub(crate) fn tag(&self, name: &str, clip: &str, time: f32, transform: Transform, scale: f32)
+        -> Option<Transform> {
+        self.source().sample_tag(name, clip, time, transform, scale, false)
+    }
+    pub(crate) fn looping_tag(&self, name: &str, clip: &str, time: f32, transform: Transform, scale: f32)
+        -> Option<Transform> {
+        self.source().sample_tag(name, clip, time, transform, scale, true)
+    }
+    pub(crate) fn mouth(&mut self, amount: f32) { self.mouth = amount; }
+    pub(crate) fn mouth_angle(&mut self, degrees: f32) { self.overrides.set_mouth_angle(degrees); }
+}
+
 /// A script-owned actor using the same mesh, attachment and animation path as placed NPCs.
-pub struct Puppet(
-    Model,
-    bool,
-    f32,
-    crate::character::SkinMaterial,
-    Option<crate::cinematic::ActorPose>,
-    crate::facial::Watch,
-);
+pub struct Puppet {
+    model: ModelArt,
+    attachments: bool,
+    mouth: f32,
+    material: crate::character::SkinMaterial,
+    handoff: Option<crate::cinematic::ActorPose>,
+    watch: crate::facial::Watch,
+    overrides: PoseOverrides,
+}
+/// Complete input for the ordinary cinematic Puppet path. Resource identity is
+/// supplied by the enclosing visit registry, never by a pointer in this record.
+pub(crate) struct PuppetInput {
+    pose: Vec<Transform>,
+    scales: Vec<f32>,
+    handoff: Option<crate::cinematic::ActorPose>,
+    visual: crate::animation_events::VisualState,
+    time: f32,
+    alive: bool,
+    transform: Transform,
+    scale: f32,
+    attachments: bool,
+    frozen: bool,
+    hidden: BTreeMap<String, bool>,
+}
+impl PuppetInput {
+    pub(crate) fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.pose.len()*std::mem::size_of::<Transform>()
+            + self.scales.len()*std::mem::size_of::<f32>() + self.visual.payload_bytes()
+            + self.hidden.keys().map(|p| std::mem::size_of::<(String, bool)>() + p.len()).sum::<usize>()
+            + self.handoff.as_ref().map_or(0, |p| p.local.len()*std::mem::size_of::<Transform>())
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn assert_same(&self, other: &Self) {
+        let serial = |pose: &[Transform]| serde_json::to_value(pose).unwrap();
+        assert_eq!(serial(&self.pose), serial(&other.pose));
+        assert_eq!(self.scales, other.scales);
+        assert!(self.handoff.is_none() && other.handoff.is_none());
+        assert_eq!(self.visual, other.visual);
+        assert_eq!(self.time, other.time);
+        assert_eq!(self.alive, other.alive);
+        assert_eq!(serial(&[self.transform]), serial(&[other.transform]));
+        assert_eq!(self.scale, other.scale);
+        assert_eq!(self.attachments, other.attachments);
+        assert_eq!(self.frozen, other.frozen);
+        assert_eq!(self.hidden, other.hidden);
+    }
+    pub(crate) fn bones(&self) -> usize { self.pose.len() }
+    pub(crate) fn with_attachments(mut self, value: bool) -> Self {
+        self.attachments = value;
+        self
+    }
+}
 impl Puppet {
+    fn source(&self) -> PoseSource<'_> {
+        PoseSource { data: &self.model.data, attachments: self.attachments, mouth: self.mouth,
+            handoff: self.handoff.is_some(), watch: &self.watch, overrides: &self.overrides }
+    }
+    /// A copy of the CPU side as it stands now, for a simulation-side capture.
+    pub(crate) fn rig(&self) -> PuppetRig {
+        PuppetRig { data: self.model.data.clone(), attachments: self.attachments, mouth: self.mouth,
+            handoff: self.handoff.is_some(), watch: self.watch.clone(), overrides: self.overrides.clone() }
+    }
+    pub(crate) fn snapshot_bones(&self) -> usize { self.model.data.skeleton.bones.len() }
+    pub(crate) fn extract_draw(&self, clip: &str, time: f32, looping: bool,
+        transform: Transform, scale: f32) -> PuppetInput {
+        self.source().extract_draw(clip, time, looping, transform, scale)
+    }
+    pub(crate) fn valid_input(&self, input: &PuppetInput) -> bool {
+        input.pose.len() == self.model.data.skeleton.bones.len()
+            && (input.scales.is_empty() || input.scales.len() == input.pose.len())
+            && input.handoff.as_ref().is_none_or(|p| p.local.len() == input.pose.len())
+    }
+    pub(crate) fn draw_input(&mut self, input: &PuppetInput, fullbright: bool) {
+        self.draw_input_dissolving(input, fullbright, 0.);
+    }
+    pub(crate) fn draw_input_dissolving(&mut self, input: &PuppetInput, fullbright: bool, dissolve: f32) {
+        if let (Some(dst), Some(src)) = (&mut self.handoff, &input.handoff) {
+            dst.clone_from(src); dst.rendered = crate::render_snapshot::handoff_render_stamp();
+        }
+        let _consumer = crate::character::skinning::CullGuard::publication_reason(
+            input.frozen, crate::phase_census::FROZEN);
+        let material = self.material.clone();
+        material.draw_dissolving(dissolve, || self.model.draw_resolved_pose(
+            &input.pose, &input.scales, 0., input.time, input.alive, input.transform,
+            input.scale, fullbright, input.attachments, &input.visual, None, &input.hidden));
+        if input.frozen { self.model.draw_frozen(); }
+    }
     /// Afterimages inherit the last normal draw's normals, including across frames.
     /// Declare this at construction, before any normal draw can enter a worker bank.
     pub(crate) fn with_afterimages(mut self) -> Self {
-        self.0.afterimage_normals = true;
+        self.model.afterimage_normals = true;
         self
     }
     /// Declare a later electric draw before preparing its body. The guard also
     /// covers attachments; no mesh references or shared-model state are retained.
     pub(crate) fn electric_consumer(&self, remaining:f32)->crate::character::skinning::CullGuard {
         crate::character::skinning::CullGuard::publication_reason(
-            remaining>0. && self.0.electric.is_some(),crate::phase_census::ELECTRIC)
+            remaining>0. && self.model.electric.is_some(),crate::phase_census::ELECTRIC)
     }
     pub fn draw_electric(&mut self, remaining: f32) {
-        self.0.draw_electric(remaining);
-        self.3.bind();
+        self.model.draw_electric(remaining);
+        self.material.bind();
     }
     pub fn atmosphere(&self, atmosphere: &Atmosphere, camera: Vec3) {
-        self.3.atmosphere(atmosphere, camera);
+        self.material.atmosphere(atmosphere, camera);
     }
     pub fn handoff_pose(&self) -> Option<&crate::cinematic::ActorPose> {
-        self.4.as_ref().filter(|p| !p.local.is_empty())
+        self.handoff.as_ref().filter(|p| !p.local.is_empty())
     }
     pub fn idle_clip(&self) -> &str {
-        &self.0.data.idle
+        &self.model.data.idle
     }
     pub fn load(
         assets: &mut Assets,
@@ -788,19 +970,20 @@ impl Puppet {
         clips: &[&str],
         specs: &BTreeMap<String, texture::MaterialSpec>,
     ) -> Result<Self> {
-        let mut model = Model::load(
+        let mut model = ModelArt::load(
             assets,
             name,
             &clips.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             specs,
         )?;
         model.late_skin_overlays = true;
-        Ok(Self(
+        Ok(Self {
             model,
-            true,
-            0.,
-            crate::character::skin_material()?,
-            (name == "alice").then(|| crate::cinematic::ActorPose {
+            attachments: true,
+            mouth: 0.,
+            material: crate::character::skin_material()?,
+            handoff: (name == "alice").then(|| crate::cinematic::ActorPose {
+                rendered: None,
                 local: Vec::new(),
                 transform: Transform {
                     translation: Vec3::ZERO,
@@ -808,8 +991,9 @@ impl Puppet {
                 },
                 scale: 1.,
             }),
-            Default::default(),
-        ))
+            watch: Default::default(),
+            overrides: PoseOverrides::default(),
+        })
     }
     pub fn tag(
         &self,
@@ -840,16 +1024,7 @@ impl Puppet {
         scale: f32,
         looping: bool,
     ) -> Option<Transform> {
-        let d = &self.0.data;
-        let tag = d.skeleton.bones.iter().position(|b| b.name == name)?;
-        let mut local = d.clips.get(clip)?.sample(time, looping);
-        self.5.apply(&d.skeleton, &mut local);
-        let mut pose = d.skeleton.global_pose(&local);
-        crate::skeletal::scale_pose(&d.skeleton, &mut pose, &self.0.bone_scales);
-        Some(Transform {
-            translation: transform.point(pose[tag].translation * d.def.scale * scale),
-            rotation: transform.rotation * pose[tag].rotation,
-        })
+        self.source().sample_tag(name, clip, time, transform, scale, looping)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn draw_filtered(
@@ -863,29 +1038,29 @@ impl Puppet {
         hidden: &[&str],
     ) {
         let mut removed = Vec::new();
-        for (i, surface) in self.0.data.skeleton.surfaces.iter().enumerate() {
+        for (i, surface) in self.model.data.skeleton.surfaces.iter().enumerate() {
             if hidden.contains(&surface.name.as_str()) {
-                removed.push((i, self.0.meshes[i].take()));
+                removed.push((i, self.model.meshes[i].take()));
             }
         }
         self.draw(clip, time, looping, transform, scale, fullbright);
         for (i, mesh) in removed {
-            self.0.meshes[i] = mesh;
+            self.model.meshes[i] = mesh;
         }
     }
     pub fn mouth(&mut self, amount: f32) {
-        self.2 = amount;
+        self.mouth = amount;
     }
     /// Scene-local authored jaw range; caller resets it between scenes.
     pub fn mouth_angle(&mut self, degrees: f32) {
-        self.0.face.mouth_angle(degrees);
+        self.overrides.set_mouth_angle(degrees);
     }
     pub fn watch(&mut self, watch: crate::facial::Watch) {
-        self.5 = watch;
+        self.watch = watch;
     }
     pub(crate) fn bone_scales(&mut self, scales: &[(&str, f32)]) {
-        self.0.bone_scales = scales.iter().filter_map(|(name, scale)| {
-            self.0.data.skeleton.bones.iter().position(|b| b.name.eq_ignore_ascii_case(name)).map(|i| (i, scale.clamp(0., 4.)))
+        self.overrides.bone_scales = scales.iter().filter_map(|(name, scale)| {
+            self.model.data.skeleton.bones.iter().position(|b| b.name.eq_ignore_ascii_case(name)).map(|i| (i, scale.clamp(0., 4.)))
         }).collect();
     }
     /// A translucent skeletal silhouette, used by the Duchess's phase trail.
@@ -898,18 +1073,18 @@ impl Puppet {
     ) {
         if crate::character::skinning::overlap::gather_only() { return; }
         #[cfg(any(debug_assertions, test))]
-        assert_afterimage_declared(self.0.afterimage_normals);
+        assert_afterimage_declared(self.model.afterimage_normals);
         #[cfg(not(any(debug_assertions, test)))]
-        if !self.0.afterimage_normals {
+        if !self.model.afterimage_normals {
             eprintln!("[lg/skin] afterimage consumer must be declared at construction; serial fallback supplies the live mesh");
         }
         let (pose, scale) = {
-            let model = &self.0;
+            let model = &self.model;
             let Some(animation) = model.data.clips.get(clip) else { return; };
             (model.data.skeleton.global_pose(&animation.sample(time, true)), model.data.def.scale)
         };
-        if !self.0.live_skin_current {
-            self.0.current_skin = Some(crate::character::skinning::overlap::OwnedSkin {
+        if !self.model.live_skin_current {
+            self.model.current_skin = Some(crate::character::skinning::overlap::OwnedSkin {
                 pose: pose.clone(),
                 scales: Vec::new(),
                 transform,
@@ -918,9 +1093,9 @@ impl Puppet {
                 alpha: 1.,
             });
         }
-        self.0.require_live_skin();
-        let d = &self.0.data;
-        for (surface, mesh) in d.skeleton.surfaces.iter().zip(&mut self.0.meshes) {
+        self.model.require_live_skin();
+        let d = &self.model.data;
+        for (surface, mesh) in d.skeleton.surfaces.iter().zip(&mut self.model.meshes) {
             if surface.name.starts_with("cap_") {
                 continue;
             }
@@ -934,28 +1109,26 @@ impl Puppet {
         gl_use_default_material();
     }
     pub fn show_attachments(&mut self, visible: bool) {
-        self.1 = visible;
+        self.attachments = visible;
     }
     /// Persist script-owned surface state across animation changes.
     pub(crate) fn surface_visible(&mut self, name: &str, visible: bool) {
-        let name = name.to_lowercase();
-        if visible { self.0.data.meta.hidden.remove(&name); }
-        else { self.0.data.meta.hidden.insert(name); }
+        self.overrides.hidden.insert(name.to_lowercase(), !visible);
     }
     pub(crate) fn reset_effects(&mut self) {
-        if let Some(effect) = &self.0.own_effect {
-            self.0.own_effect = Some(effect.fork());
+        if let Some(effect) = &self.model.own_effect {
+            self.model.own_effect = Some(effect.fork());
         }
-        for effect in self.0.effects.values_mut() {
+        for effect in self.model.effects.values_mut() {
             *effect = effect.fork();
         }
     }
     pub(crate) fn tune_effects(&mut self, size: f32, opacity: f32) {
         for effect in self
-            .0
+            .model
             .own_effect
             .iter_mut()
-            .chain(self.0.effects.values_mut())
+            .chain(self.model.effects.values_mut())
         {
             effect.resize(size);
             effect.attenuate(opacity);
@@ -983,14 +1156,15 @@ impl Puppet {
         fullbright: bool,
         dissolve: f32,
     ) {
-        let d = &self.0.data;
+        let d = &self.model.data;
         let animation = d.clips.get(clip).unwrap_or(&d.clips[&d.idle]);
         let mut local = animation.sample(time, looping);
-        self.5.apply(&d.skeleton, &mut local);
-        if let Some(pose) = &mut self.4 {
+        self.watch.apply(&d.skeleton, &mut local);
+        if let Some(pose) = &mut self.handoff {
             pose.local.clone_from(&local);
             pose.transform = transform;
             pose.scale = scale;
+            pose.rendered = crate::render_snapshot::handoff_render_stamp();
         }
         let visual = d.events.visual(
             clip,
@@ -1000,23 +1174,24 @@ impl Puppet {
             looping,
         );
         let _consumer = crate::character::skinning::CullGuard::publication_reason(clip == "death_frozen",crate::phase_census::FROZEN);
-        let material = self.3.clone();
+        let material = self.material.clone();
         material.draw_dissolving(dissolve, || {
-            self.0.draw_pose(
+            self.model.draw_pose_with_overrides(
                 &local,
-                self.2,
+                self.mouth,
                 time,
                 !clip.starts_with("death"),
                 transform,
                 scale,
                 fullbright,
-                self.1,
+                self.attachments,
                 &visual,
                 None,
+                &self.overrides,
             )
         });
         if clip == "death_frozen" {
-            self.0.draw_frozen();
+            self.model.draw_frozen();
         }
     }
     pub fn draw_performance(
@@ -1027,12 +1202,13 @@ impl Puppet {
         scale: f32,
         fullbright: bool,
     ) {
-        let d = &self.0.data;
+        let d = &self.model.data;
         let (local, clip, at, looping) = d.performance(&d.idle, speaking, false, time);
-        if let Some(pose) = &mut self.4 {
+        if let Some(pose) = &mut self.handoff {
             pose.local.clone_from(&local);
             pose.transform = transform;
             pose.scale = scale;
+            pose.rendered = crate::render_snapshot::handoff_render_stamp();
         }
         let animation = &d.clips[&clip];
         let visual = d.events.visual(
@@ -1042,9 +1218,9 @@ impl Puppet {
             animation.frame_time,
             looping,
         );
-        self.3.bind();
-        self.0.draw_pose(
-            &local, self.2, time, true, transform, scale, fullbright, self.1, &visual, None,
+        self.material.bind();
+        self.model.draw_pose_with_overrides(
+            &local, self.mouth, time, true, transform, scale, fullbright, self.attachments, &visual, None, &self.overrides,
         );
     }
     pub fn draw_guard(
@@ -1054,9 +1230,9 @@ impl Puppet {
         camera: Vec3,
         atmosphere: &Atmosphere,
     ) {
-        self.3.atmosphere(atmosphere, camera);
-        self.0
-            .draw_guard(guard, fullbright, camera, atmosphere, &self.3);
+        self.material.atmosphere(atmosphere, camera);
+        self.model
+            .draw_guard(guard, fullbright, camera, atmosphere, &self.material, &self.overrides);
     }
     #[allow(clippy::too_many_arguments)]
     pub fn draw_effects(
@@ -1069,9 +1245,9 @@ impl Puppet {
         camera: Vec3,
         atmosphere: &Atmosphere,
     ) {
-        self.0
-            .draw_effects(clip, time, looping, transform, scale, camera, atmosphere);
-        self.3.bind();
+        self.model
+            .draw_effects_with_scales(clip, time, looping, transform, scale, camera, atmosphere, &self.overrides.bone_scales);
+        self.material.bind();
     }
 }
 pub fn placed_guards(map: &Bsp, name: &str) -> Vec<Guard> {
@@ -1082,29 +1258,29 @@ pub fn placed_guards(map: &Bsp, name: &str) -> Vec<Guard> {
         .collect()
 }
 /// Headless rig access for scene-owned Heart/Spade encounter pools.
-pub struct CardRig(Data);
+pub struct CardRig(ModelData);
 impl CardRig {
-    pub fn load(assets: &mut Assets, kind: crate::cards::Kind) -> Result<Self> { Ok(Self(Data::load(assets, kind.model(), &kind.clips().iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())?)) }
+    pub fn load(assets: &mut Assets, kind: crate::cards::Kind) -> Result<Self> { Ok(Self(ModelData::load(assets, kind.model(), &kind.clips().iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())?)) }
     pub fn step(&self, guard: &mut crate::cards::Guard, world: &World, eye: Vec3, out: &mut combat::Feedback) { guard.step(world, eye, &self.0, out); }
 }
 impl Puppet {
     /// Draw a supplied death animation with only one side of its authored surface split.
     pub fn draw_split(&mut self, clip: &str, time: f32, looping: bool, at: Transform, pattern: &str, detached: bool, bright: bool) {
-        let data=&self.0.data;let animation=&data.clips[clip];
+        let data=&self.model.data;let animation=&data.clips[clip];
         let local=animation.sample(time,looping);
         let visual=data.events.visual(clip,time,animation.duration(),animation.frame_time,looping);
-        self.3.bind();self.0.draw_pose(&local,0.,time,looping,at,1.,bright,false,&visual,Some((pattern,"",detached)));
+        self.material.bind();self.model.draw_pose_with_overrides(&local,0.,time,looping,at,1.,bright,false,&visual,Some((pattern,"",detached)),&self.overrides);
     }
     pub fn draw_card(&mut self, guard: &crate::cards::Guard, bright: bool, camera: Vec3, atmosphere: &Atmosphere) {
-        self.3.atmosphere(atmosphere, camera); self.0.draw_card(guard, bright, &self.3);
+        self.material.atmosphere(atmosphere, camera); self.model.draw_card(guard, bright, &self.material, &self.overrides);
     }
 }
 pub fn guard_timing(assets: &mut Assets) -> Result<Timing> {
-    Data::load(assets, "cardguard_club", &[])?
+    ModelData::load(assets, "cardguard_club", &[])?
         .combat
         .context("Missing club guard clips")
 }
-impl Model {
+impl ModelArt {
     fn draw_electric(&mut self, remaining: f32) {
         let _census=crate::phase_census::span(crate::phase_census::Region::ActorConsumers);
         let _leaf=crate::phase_census::span(crate::phase_census::Region::ActorNpcOverlays);
@@ -1194,6 +1370,24 @@ impl Model {
         visual: &crate::animation_events::VisualState,
         piece: Option<(&str, &str, bool)>,
     ) {
+        self.draw_pose_with_overrides(local, mouth, time, alive, transform, scale,
+            fullbright, attachments, visual, piece, &PoseOverrides::default());
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pose_with_overrides(
+        &mut self,
+        local: &[Transform],
+        mouth: f32,
+        time: f32,
+        alive: bool,
+        transform: Transform,
+        scale: f32,
+        fullbright: bool,
+        attachments: bool,
+        visual: &crate::animation_events::VisualState,
+        piece: Option<(&str, &str, bool)>,
+        overrides: &PoseOverrides,
+    ) {
         let _identity = self.skin_identity.scope_unless_set();
         let _skin_kind = crate::character::skinning::timing::kind(&self.data.def.model);
         #[cfg(feature="vita_renderer")]
@@ -1209,27 +1403,60 @@ impl Model {
             self.skin_identity, &self.data.def.path, &self.data.def.model,
             self.data.skeleton.bones.len(), &self.data.meta.attachments, transform, scale,
             self.late_skin_overlays, self.afterimage_normals);
-        let d = &self.data;
+        let d = self.data.as_ref();
         let prepared = crate::character::skinning::prepared::pose(
-            (&d.skeleton as *const Skeleton as usize, &self.face as *const _ as usize),
-            local, mouth, &self.bone_scales, || {
-                let mut pose = self.face.pose(&d.skeleton, local, mouth);
-                let scales = if self.bone_scales.is_empty() { Vec::new() }
+            (&d.skeleton as *const Skeleton as usize, &self.blink as *const _ as usize),
+            local, mouth, &overrides.bone_scales, || {
+                let mut pose = d.mouth_rig.pose(&d.skeleton, local, mouth, overrides.mouth_angle);
+                let scales = if overrides.bone_scales.is_empty() { Vec::new() }
                     else { let _census=crate::phase_census::span(crate::phase_census::Region::ActorScalesPalette);
-                        crate::skeletal::scale_pose(&d.skeleton, &mut pose, &self.bone_scales) };
+                        crate::skeletal::scale_pose(&d.skeleton, &mut pose, &overrides.bone_scales) };
                 (pose, scales)
             },
         );
-        let pose = &prepared.pose;
-        let scales = &prepared.scales;
-        self.face.blink(&mut self.meshes, time, alive);
+        self.publish_resolved_pose(&prepared.pose, &prepared.scales, time, alive,
+            transform, scale, fullbright, attachments, visual, piece, &overrides.hidden);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_resolved_pose(
+        &mut self, pose: &[Transform], scales: &[f32], _mouth: f32,
+        time: f32, alive: bool, transform: Transform, scale: f32,
+        fullbright: bool, attachments: bool, visual: &crate::animation_events::VisualState,
+        piece: Option<(&str, &str, bool)>, hidden_overrides: &BTreeMap<String, bool>,
+    ) {
+        let _identity = self.skin_identity.scope_unless_set();
+        self.visible.fill(false);
+        self.electric_attachments.clear();
+        self.electric_props.clear();
+        if scale <= 0. {
+            return;
+        }
+        #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+        let _actor_timing=crate::character::skinning::census::actor(
+            self.skin_identity, &self.data.def.path, &self.data.def.model,
+            self.data.skeleton.bones.len(), &self.data.meta.attachments, transform, scale,
+            self.late_skin_overlays, self.afterimage_normals);
+        self.publish_resolved_pose(pose, scales, time, alive, transform, scale,
+            fullbright, attachments, visual, piece, hidden_overrides);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn publish_resolved_pose(
+        &mut self, pose: &[Transform], scales: &[f32], time: f32, alive: bool,
+        transform: Transform, scale: f32, fullbright: bool, attachments: bool,
+        visual: &crate::animation_events::VisualState, piece: Option<(&str, &str, bool)>, hidden_overrides: &BTreeMap<String, bool>,
+    ) {
+        let d = self.data.as_ref();
+        self.blink.apply(&mut self.meshes, time, alive);
         let mut removed = Vec::new();
         for (i, surface) in d.skeleton.surfaces.iter().enumerate() {
             let mut hidden = d
                 .meta
                 .hidden
                 .iter()
-                .any(|p| crate::animation_events::matches(p, &surface.name));
+                .any(|p| hidden_overrides.get(p) != Some(&false)
+                    && crate::animation_events::matches(p, &surface.name))
+                || hidden_overrides.iter().any(|(p, hidden)| *hidden
+                    && crate::animation_events::matches(p, &surface.name));
             for (pattern, value) in &visual.surfaces {
                 if crate::animation_events::matches(pattern, &surface.name) {
                     hidden = *value;
@@ -1264,7 +1491,7 @@ impl Model {
             || crate::character::skinning::mutable_required();
         let skin_scale = d.def.scale * scale;
         self.remember_skin(pose, scales, transform, skin_scale, fullbright, 1.);
-        let d = &self.data;
+        let d = self.data.as_ref();
         let skin_visible = crate::character::draw_skin_scaled(
             &d.skeleton,
             &mut self.meshes,
@@ -1281,7 +1508,7 @@ impl Model {
         for (visible, mesh) in self.visible.iter_mut().zip(&self.meshes) {
             *visible = skin_visible && mesh.is_some();
         }
-        // Model instances are shared by many actors. Always restore every mesh.
+        // ModelArt instances are shared by many actors. Always restore every mesh.
         for (i, mesh) in removed {
             self.meshes[i] = mesh;
         }
@@ -1330,6 +1557,7 @@ impl Model {
         camera: Vec3,
         atmosphere: &Atmosphere,
         material: &crate::character::SkinMaterial,
+        overrides: &PoseOverrides,
     ) {
         let _consumer = crate::character::skinning::CullGuard::publication_reason(g.frozen,crate::phase_census::FROZEN);
         let _skin_guard = crate::character::skinning::CullGuard::reason(g.electric > 0.,crate::phase_census::ELECTRIC);
@@ -1341,7 +1569,7 @@ impl Model {
             material.bind();
             return;
         }
-        let d = &self.data;
+        let d = self.data.as_ref();
         let clip = &d.clips[g.clip()];
         let visual = d.events.visual(
             g.clip(),
@@ -1386,7 +1614,7 @@ impl Model {
             g.scale
         };
         material.bind();
-        self.draw_pose(
+        self.draw_pose_with_overrides(
             &local,
             0.,
             g.time,
@@ -1400,6 +1628,7 @@ impl Model {
             true,
             &visual,
             piece,
+            overrides,
         );
         if g.frozen {
             self.draw_frozen();
@@ -1422,7 +1651,7 @@ impl Model {
         {
             let local = self.data.clips[animation].sample(g.dismember.age, false);
             material.draw_dissolving(g.dismember.fade(), || {
-                self.draw_pose(
+                self.draw_pose_with_overrides(
                     &local,
                     0.,
                     g.dismember.age,
@@ -1433,11 +1662,12 @@ impl Model {
                     false,
                     &Default::default(),
                     Some((pattern, cap, true)),
+                    overrides,
                 )
             });
         }
         if g.cut && g.dismember.age < crate::dismember::LIFE {
-            self.draw_effects(
+            self.draw_effects_with_scales(
                 g.clip(),
                 g.time,
                 false,
@@ -1448,6 +1678,7 @@ impl Model {
                 scale,
                 camera,
                 atmosphere,
+                &overrides.bone_scales,
             );
         }
         material.bind();
@@ -1463,8 +1694,22 @@ impl Model {
         camera: Vec3,
         atmosphere: &Atmosphere,
     ) {
+        self.draw_effects_with_scales(clip, time, looping, transform, scale, camera, atmosphere, &[]);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_effects_with_scales(
+        &mut self,
+        clip: &str,
+        time: f32,
+        looping: bool,
+        transform: Transform,
+        scale: f32,
+        camera: Vec3,
+        atmosphere: &Atmosphere,
+        bone_scales: &[(usize, f32)],
+    ) {
         if crate::character::skinning::overlap::gather_only() { return; }
-        let d = &self.data;
+        let d = self.data.as_ref();
         let Some(animation) = d.clips.get(clip) else {
             return;
         };
@@ -1482,7 +1727,7 @@ impl Model {
                 return transform;
             };
             let mut pose = d.skeleton.global_pose(&animation.sample(at, looping));
-            crate::skeletal::scale_pose(&d.skeleton, &mut pose, &self.bone_scales);
+            crate::skeletal::scale_pose(&d.skeleton, &mut pose, bone_scales);
             Transform {
                 translation: transform.point(pose[bone].translation * d.def.scale * scale),
                 rotation: transform.rotation * pose[bone].rotation,
@@ -1538,7 +1783,7 @@ impl Model {
         extra: &[String],
         specs: &BTreeMap<String, texture::MaterialSpec>,
     ) -> Result<Self> {
-        let data = Data::load(assets, name, extra)?;
+        let mut data = ModelData::load(assets, name, extra)?;
         #[cfg(feature="vita_renderer")]
         let mut glow_subset = false;
         #[cfg(not(feature="vita_renderer"))]
@@ -1621,14 +1866,15 @@ impl Model {
                 .with_context(|| format!("NPC attachment tag {tag}"))?;
             attachments.push((bone, *scale, Prop::load(assets, name, specs)?));
         }
-        let face = crate::facial::Face::load(
+        let (mouth_rig, blink) = crate::facial::Face::load(
             assets,
             &format!("models/{name}.tik"),
             &data.def,
             &data.skeleton,
             &meshes,
             specs,
-        )?;
+        )?.into_parts();
+        data.mouth_rig = mouth_rig;
         let mut props = BTreeMap::new();
         let mut effects = BTreeMap::new();
         for (clip, events) in &data.events.clips {
@@ -1678,6 +1924,9 @@ impl Model {
                 effect.orient_velocity("sparkle");
             }
         }
+        // These resource capabilities are fixed when the model slot is loaded.
+        data.ambient_art_free = attachments.is_empty()
+            && props.is_empty() && effects.is_empty() && own_effect.is_none();
         Ok(Self {
             glow_subset,
             skin_identity: Default::default(),
@@ -1686,7 +1935,6 @@ impl Model {
             live_skin_current: true,
             current_skin: None,
             visible: vec![false; meshes.len()],
-            bone_scales: Vec::new(),
             electric: Some(crate::electric::Art::load(assets, specs)?),
             burst: matches!(name, "cardguard_club" | "cardguard_diamond")
                 .then(|| {
@@ -1704,9 +1952,9 @@ impl Model {
                 None
             },
             own_effect,
-            face,
+            blink,
             _material_layers: material_layers,
-            data,
+            data: Arc::new(data),
             meshes,
             attachments,
             electric_attachments: Vec::new(),
@@ -2011,34 +2259,197 @@ fn near_cull_skips_only_close_dead_bodies_and_is_off_at_zero() {
     assert!(!near_cull(80., true, || 80.));
     assert!(!near_cull(80., false, || 1.));
 }
+/// Renderer-owned slots. Recreated on every visit/restore, never saved or sent.
+#[derive(Default)]
+struct SnapshotRegistry {
+    generation: u64,
+    slots: Vec<(crate::character::skinning::identity::ActorId, usize)>,
+    // Required owned commands; omissions may never silently read live actors.
+    owned_slots: Vec<usize>,
+}
+/// Owned command slots for one registry generation, in actor order.
+pub(crate) struct OwnedSlots {
+    pub(crate) generation: u64,
+    pub(crate) slots: Vec<usize>,
+}
+
+fn owned_slots(actors: &[Actor]) -> impl Iterator<Item = usize> + '_ {
+    actors.iter().enumerate()
+        .filter(|(_, actor)| actor.ant.is_some() || actor.snapshot_ambient() || actor.snapshot_resident())
+        .map(|(slot, _)| slot)
+}
+
+impl SnapshotRegistry {
+    fn publish_membership(
+        &mut self,
+        keys: Vec<(crate::character::skinning::identity::ActorId, usize)>,
+        membership: OwnedSlots,
+    ) -> bool {
+        if membership.generation != self.generation {
+            return false;
+        }
+        if self.generation == 0 || self.slots != keys {
+            self.retire();
+            self.slots.extend(keys);
+            self.owned_slots.extend(membership.slots);
+            return true;
+        }
+        self.owned_slots == membership.slots
+    }
+
+    fn retire(&mut self) {
+        self.generation = crate::character::skinning::identity::next_art_instance();
+        self.slots.clear(); self.owned_slots.clear();
+    }
+}
+struct AntBodyInput {
+    pose: Vec<Transform>,
+    scales: Vec<f32>,
+    visual: crate::animation_events::VisualState,
+    transform: Transform,
+    scale: f32,
+    time: f32,
+    alive: bool,
+    frozen: bool,
+    electric: f32,
+}
+struct AntInput {
+    slot: usize,
+    visible: bool,
+    preserve: bool,
+    corpse: bool,
+    body: Option<AntBodyInput>,
+    shots: Vec<crate::ant::Bullet>,
+    blasts: Vec<crate::ant::Blast>,
+}
+struct AmbientInput {
+    slot: usize,
+    visible: bool,
+    preserve: bool,
+    body: Option<AntBodyInput>,
+    clip: usize,
+    sample_time: f32,
+    looping: bool,
+    lod_safe: bool,
+    distance_squared: f32,
+    radius: f32,
+}
+impl Actor {
+    fn snapshot_ambient(&self) -> bool {
+        self.ant.is_none() && self.resident.is_none() && self.clock.is_none()
+            && self.imp.is_none() && self.chess.is_none() && self.guard.is_none() && self.guide.is_none()
+    }
+}
+// Only resolved numeric/owned visual input crosses the simulation boundary.
+struct ResidentInput {
+    slot: usize,
+    visible: bool,
+    preserve: bool,
+    attached: bool,
+    body: Option<AntBodyInput>,
+    effects: ResidentEffects,
+}
+enum ResidentEffects {
+    BiteOnly,
+    Flora { resident: Option<Box<resident::Resident>>, body_visible: bool },
+    Wildlife { active: bool, input: wildlife_art::Input },
+    Ladybug { active: bool, acorns: Vec<(Vec3, f32)>, bursts: Vec<(Vec3, f32)> },
+    Plant { kind: crate::plants::Kind, shots: Vec<crate::plants::Shot> },
+}
+impl ResidentEffects {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::BiteOnly => 0,
+            Self::Flora { resident, .. } => resident.as_ref().map_or(0, |p| {
+                std::mem::size_of::<resident::Resident>() + match &p.body {
+                    resident::Body::Snark(s) => std::mem::size_of_val(s.shots.as_slice()),
+                    _ => 0,
+                }
+            }),
+            Self::Wildlife { .. } => std::mem::size_of::<wildlife_art::Input>(),
+            Self::Ladybug { acorns, bursts, .. } => (acorns.len()+bursts.len())*std::mem::size_of::<(Vec3,f32)>(),
+            Self::Plant { shots, .. } => shots.len()*std::mem::size_of::<crate::plants::Shot>(),
+        }
+    }
+}
+impl Actor {
+    fn snapshot_resident(&self) -> bool {
+        self.resident.as_ref().is_some_and(|p| matches!(&p.body, resident::Body::Ladybug(_) | resident::Body::Plant(_))
+            || matches!(&p.body, resident::Body::Snark(b) if matches!(b.kind, crate::snark::Kind::BiteOnly | crate::snark::Kind::Water))
+            || matches!(&p.body, resident::Body::Insect(_))
+            || matches!(&p.body, resident::Body::Wildlife(b) if b.kind.rock()))
+    }
+}
+#[derive(Default)]
+struct ActorInputs {
+    generation: u64,
+    ants: Vec<AntInput>,
+    ambient: Vec<AmbientInput>,
+    residents: Vec<ResidentInput>,
+    overflow: bool,
+}
+impl ActorInputs {
+    fn valid_for(&self, registry: &SnapshotRegistry) -> bool {
+        !self.overflow && self.generation != 0 && self.generation == registry.generation
+            && self.ants.len()+self.ambient.len()+self.residents.len() == registry.owned_slots.len()
+            && registry.owned_slots.iter().all(|slot|
+                self.ants.iter().any(|a| a.slot == *slot) || self.ambient.iter().any(|a| a.slot == *slot)
+                    || self.residents.iter().any(|a| a.slot == *slot))
+            && self.ants.iter().all(|a| a.slot < registry.slots.len())
+            && self.ants.windows(2).all(|a| a[0].slot < a[1].slot)
+            && self.ambient.iter().all(|a| a.slot < registry.slots.len()
+                && !self.ants.iter().any(|b| b.slot == a.slot))
+            && self.ambient.windows(2).all(|a| a[0].slot < a[1].slot)
+            && self.residents.windows(2).all(|a| a[0].slot < a[1].slot)
+            && self.residents.iter().all(|a| a.slot < registry.slots.len()
+                && !self.ants.iter().any(|b| a.slot == b.slot)
+                && !self.ambient.iter().any(|b| a.slot == b.slot))
+    }
+    fn valid_resources(&self, registry: &SnapshotRegistry, models: &[ModelArt]) -> bool {
+        self.valid_for(registry) && registry.slots.iter().all(|(_, slot)| *slot < models.len())
+            && self.residents.iter().all(|a| {
+                let d = &models[registry.slots[a.slot].1].data;
+                a.body.as_ref().is_none_or(|b| b.pose.len() == d.skeleton.bones.len()
+                    && (b.scales.is_empty() || b.scales.len() == b.pose.len()))
+            })
+            && self.ambient.iter().all(|a| {
+                let d = &models[registry.slots[a.slot].1].data;
+                a.clip < d.clips.len() && a.visible == a.body.is_some()
+                    && a.body.as_ref().is_none_or(|b| b.pose.len() == d.skeleton.bones.len()
+                        && (b.scales.is_empty() || b.scales.len() == b.pose.len()))
+            })
+    }
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.residents.len()*std::mem::size_of::<ResidentInput>()
+            + self.residents.iter().map(|r| r.effects.bytes() + r.body.as_ref().map_or(0, |b|
+                b.pose.len()*std::mem::size_of::<Transform>() + b.scales.len()*std::mem::size_of::<f32>()
+                    + b.visual.payload_bytes())).sum::<usize>()
+            + self.ambient.len()*std::mem::size_of::<AmbientInput>()
+            + self.ambient.iter().filter_map(|a| a.body.as_ref()).map(|b|
+                b.pose.len()*std::mem::size_of::<Transform>() + b.scales.len()*std::mem::size_of::<f32>()
+                + b.visual.payload_bytes()).sum::<usize>()
+            + self.ants.len()*std::mem::size_of::<AntInput>()
+            + self.ants.iter().map(|a| a.shots.len()*std::mem::size_of::<crate::ant::Bullet>()
+                + a.blasts.len()*std::mem::size_of::<crate::ant::Blast>()
+                + a.body.as_ref().map_or(0, |b| b.pose.len()*std::mem::size_of::<Transform>()
+                    + b.scales.len()*std::mem::size_of::<f32>()
+                    // Owned visual strings/trees are counted separately below.
+                    + b.visual.payload_bytes())).sum::<usize>()
+    }
+}
 pub struct Npcs {
-    // GPU-only state, discarded on restore/level change and never serialized.
-    visual_lod: BTreeMap<usize, visual_lod::Cache>,
-    attack_fx: std::rc::Rc<attack_fx::Art>,
+    art: NpcArt,
+    sim: NpcSim,
+}
+pub(crate) struct NpcSim {
     /// Battle Royale places enemies above a player-only ceiling.
     actor_world: Option<World>,
     garden: Option<garden::Logic>,
     resident_ambushes: Vec<resident_spawns::Ambush>,
     resident_initial: Vec<Option<resident::Resident>>,
-    acorn: Option<Prop>,
-    resident_diamond: Option<Prop>,
-    thorn: Option<Prop>,
-    spore: Option<crate::particles::Attached>,
-    spores: BTreeMap<(usize, u32), crate::particles::Attached>,
     clock_ambushes: Vec<clock_spawns::Ambush>,
-    clock_prop: Option<Prop>,
-    clock_trail: Option<crate::particles::Attached>,
-    clock_art: BTreeMap<usize, clock_art::Art>,
-    card_art: BTreeMap<usize, card_art::Art>,
-    snark_art: BTreeMap<usize, snark_art::Art>,
-    magma_art: BTreeMap<usize, magma_art::Art>,
-    wildlife_art: BTreeMap<usize, wildlife_art::Art>,
-    magma_fire: Option<crate::particles::Attached>,
-    burrow_art: BTreeMap<usize, burrow_art::Art>,
-    snark_props: BTreeMap<crate::snark::Kind, snark_art::Projectiles>,
-    card_props: BTreeMap<crate::cards::Kind, card_art::Projectiles>,
     imp_ambushes: Vec<imp_spawns::Ambush>,
-    imp_debris: Vec<Prop>,
     chess_ambushes: Vec<chess_spawns::Ambush>,
     pupil_path: Vec<Vec3>,
     companion_routes: companions::Routes,
@@ -2052,86 +2463,175 @@ pub struct Npcs {
     owns_school2: bool,
     /// Registered controllers serving this visit; they own the actors `owns_npc` names.
     levels: Vec<&'static crate::levels::Registration>,
-    ant_shots: Option<[crate::weapons::Prop; 2]>,
-    models: Vec<Model>,
     actors: Vec<Actor>,
-    material: crate::character::SkinMaterial,
     pub greetings: u64,
+    models: Vec<Arc<ModelData>>,
 }
+
+pub(crate) type NpcArt = owner_thread::NpcArt<NpcArtResources>;
+
+struct ResidentEffectsArt {
+    snark_art: BTreeMap<usize, snark_art::Art>,
+    burrow_art: BTreeMap<usize, burrow_art::Art>,
+    snark_props: BTreeMap<crate::snark::Kind, snark_art::Projectiles>,
+}
+
+pub(crate) struct NpcArtResources {
+    resident_effects: ResidentEffectsArt,
+    snapshot_registry: SnapshotRegistry,
+    actor_inputs: Option<ActorInputs>,
+    // GPU-only state, discarded on restore/level change and never serialized.
+    visual_lod: BTreeMap<usize, visual_lod::Cache>,
+    attack_fx: std::rc::Rc<attack_fx::Art>,
+    acorn: Option<Prop>,
+    resident_diamond: Option<Prop>,
+    thorn: Option<Prop>,
+    spore: Option<crate::particles::Attached>,
+    spores: BTreeMap<(usize, u32), crate::particles::Attached>,
+    clock_prop: Option<Prop>,
+    clock_trail: Option<crate::particles::Attached>,
+    clock_art: BTreeMap<usize, clock_art::Art>,
+    card_art: BTreeMap<usize, card_art::Art>,
+    magma_art: BTreeMap<usize, magma_art::Art>,
+    wildlife_art: BTreeMap<usize, wildlife_art::Art>,
+    magma_fire: Option<crate::particles::Attached>,
+    card_props: BTreeMap<crate::cards::Kind, card_art::Projectiles>,
+    imp_debris: Vec<Prop>,
+    ant_shots: Option<[crate::weapons::Prop; 2]>,
+    models: Vec<ModelArt>,
+    material: crate::character::SkinMaterial,
+}
+
+const _: fn() = || {
+    fn send<T: Send>() {}
+    fn send_sync<T: Send + Sync>() {}
+    send::<NpcSim>();
+    send_sync::<ModelData>();
+    send_sync::<PuppetRig>();
+    send::<PuppetInput>();
+};
+
+// `NpcArt` owns GL-affine resources and must stay on the owner thread. This fails to
+// compile (ambiguous impl) the day it becomes `Send`, in every build, Vita included.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> { fn some_item() {} }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    struct Invalid;
+    impl<T: ?Sized + Send> AmbiguousIfSend<Invalid> for T {}
+    let _ = <NpcArt as AmbiguousIfSend<_>>::some_item;
+};
+
+/// Release builds keep drawing without the debug assertion; say once that NPCs were skipped.
+fn report_world_free_npc_skip(site: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[lg/overlap] world-free NPC draw skipped actors ({site}); serial fallback unavailable");
+    }
+}
+
+impl NpcArt {
+    pub(crate) fn draw_captured(
+        &mut self, camera: Vec3, direction: Vec3, atmosphere: &Atmosphere, fullbright: bool,
+    ) {
+        self.resources.draw(camera, direction, atmosphere, fullbright, None);
+    }
+}
+
 impl Npcs {
-    pub(crate) fn check_school2_ownership(&self) -> Result<()> {
-        let diamonds = self
-            .actors
-            .iter()
-            .filter(|a| a.spawn.model == "cardguard_diamond")
-            .collect::<Vec<_>>();
-        ensure!(
-            self.owns_school2
-                && diamonds.len() == 6
-                && diamonds.iter().all(|a| self.registry_owns(a)),
-            "School2 decorative Diamonds overlap combat ownership"
-        );
-        Ok(())
-    }
-    /// Whether a registered controller owns this placed actor.
-    fn registry_owns(&self, actor: &Actor) -> bool {
-        (self.owns_village
-            && matches!(
-                actor.spawn.name.as_str(),
-                "rabbit_actor1"
-                    | "cat_hole1"
-                    | "knife_cat"
-                    | "cat_shrink1"
-                    | "essence_cat"
-                    | "bridge_cat"
-            ))
-            || (self.owns_ladybugs && crate::pool::cinema::owns(&actor.spawn.name))
-            || (self.owns_school_first && crate::school::cinema::owns(&actor.spawn.name))
-            || (self.owns_school2 && (actor.spawn.model == "cardguard_diamond" || actor.spawn.name == "dice_cat"))
-            || self
-                .levels
-                .iter()
-                .any(|r| (r.owns_npc)(&actor.spawn.name, &actor.spawn.model))
-    }
-    pub fn scene_hidden(&mut self, names: &[&str]) {
-        self.scene_hidden = names.iter().map(|n| n.to_string()).collect();
-    }
-    pub fn scene_place(&mut self, name: &str, pose: Transform) {
-        if let Some(a) = self.actors.iter_mut().find(|a| a.spawn.name == name) {
-            // Rebuild the location after old saves without resetting the actor's
-            // later turns toward Alice every frame at an unchanged marker.
-            if a.footing
-                .is_none_or(|p| p.distance_squared(pose.translation) > 1.)
-            {
-                a.yaw = pose.rotation.to_euler(EulerRot::ZYX).0;
-            }
-            a.footing = Some(pose.translation);
-            a.falling = 0.;
-        }
+    pub(crate) fn art_mut(&mut self) -> &mut NpcArt { &mut self.art }
+
+    pub(crate) fn sim_mut(&mut self) -> &mut NpcSim { &mut self.sim }
+
+    pub(crate) fn into_parts(self) -> (NpcSim, NpcArt) {
+        (self.sim, self.art)
     }
 
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            actors: self.actors.clone(),
-            greetings: self.greetings,
-            garden: self.garden.as_ref().map(|g|g.saved.clone()),
+    pub(crate) fn from_parts(sim: NpcSim, art: NpcArt) -> Self {
+        Self { sim, art }
+    }
+
+    pub fn greetings(&self) -> u64 { self.sim.greetings }
+    /// Host-only census of incomplete schemas, including dispatch visibility reads.
+    /// Presence is intentional: a hidden actor still consults live state before returning.
+    pub(crate) fn snapshot_fence_census(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for actor in &self.sim.actors {
+            if (actor.ant.is_some() || actor.snapshot_ambient() || actor.snapshot_resident()) && self.art.resources.actor_inputs.as_ref()
+                .is_some_and(|i| i.valid_resources(&self.art.resources.snapshot_registry, &self.art.resources.models)) { continue; }
+            let family = if actor.ant.is_some() { "ant" } else if let Some(p) = &actor.resident {
+                match &p.body {
+                    resident::Body::Boojum(_) => "boojum",
+                    resident::Body::Ladybug(_) => "ladybug",
+                    resident::Body::Diamond(_) => "diamond",
+                    resident::Body::Plant(_) => "plant",
+                    resident::Body::Card(_) => "card",
+                    resident::Body::Snark(_) => "snark",
+                    resident::Body::Insect(_) => "insect",
+                    resident::Body::Magma(_) => "magma",
+                    resident::Body::Wildlife(_) => "wildlife",
+                }
+            } else if actor.clock.is_some() { "clockwork" }
+            else if actor.imp.is_some() { "fire_imp" }
+            else if actor.chess.is_some() { "chess" }
+            else if actor.guard.is_some() { "guard" }
+            else if actor.guide.is_some() { "companion" }
+            else { "ambient" };
+            *counts.entry(format!("npc.{family}.{}", actor.spawn.model)).or_insert(0) += 1;
         }
+        counts
+    }
+    /// Extract bounded owned NPC inputs. Unconverted families retain their
+    /// explicit serial fence and legacy consumer.
+    pub(crate) fn extract_ants(&mut self, camera: Vec3, direction: Vec3) -> (usize, usize, bool) {
+        // Reject before walking a malformed/unbounded cast or allocating poses.
+        if self.sim.actors.len() > MAX_SNAPSHOT_ACTORS || self.sim.actors.iter().any(|a| a.model >= self.sim.models.len()) {
+            self.art.resources.actor_inputs = Some(ActorInputs { overflow: true, ..Default::default() });
+            return (std::mem::size_of::<ActorInputs>(), 0, true);
+        }
+        let generation = self.art.resources.snapshot_registry.generation;
+        let membership = self.sim.capture_owned_slots(generation);
+        let keys: Vec<_> = self.sim.actors.iter().map(|a| (a.skin_identity, a.model)).collect();
+        let view = ActorCaptureView {
+            camera,
+            direction,
+            skip_live: crate::draw_diagnostics::skip(crate::draw_diagnostics::Class::LiveActors),
+            skip_ant_corpses: crate::draw_diagnostics::skip(crate::draw_diagnostics::Class::AntCorpses),
+            #[cfg(feature = "vita_renderer")]
+            near_cull: crate::render::vita_renderer::config().actor_near_cull,
+        };
+        let inputs = self.sim.extract_actors(view);
+        self.art.resources.publish_actors(keys, membership, inputs)
+    }
+    pub(crate) fn clear_actor_inputs(&mut self) { self.art.resources.actor_inputs = None; }
+    pub(crate) fn check_school2_ownership(&self) -> Result<()> {
+        self.sim.check_school2_ownership()
+    }
+    pub fn scene_hidden(&mut self, names: &[&str]) {
+        self.sim.scene_hidden(names)
+    }
+    pub fn scene_place(&mut self, name: &str, pose: Transform) {
+        self.sim.scene_place(name, pose)
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        self.sim.snapshot()
     }
     pub fn restore(&mut self, s: &Snapshot) -> Result<()> {
-        self.visual_lod.clear();
-        if let Some(g) = &self.garden { g.validate(s.garden.as_ref())?; }
-        self.card_art.clear();
-        self.snark_art.clear();
-        self.burrow_art.clear();
-        self.magma_art.clear();
-        self.wildlife_art.clear();
-        self.clock_art.clear();
-        self.spores.clear();
+        self.art.resources.snapshot_registry.retire();
+        self.art.resources.actor_inputs = None;
+        self.art.resources.visual_lod.clear();
+        if let Some(g) = &self.sim.garden { g.validate(s.garden.as_ref())?; }
+        self.art.resources.card_art.clear();
+        self.art.resources.resident_effects.snark_art.clear();
+        self.art.resources.resident_effects.burrow_art.clear();
+        self.art.resources.magma_art.clear();
+        self.art.resources.wildlife_art.clear();
+        self.art.resources.clock_art.clear();
+        self.art.resources.spores.clear();
         let mut matched = std::collections::BTreeSet::new();
-        let maze = self.levels.iter().any(|r| matches!(r.id, "hedge1" | "tower1"));
+        let maze = self.sim.levels.iter().any(|r| matches!(r.id, "hedge1" | "tower1"));
         for b in &s.actors {
             let (index, a) = self
-                .actors
+                .sim.actors
                 .iter_mut()
                 .enumerate()
                 .find(|(i, a)| !matched.contains(i) && a.spawn.saved_identity(&b.spawn, maze))
@@ -2189,13 +2689,13 @@ impl Npcs {
             );
             let resident = if let Some(b) = &b.resident {
                 b.matches(
-                    self.resident_initial[index]
+                    self.sim.resident_initial[index]
                         .as_ref()
                         .context("Missing resident seed")?,
                 )?;
                 Some(b.clone())
             } else {
-                self.resident_initial[index].clone().map(|mut p| {
+                self.sim.resident_initial[index].clone().map(|mut p| {
                     match &mut p.body {
                         resident::Body::Boojum(c) => c.feet = b.position(),
                         resident::Body::Ladybug(c) => c.feet = b.position(),
@@ -2258,9 +2758,9 @@ impl Npcs {
             a.model = model;
             matched.insert(index);
         }
-        for (index, actor) in self.actors.iter_mut().enumerate() {
+        for (index, actor) in self.sim.actors.iter_mut().enumerate() {
             if !matched.contains(&index) && actor.spawn.resident_spawn.is_some() {
-                actor.resident = self.resident_initial[index].clone();
+                actor.resident = self.sim.resident_initial[index].clone();
             }
             if !matched.contains(&index)
                 && actor.spawn.clock_spawn.is_some()
@@ -2306,7 +2806,7 @@ impl Npcs {
             }
         }
         ensure!(
-            self.actors
+            self.sim.actors
                 .iter()
                 .enumerate()
                 .all(|(i, a)| matched.contains(&i)
@@ -2317,115 +2817,18 @@ impl Npcs {
                     || a.spawn.resident_spawn.is_some()),
             "Saved NPC cast does not match map"
         );
-        if let Some(g)=&mut self.garden {g.restore(s.garden.as_ref(), &mut self.actors)?;}
-        self.greetings = s.greetings;
+        if let Some(g)=&mut self.sim.garden {g.restore(s.garden.as_ref(), &mut self.sim.actors)?;}
+        self.sim.greetings = s.greetings;
         Ok(())
     }
     pub fn notarget(&mut self, value: bool) {
-        for p in self.actors.iter_mut().filter_map(|a| a.resident.as_mut()) {
-            p.notarget(value);
-        }
-        for p in self.actors.iter_mut().filter_map(|a| a.clock.as_mut()) {
-            p.notarget = value;
-        }
-        for p in self.actors.iter_mut().filter_map(|a| a.imp.as_mut()) {
-            p.notarget = value;
-        }
-        for p in self.actors.iter_mut().filter_map(|a| a.chess.as_mut()) {
-            p.notarget = value;
-        }
-        for ant in self.actors.iter_mut().filter_map(|a| a.ant.as_mut()) {
-            ant.notarget = value;
-        }
-        for guard in self.actors.iter_mut().filter_map(|a| a.guard.as_mut()) {
-            guard.notarget = value;
-        }
+        self.sim.notarget(value)
     }
     pub fn lights(&self) -> Vec<crate::lighting::Light> {
-        self.actors
-            .iter()
-            .filter_map(|a| a.clock.as_ref())
-            .flat_map(|p| p.fists.iter())
-            .map(|f| crate::lighting::Light {
-                position: f.position,
-                color: vec3(1., 0.7, 0.2),
-                radius: 170.,
-                only_models: false,
-                flare: false,
-            })
-            .chain(
-                self.actors
-                    .iter()
-                    .filter_map(|a| a.resident.as_ref())
-                    .filter(|p| p.active)
-                    .flat_map(|p| match &p.body {
-                        resident::Body::Insect(g)
-                            if g.kind == crate::burrow::Kind::Larva && g.health > 0. =>
-                        {
-                            vec![crate::lighting::Light {
-                                position: g.feet + Vec3::Z * 10.,
-                                color: vec3(0.25, 0., 0.),
-                                radius: 50.,
-                                only_models: false,
-                                flare: false,
-                            }]
-                        }
-                        resident::Body::Card(g) => g
-                            .shots
-                            .iter()
-                            .map(|s| crate::lighting::Light {
-                                position: s.position,
-                                color: vec3(1., 0.2, 0.2),
-                                radius: 150.,
-                                only_models: false,
-                                flare: false,
-                            })
-                            .collect::<Vec<_>>(),
-                        resident::Body::Snark(g) if g.kind == crate::snark::Kind::Fire => g
-                            .shots
-                            .iter()
-                            .map(|s| crate::lighting::Light {
-                                position: s.position,
-                                color: vec3(1., 0.45, 0.1),
-                                radius: 120.,
-                                only_models: false,
-                                flare: false,
-                            })
-                            .collect(),
-                        _ => Vec::new(),
-                    }),
-            )
-            .chain(self.actors.iter().filter_map(|a| {
-                let p = a.resident.as_ref()?;
-                let resident::Body::Card(g) = &p.body else {
-                    return None;
-                };
-                let data = &self.models[a.model].data;
-                if !p.active
-                    || g.kind != crate::cards::Kind::Heart
-                    || !(g.phase == crate::cards::Phase::Charge
-                        || (g.phase == crate::cards::Phase::Slam
-                            && g.time < 44. * data.clips[g.clip()].frame_time))
-                {
-                    return None;
-                }
-                let tag = crate::clockwork::Rig::tag(data, g.clip(), g.time, "tag_barrel");
-                Some(crate::lighting::Light {
-                    position: g.feet + Quat::from_rotation_z(g.yaw) * tag.translation * g.scale,
-                    color: vec3(1., 0.2, 0.2),
-                    radius: 100.,
-                    only_models: false,
-                    flare: false,
-                })
-            }))
-            .collect()
+        self.sim.lights()
     }
     pub fn chess_threats(&mut self, threatens: impl Fn(&combat::Target) -> bool) {
-        for (id, actor) in self.actors.iter_mut().enumerate() {
-            if let Some(p) = &mut actor.chess {
-                p.threatened(threatens(&p.target(id)));
-            }
-        }
+        self.sim.chess_threats(threatens)
     }
     pub fn load(
         assets: &mut Assets,
@@ -2477,7 +2880,7 @@ impl Npcs {
             if model == "c_insanechild_muzzle" && name == "skool1" {
                 extra.push("walk".into());
             }
-            match Model::load(assets, model, &extra, &specs) {
+            match ModelArt::load(assets, model, &extra, &specs) {
                 Ok(data) => {
                     indices.insert(model.clone(), models.len());
                     models.push(data);
@@ -2594,177 +2997,933 @@ impl Npcs {
             models.len()
         );
         let garden = garden::Logic::load(map,name,&mut actors)?;
+        let snapshot_registry = SnapshotRegistry::default();
+        let actor_inputs = None;
+        let visual_lod = BTreeMap::new();
+        let attack_fx = attack_fx::Art::load(assets, &specs)?;
+        let resident_diamond = if actors.iter().any(|a| {
+            a.resident
+                .as_ref()
+                .is_some_and(|p| p.model() == "cardguard_diamond")
+        }) {
+            Some(Prop::load_animation(assets, "prj_diamond", "idle", &specs)?)
+        } else {
+            None
+        };
+        let thorn = if actors.iter().any(|a| a.spawn.model == "c_bloodrose") {
+            Some(Prop::load_animation(assets, "prj_thorn", "idle", &specs)?)
+        } else {
+            None
+        };
+        let spore = if actors.iter().any(|a| a.spawn.model == "c_evilmushroom") {
+            crate::particles::Attached::load(assets, "prj_spore2", &specs)?
+        } else {
+            None
+        };
+        let spores = BTreeMap::new();
+        let resident_ambushes = resident_spawns::ambushes(map, name)?;
+        let actor_world = (name == "grounds2").then(|| World::actor_world(map)).transpose()?;
+        let resident_initial = actors.iter().map(|a| a.resident.clone()).collect();
+        let acorn = if actors.iter().any(|a| {
+            a.resident
+                .as_ref()
+                .is_some_and(|p| p.model() == "c_ladybug")
+        }) {
+            Some(Prop::load_animation(assets, "prj_acorn", "acorn", &specs)?)
+        } else {
+            None
+        };
+        let chess_ambushes = chess_spawns::ambushes(map, name)?;
+        let imp_ambushes = imp_spawns::ambushes(map, name)?;
+        let clock_ambushes = clock_spawns::ambushes(map, name)?;
+        let card_art = BTreeMap::new();
+        let snark_art = BTreeMap::new();
+        let burrow_art = BTreeMap::new();
+        let magma_art = BTreeMap::new();
+        let wildlife_art = BTreeMap::new();
+        let magma_fire = if actors.iter().any(|a| a.spawn.model == crate::magma::MODEL) {
+            crate::particles::Attached::load(assets, "prj_fireball", &specs)?
+        } else {
+            None
+        };
+        let snark_props = snark_art::Projectiles::load(assets, &actors, &specs)?;
+        let card_props = card_art::Projectiles::load(assets, &actors, &specs)?;
+        let clock_art = BTreeMap::new();
+        let clock_prop = if actors.iter().any(|a| a.clock.is_some()) {
+            Some(Prop::load(assets, "prj_hand", &specs)?)
+        } else {
+            None
+        };
+        let clock_trail = if actors.iter().any(|a| a.clock.is_some()) {
+            crate::particles::Attached::load(assets, "prj_hand", &specs)?
+        } else {
+            None
+        };
+        let imp_debris = if actors.iter().any(|a| a.imp.is_some()) {
+            [
+                "gb_meatbone1",
+                "gb_meatbone2",
+                "gb_meatbone3",
+                "gb_ribs",
+                "w_fork",
+            ]
+            .iter()
+            .map(|n| Prop::load(assets, n, &specs))
+            .collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        let pupil_path = ambient::path(map, name, entry)?;
+        let companion_routes = companions::Routes::load(map, name)?;
+        let scene_hidden = BTreeSet::new();
+        let owns_village = name == "gvillage";
+        let owns_duchess = name == "potears3";
+        let owns_ladybugs = name == "potears1";
+        let owns_pandemonium = name == "pandemonium";
+        let owns_school_first = name == "skool1" && entry != Some("skool1_start2");
+        let owns_school2 = name == "skool2";
+        let levels = crate::levels::serving(name, entry).collect();
+        let ant_shots = if actors.iter().any(|a| a.ant.is_some()) {
+            Some([
+                crate::weapons::Prop::load_animation(assets, "prj_bullet", "idle", &specs)?,
+                crate::weapons::Prop::load_animation(assets, "prj_grenade", "idle", &specs)?,
+            ])
+        } else {
+            None
+        };
+        let material = crate::character::skin_material()?;
+        let greetings = 0;
+        let sim_models = models.iter().map(|model| Arc::clone(&model.data)).collect();
         Ok(Self {
-            visual_lod: BTreeMap::new(),
-            attack_fx: attack_fx::Art::load(assets, &specs)?,
-            garden,
-            resident_diamond: if actors.iter().any(|a| {
-                a.resident
-                    .as_ref()
-                    .is_some_and(|p| p.model() == "cardguard_diamond")
-            }) {
-                Some(Prop::load_animation(assets, "prj_diamond", "idle", &specs)?)
-            } else {
-                None
+            art: NpcArt::new(NpcArtResources {
+                snapshot_registry,
+                actor_inputs,
+                visual_lod,
+                attack_fx,
+                resident_diamond,
+                thorn,
+                spore,
+                spores,
+                acorn,
+                card_art,
+                resident_effects: ResidentEffectsArt { snark_art, burrow_art, snark_props },
+                magma_art,
+                wildlife_art,
+                magma_fire,
+                card_props,
+                clock_art,
+                clock_prop,
+                clock_trail,
+                imp_debris,
+                ant_shots,
+                models,
+                material,
+            }),
+            sim: NpcSim {
+                garden,
+                actors,
+                resident_ambushes,
+                actor_world,
+                resident_initial,
+                chess_ambushes,
+                imp_ambushes,
+                clock_ambushes,
+                pupil_path,
+                companion_routes,
+                scene_hidden,
+                owns_village,
+                owns_duchess,
+                owns_ladybugs,
+                owns_pandemonium,
+                owns_school_first,
+                owns_school2,
+                levels,
+                greetings,
+                models: sim_models,
             },
-            thorn: if actors.iter().any(|a| a.spawn.model == "c_bloodrose") {
-                Some(Prop::load_animation(assets, "prj_thorn", "idle", &specs)?)
-            } else {
-                None
-            },
-            spore: if actors.iter().any(|a| a.spawn.model == "c_evilmushroom") {
-                crate::particles::Attached::load(assets, "prj_spore2", &specs)?
-            } else {
-                None
-            },
-            spores: BTreeMap::new(),
-            resident_ambushes: resident_spawns::ambushes(map, name)?,
-            actor_world: (name == "grounds2").then(|| World::actor_world(map)).transpose()?,
-            resident_initial: actors.iter().map(|a| a.resident.clone()).collect(),
-            acorn: if actors.iter().any(|a| {
-                a.resident
-                    .as_ref()
-                    .is_some_and(|p| p.model() == "c_ladybug")
-            }) {
-                Some(Prop::load_animation(assets, "prj_acorn", "acorn", &specs)?)
-            } else {
-                None
-            },
-            chess_ambushes: chess_spawns::ambushes(map, name)?,
-            imp_ambushes: imp_spawns::ambushes(map, name)?,
-            clock_ambushes: clock_spawns::ambushes(map, name)?,
-            card_art: BTreeMap::new(),
-            snark_art: BTreeMap::new(),
-            burrow_art: BTreeMap::new(),
-            magma_art: BTreeMap::new(),
-            wildlife_art: BTreeMap::new(),
-            magma_fire: if actors.iter().any(|a| a.spawn.model == crate::magma::MODEL) {
-                crate::particles::Attached::load(assets, "prj_fireball", &specs)?
-            } else {
-                None
-            },
-            snark_props: snark_art::Projectiles::load(assets, &actors, &specs)?,
-            card_props: card_art::Projectiles::load(assets, &actors, &specs)?,
-            clock_art: BTreeMap::new(),
-            clock_prop: if actors.iter().any(|a| a.clock.is_some()) {
-                Some(Prop::load(assets, "prj_hand", &specs)?)
-            } else {
-                None
-            },
-            clock_trail: if actors.iter().any(|a| a.clock.is_some()) {
-                crate::particles::Attached::load(assets, "prj_hand", &specs)?
-            } else {
-                None
-            },
-            imp_debris: if actors.iter().any(|a| a.imp.is_some()) {
-                [
-                    "gb_meatbone1",
-                    "gb_meatbone2",
-                    "gb_meatbone3",
-                    "gb_ribs",
-                    "w_fork",
-                ]
-                .iter()
-                .map(|n| Prop::load(assets, n, &specs))
-                .collect::<Result<_>>()?
-            } else {
-                Vec::new()
-            },
-            pupil_path: ambient::path(map, name, entry)?,
-            companion_routes: companions::Routes::load(map, name)?,
-            scene_hidden: BTreeSet::new(),
-            owns_village: name == "gvillage",
-            owns_duchess: name == "potears3",
-            owns_ladybugs: name == "potears1",
-            owns_pandemonium: name == "pandemonium",
-            owns_school_first: name == "skool1" && entry != Some("skool1_start2"),
-            owns_school2: name == "skool2",
-            levels: crate::levels::serving(name, entry).collect(),
-            ant_shots: if actors.iter().any(|a| a.ant.is_some()) {
-                Some([
-                    crate::weapons::Prop::load_animation(assets, "prj_bullet", "idle", &specs)?,
-                    crate::weapons::Prop::load_animation(assets, "prj_grenade", "idle", &specs)?,
-                ])
-            } else {
-                None
-            },
-            models,
-            actors,
-            material: crate::character::skin_material()?,
-            greetings: 0,
         })
     }
     pub fn summon(&mut self, target: Option<combat::Target>) {
-        for a in &mut self.actors {
-            if let Some(p) = &mut a.resident {
-                p.opponents().summon = target;
-            }
-            if let Some(p) = &mut a.clock {
-                p.opponents.summon = target;
-            }
-            if let Some(p) = &mut a.imp {
-                p.opponents.summon = target;
-            }
-            if let Some(p) = &mut a.chess {
-                p.opponents.summon = target;
-            }
-            if let Some(ant) = &mut a.ant {
-                ant.opponents.summon = target;
-            }
-            if let Some(g) = &mut a.guard {
-                g.opponents.summon = target;
-            }
-        }
+        self.sim.summon(target)
     }
     pub fn provoke_summon(&mut self, id: usize) {
-        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.resident.as_mut()) {
-            p.opponents().demon = true;
-        }
-        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.clock.as_mut()) {
-            p.opponents.demon = true;
-        }
-        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.imp.as_mut()) {
-            p.opponents.demon = true;
-        }
-        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.chess.as_mut()) {
-            p.opponents.demon = true;
-        }
-        if let Some(a) = self.actors.get_mut(id).and_then(|a| a.ant.as_mut()) {
-            a.opponents.demon = true;
-        }
-        if let Some(g) = self.actors.get_mut(id).and_then(|a| a.guard.as_mut()) {
-            g.opponents.demon = true;
-        }
+        self.sim.provoke_summon(id)
     }
     pub fn companions(&self) -> Vec<crate::level::CompanionContact> {
-        self.actors.iter().filter_map(|a| a.guide.as_ref().map(|g| crate::level::CompanionContact {
-            name: a.spawn.name.clone(), feet: a.position(), half: vec3(16.,16.,30.)*a.spawn.scale,
-            visible: g.visible(), holding: g.holding(),
-        })).collect()
+        self.sim.companions()
     }
     pub fn level_patrols(&mut self, levels: &[crate::level::Slot]) {
-        for level in levels {
-            let names = level.ctl.patrols();
-            if names.is_empty() { continue; }
-            for actor in &mut self.actors {
-                if names.contains(&actor.spawn.name.as_str()) {
-                    if let Some(resident) = &mut actor.resident {
-                        if let resident::Body::Ladybug(b) = &mut resident.body {
-                            b.patrol_started = true;
+        self.sim.level_patrols(levels)
+    }
+    pub fn activate_levels(&mut self, levels: &[crate::level::Slot]) {
+        self.sim.activate_levels(levels)
+    }
+    pub fn update(&mut self, dt: f32, world: &World, eye: Vec3) -> combat::Feedback {
+        self.sim.update(dt, world, eye)
+    }
+    pub fn loot_sources(&self) -> Vec<crate::loot::Source> {
+        self.sim.loot_sources()
+    }
+    pub fn targets(&self) -> Vec<combat::Target> {
+        self.sim.targets()
+    }
+    pub fn mallet_contacts(&self) -> Vec<combat::Target> {
+        self.sim.mallet_contacts()
+    }
+    pub fn hit(&mut self, hit: combat::Hit) -> Option<(String, &'static str)> {
+        self.sim.hit(hit)
+    }
+    pub fn reset_combat(&mut self) {
+        self.sim.reset_combat()
+    }
+    pub fn talk_target(&self, name: &str, world: &World, eye: Vec3, aim: Vec3) -> Option<Vec3> {
+        self.sim.talk_target(name, world, eye, aim)
+    }
+    pub fn begin_talk(&mut self, name: &str) {
+        self.sim.begin_talk(name)
+    }
+    pub fn story_pose(&mut self, story: &crate::story::Story, dt: f32, world: &World, eye: Vec3) {
+        self.sim.story_pose(story, dt, world, eye)
+    }
+    pub fn draw(
+        &mut self,
+        camera: Vec3,
+        direction: Vec3,
+        atmosphere: &Atmosphere,
+        fullbright: bool,
+        world_free: bool,
+    ) {
+        self.art.resources.draw(camera, direction, atmosphere, fullbright,
+            if world_free { None } else { Some(&self.sim) });
+    }
+}
+impl ResidentEffectsArt {
+    fn draw(
+        &mut self, id: usize, model: &ModelArt, p: &resident::Resident, camera: Vec3,
+        atmosphere: &Atmosphere, fullbright: bool, material: &crate::character::SkinMaterial,
+    ) {
+        if !p.active {
+            return;
+        }
+        match &p.body {
+            resident::Body::Insect(g) => self.burrow_art.entry(id)
+                .or_insert_with(|| burrow_art::Art::new(model.own_effect.as_ref()))
+                .draw(g, &model.data, camera, atmosphere),
+            resident::Body::Snark(g) => {
+                let art = self.snark_art.entry(id)
+                    .or_insert_with(|| snark_art::Art::new(model.own_effect.as_ref()));
+                if let Some(props) = self.snark_props.get_mut(&g.kind) {
+                    art.shots(g, props, camera, atmosphere, fullbright, material);
+                }
+                art.tongue(g, &model.data);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl NpcArtResources {
+    fn publish_actors(
+        &mut self,
+        keys: Vec<(crate::character::skinning::identity::ActorId, usize)>,
+        membership: OwnedSlots,
+        mut inputs: ActorInputs,
+    ) -> (usize, usize, bool) {
+        let registry = &mut self.snapshot_registry;
+        if !registry.publish_membership(keys, membership) {
+            self.actor_inputs = None;
+            return (0, 0, true);
+        }
+        inputs.generation = registry.generation;
+        let result = (inputs.bytes(), inputs.ants.len(), inputs.overflow);
+        self.actor_inputs = Some(inputs);
+        result
+    }
+
+
+    fn draw(
+        &mut self,
+        camera: Vec3,
+        direction: Vec3,
+        atmosphere: &Atmosphere,
+        fullbright: bool,
+        live: Option<&NpcSim>,
+    ) {
+        #[cfg(feature="vita_renderer")]
+        let render_config={let mut c=crate::vita_sim::effective().clone();c.anim_cull|=crate::render_fx::retained_active()&&crate::render::vita_renderer::config().actor_frustum_cull;c};
+        #[cfg(feature="vita_renderer")]
+        let config=&render_config;
+        #[cfg(not(feature="vita_renderer"))]
+        let config = crate::vita_sim::effective();
+        let lod_enabled = config.anim_cull || config.anim_far_every > 1;
+        #[cfg(target_os = "vita")]
+        let mut lod_counts = [0u64; 5];
+        self.material.atmosphere(atmosphere, camera);
+        self.material.bind();
+        let inputs = self.actor_inputs.as_ref().filter(|i| i.valid_resources(&self.snapshot_registry, &self.models));
+        #[cfg(any(debug_assertions, not(target_os = "vita")))]
+        assert!(live.is_some() || inputs.is_some(), "world-free NPC draw lost its accepted inputs");
+        if live.is_none() && inputs.is_none() { report_world_free_npc_skip("inputs"); }
+        let draw_count = inputs.map_or_else(
+            || live.map_or(0, |sim| sim.actors.len()),
+            |_| self.snapshot_registry.slots.len(),
+        );
+        for id in 0..draw_count {
+            if let Some(input) = inputs.and_then(|i| i.ants.iter().find(|a| a.slot == id)) {
+                if !input.visible { continue; }
+                let (identity, model_slot) = self.snapshot_registry.slots[input.slot];
+                let _identity = identity.scope();
+                let _preserve = crate::character::skinning::CullGuard::preserve(input.preserve);
+                if !crate::character::skinning::overlap::gather_only() {
+                    if let Some(props) = &mut self.ant_shots {
+                        for shot in &input.shots { crate::ant::draw_shot(props, shot, fullbright); }
+                        crate::ant::draw_blast_inputs(&input.blasts);
+                        self.material.bind();
+                    }
+                }
+                if let Some(body) = &input.body {
+                    #[cfg(feature="vita_renderer")]
+                    let _corpse = crate::render_fx::corpse_triangles::scope(input.corpse);
+                    let _consumer = crate::character::skinning::CullGuard::publication_reason(body.frozen,crate::phase_census::FROZEN);
+                    let _electric = crate::character::skinning::CullGuard::reason(body.electric>0.,crate::phase_census::ELECTRIC);
+                    self.material.bind();
+                    let model = &mut self.models[model_slot];
+                    model.draw_resolved_pose(&body.pose, &body.scales, 0.,body.time,body.alive,
+                        body.transform,body.scale,fullbright,true,&body.visual,None,&BTreeMap::new());
+                    if body.frozen { model.draw_frozen(); }
+                    model.draw_electric(body.electric);
+                }
+                continue;
+            }
+            if let Some(input) = inputs.and_then(|i| i.ambient.iter().find(|a| a.slot == id)) {
+                if !input.visible { continue; }
+                let Some(body) = &input.body else { continue; };
+                let (identity, model_slot) = self.snapshot_registry.slots[input.slot];
+                let _identity = identity.scope();
+                let _preserve = crate::character::skinning::CullGuard::preserve(input.preserve);
+                let decision = if crate::character::skinning::overlap::ready() {
+                    self.visual_lod.get(&id).map_or(visual_lod::Decision::Exact, |lod| lod.prepared)
+                } else if lod_enabled {
+                    let outside = config.anim_cull && input.lod_safe && crate::render::outside_bounds(
+                        body.transform.translation-Vec3::splat(input.radius), body.transform.translation+Vec3::splat(input.radius));
+                    #[cfg(target_os="vita")] { lod_counts[4] += u64::from(!input.lod_safe); }
+                    self.visual_lod.entry(id).or_default().decide(config,input.lod_safe,outside,
+                        input.distance_squared,body.transform,body.scale,fullbright)
+                } else { visual_lod::Decision::Exact };
+                if crate::character::skinning::overlap::gather_only() {
+                    self.visual_lod.entry(id).or_default().prepared=decision;
+                }
+                #[cfg(target_os="vita")] { lod_counts[match decision {
+                    visual_lod::Decision::Exact=>0,visual_lod::Decision::Hidden=>1,
+                    visual_lod::Decision::Refresh=>2,visual_lod::Decision::Reuse=>3 }] += 1; }
+                match decision {
+                    visual_lod::Decision::Hidden => continue,
+                    visual_lod::Decision::Reuse => {
+                        for mesh in &self.visual_lod[&id].meshes { crate::render_fx::skin(mesh); } continue;
+                    }
+                    _ => {}
+                }
+                let model = &mut self.models[model_slot];
+                let _consumer = crate::character::skinning::CullGuard::reason(
+                    crate::character::skinning::overlap::single_preparing() && decision==visual_lod::Decision::Refresh,
+                    crate::phase_census::AMBIENT);
+                model.draw_resolved_pose(&body.pose,&body.scales,0.,body.time,true,body.transform,
+                    body.scale,fullbright,true,&body.visual,None,&BTreeMap::new());
+                if decision==visual_lod::Decision::Refresh && !crate::character::skinning::overlap::gather_only() {
+                    self.visual_lod.get_mut(&id).expect("ambient cache").capture(model);
+                }
+                let clip = model.data.clips.keys().nth(input.clip).expect("validated ambient clip").clone();
+                model.draw_effects(&clip,input.sample_time,input.looping,body.transform,body.scale,camera,atmosphere);
+                model.draw_electric(body.electric); self.material.bind();
+                continue;
+            }
+            if let Some(input) = inputs.and_then(|i| i.residents.iter().find(|a| a.slot == id)) {
+                if !input.visible { continue; }
+                let (identity, model_slot) = self.snapshot_registry.slots[input.slot];
+                let _identity = identity.scope();
+                let _preserve = crate::character::skinning::CullGuard::preserve(input.preserve);
+                if let ResidentEffects::Flora { resident, body_visible } = &input.effects {
+                    let draw_effects = !crate::character::skinning::overlap::gather_only();
+                    if let Some(p) = resident {
+                        if draw_effects {
+                            self.resident_effects.draw(
+                                id, &self.models[model_slot], p, camera, atmosphere, fullbright, &self.material,
+                            );
+                        }
+                        if *body_visible {
+                            let model = &mut self.models[model_slot];
+                            p.draw(model, fullbright, &self.material);
+                            if draw_effects {
+                                if let resident::Body::Snark(g) = &p.body {
+                                    if let Some(art) = self.resident_effects.snark_art.get_mut(&id) {
+                                        art.smoke(g, &model.data, camera, atmosphere);
+                                    }
+                                }
+                            }
+                            self.material.bind();
+                        }
+                    } else if *body_visible {
+                        self.material.bind();
+                    }
+                    continue;
+                }
+                if !crate::character::skinning::overlap::gather_only() {
+                    match &input.effects {
+                        ResidentEffects::BiteOnly => {},
+                        ResidentEffects::Flora { .. } => unreachable!("handled resident draw"),
+                        ResidentEffects::Wildlife { active, input } => {
+                            if !*active { self.material.bind(); continue; }
+                            let model=&self.models[model_slot];
+                            self.wildlife_art.entry(id).or_insert_with(||wildlife_art::Art::new(model))
+                                .draw_input(input,model,camera,atmosphere,&self.attack_fx);
+                        },
+                        ResidentEffects::Ladybug { active, acorns, bursts } => {
+                            if !*active { self.material.bind(); continue; }
+                            if let Some(prop) = &mut self.acorn {
+                                for (position,age) in acorns {
+                                    prop.draw_frame(Transform { translation:*position, rotation:Quat::from_euler(
+                                        EulerRot::XYZ,*age*1.75,*age*3.5,*age*5.25) },1.,fullbright,*age,true);
+                                }
+                            }
+                            gl_use_default_material();
+                            for (position,age) in bursts { crate::render_snapshot::WaveInput::Ladybug(*position,*age).draw(); }
+                        }
+                        ResidentEffects::Plant { kind, shots } => {
+                            self.spores.retain(|(owner,serial),_| *owner!=id || shots.iter().any(|s|s.serial==*serial));
+                            for shot in shots {
+                                let transform = Transform { translation:shot.position,
+                                    rotation:Quat::from_rotation_arc(Vec3::X,shot.direction) };
+                                if *kind==crate::plants::Kind::Rose {
+                                    if let Some(prop)=&mut self.thorn { self.material.bind(); prop.draw_frame(transform,1.,fullbright,shot.age,true); }
+                                } else if let Some(template)=&self.spore {
+                                    let effect=self.spores.entry((id,shot.serial)).or_insert_with(||template.fork());
+                                    effect.draw(shot.age,1.,|at,_|Transform {
+                                        translation:shot.position-shot.direction*600.*(shot.age-at),..transform },
+                                        |_,_,default|default,camera,atmosphere);
+                                }
+                            }
+                        }
+                    }
+                    self.material.bind();
+                }
+                if let Some(body)=&input.body {
+                    let _frozen=crate::character::skinning::CullGuard::publication_reason(body.frozen,crate::phase_census::FROZEN);
+                    let _electric=crate::character::skinning::CullGuard::preserve(body.electric>0.);
+                    self.material.bind();
+                    let model=&mut self.models[model_slot];
+                    crate::render_fx::with_skin_opacity(1., || model.draw_resolved_pose(
+                        &body.pose,&body.scales,0.,body.time,body.alive,
+                        body.transform,body.scale,fullbright,input.attached,&body.visual,None,&BTreeMap::new()));
+                    if body.frozen { model.draw_frozen(); }
+                    model.draw_electric(body.electric); self.material.bind();
+                }
+                continue;
+            }
+            #[cfg(any(debug_assertions, not(target_os = "vita")))]
+            assert!(live.is_some(), "world-free NPC draw reached live fallback at slot {id}");
+            let Some(live) = live else { report_world_free_npc_skip("fallback"); continue };
+            let actor = &live.actors[id];
+            let corpse = actor.ant.as_ref().is_some_and(|a| a.health <= 0.);
+            let dead = corpse || actor.resident.as_ref().is_some_and(|p|p.health()<=0.)
+                || actor.clock.as_ref().is_some_and(|p|p.health<=0.) || actor.imp.as_ref().is_some_and(|p|p.health<=0.)
+                || actor.chess.as_ref().is_some_and(|p|p.health<=0.) || actor.guard.as_ref().is_some_and(|p|p.health<=0.);
+            if (corpse && crate::draw_diagnostics::skip(crate::draw_diagnostics::Class::AntCorpses))
+                || (!dead && crate::draw_diagnostics::skip(crate::draw_diagnostics::Class::LiveActors)) { continue; }
+            #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+            if std::env::var_os("LOOKING_GLASS_ACTOR_CENSUS").is_some() && crate::sim_maps::probe::frame()==300 {
+                let d=&self.models[actor.model].data;
+                println!("[lg/actor-census] actor={id} identity={} model={} name={} dead={dead} bones={} surfaces={} triangles={} attachments={:?} position={:?} gathering={}",
+                    actor.skin_identity.census_id(),actor.spawn.model,actor.spawn.name,d.skeleton.bones.len(),d.skeleton.surfaces.len(),
+                    d.skeleton.surfaces.iter().map(|s|s.indices.len()/3).sum::<usize>(),d.meta.attachments,actor.position(),crate::character::skinning::overlap::gather_only());
+            }
+            let _identity = actor.skin_identity.scope();
+            let _skin_guard = crate::character::skinning::CullGuard::preserve(actor.electric > 0.);
+            if actor.ant.as_ref().is_some_and(|a| !a.enabled) { continue; }
+            #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+            if std::env::var_os("LOOKING_GLASS_NEAR_TRACE").is_some() && !crate::character::skinning::overlap::gather_only() {
+                println!("[lg/near-trace] frame={} actor={id} model={} dead={} distance={:.1}", crate::sim_maps::probe::frame(),
+                    actor.spawn.model, actor.ant.as_ref().is_some_and(|a| a.health <= 0.), actor.near_distance(camera));
+            }
+            if actor.guide.as_ref().is_some_and(|g| !g.visible()) {
+                continue;
+            }
+            #[cfg(feature="vita_renderer")]
+            if actor.near_culled(camera, crate::render::vita_renderer::config().actor_near_cull) { continue; }
+            if live.scene_hidden.contains(&actor.spawn.name) {
+                continue;
+            }
+            if live.registry_owns(actor) {
+                continue;
+            }
+            if live.legacy_owns(actor) { continue; }
+            if (actor.spawn.hidden
+                || (live.owns_pandemonium
+                    && matches!(actor.spawn.name.as_str(), "rope_cat" | "cards_cat")))
+                && !actor.story_visible
+            {
+                continue;
+            }
+            if !crate::character::skinning::overlap::gather_only() {
+            if let Some(p) = &actor.resident {
+                if let resident::Body::Card(g) = &p.body {
+                    if p.active {
+                        let art = self.card_art.entry(id).or_insert_with(|| {
+                            card_art::Art::new(self.models[actor.model].own_effect.as_ref())
+                        });
+                        if let Some(props) = self.card_props.get_mut(&g.kind) {
+                            art.shots(g, props, camera, atmosphere, fullbright, &self.material);
                         }
                     }
                 }
+                if let resident::Body::Wildlife(g) = &p.body {
+                    if p.active {
+                        self.wildlife_art
+                            .entry(id)
+                            .or_insert_with(|| wildlife_art::Art::new(&self.models[actor.model]))
+                            .draw(g, &self.models[actor.model], camera, atmosphere, &self.attack_fx);
+                    }
+                }
+                if let resident::Body::Magma(g) = &p.body {
+                    if p.active {
+                        self.magma_art
+                            .entry(id)
+                            .or_insert_with(|| {
+                                magma_art::Art::new(self.models[actor.model].own_effect.as_ref())
+                            })
+                            .draw(
+                                g,
+                                &self.models[actor.model].data,
+                                self.magma_fire.as_ref(),
+                                camera,
+                                atmosphere,
+                            );
+                    }
+                }
+                self.resident_effects.draw(
+                    id, &self.models[actor.model], p, camera, atmosphere, fullbright, &self.material,
+                );
+                if let resident::Body::Plant(plant) = &p.body {
+                    self.spores.retain(|(owner, serial), _| {
+                        *owner != id || plant.shots.iter().any(|s| s.serial == *serial)
+                    });
+                    for shot in &plant.shots {
+                        let transform = Transform {
+                            translation: shot.position,
+                            rotation: Quat::from_rotation_arc(Vec3::X, shot.direction),
+                        };
+                        if plant.kind == crate::plants::Kind::Rose {
+                            if let Some(prop) = &mut self.thorn {
+                                self.material.bind();
+                                prop.draw_frame(transform, 1., fullbright, shot.age, true);
+                            }
+                        } else if let Some(template) = &self.spore {
+                            let effect = self.spores
+                                .entry((id, shot.serial))
+                                .or_insert_with(|| template.fork());
+                            effect.draw(
+                                shot.age,
+                                1.,
+                                |at, _| Transform {
+                                    translation: shot.position
+                                        - shot.direction * 600. * (shot.age - at),
+                                    ..transform
+                                },
+                                |_, _, default| default,
+                                camera,
+                                atmosphere,
+                            );
+                        }
+                    }
+                }
+                p.effects(&mut self.acorn, &mut self.resident_diamond, fullbright);
+                self.material.bind();
             }
+            if let (Some(p), Some(prop)) = (&actor.clock, &mut self.clock_prop) {
+                let art = self.clock_art.entry(id).or_insert_with(|| {
+                    clock_art::Art::new(
+                        self.models[actor.model].own_effect.as_ref(),
+                        self.clock_trail.as_ref(),
+                    )
+                });
+                art.shots(p, prop, camera, atmosphere, fullbright, &self.material);
+            }
+            if let (Some(ant), Some(props)) = (&actor.ant, &mut self.ant_shots) {
+                for shot in &ant.shots {
+                    crate::ant::draw_shot(props, shot, fullbright);
+                }
+                crate::ant::draw_blasts(ant);
+                self.material.bind();
+            }
+            if let Some(p) = &actor.imp {
+                if let Some(parts) = &p.fragments {
+                    self.material.bind();
+                    for (prop, part) in self.imp_debris.iter_mut().zip(parts) {
+                        prop.draw(
+                            Transform {
+                                translation: part.position,
+                                rotation: part.rotation,
+                            },
+                            p.scale * (5. - p.time).clamp(0., 1.),
+                            fullbright,
+                        );
+                    }
+                }
+            }
+            if let Some(beam) = actor.chess.as_ref().and_then(|p| p.beam.as_ref()) {
+                self.attack_fx.lightning(beam.from, beam.to, camera, beam.age, 500., true, atmosphere);
+                self.material.bind();
+            }
+            } // effects are submitted once, after collect
+            let offset = actor.target() - camera;
+            if offset.length_squared() > 3500. * 3500.
+                || (offset.length_squared() > 200. * 200.
+                    && offset.normalize().dot(direction) < -0.3)
+            {
+                continue;
+            }
+            let model = &mut self.models[actor.model];
+            if let Some(p) = &actor.resident {
+                p.draw(model, fullbright, &self.material);
+                if p.active && !crate::character::skinning::overlap::gather_only() {
+                    if let resident::Body::Snark(g) = &p.body {
+                        if let Some(art) = self.resident_effects.snark_art.get_mut(&id) {
+                            art.smoke(g, &model.data, camera, atmosphere);
+                        }
+                    }
+                }
+                if p.active && !crate::character::skinning::overlap::gather_only() {
+                    if let resident::Body::Card(g) = &p.body {
+                        if let Some(art) = self.card_art.get_mut(&id) {
+                            art.charge(g, &model.data, camera, atmosphere);
+                        }
+                    }
+                }
+                self.material.bind();
+                continue;
+            }
+            if let Some(p) = &actor.clock {
+                model.draw_clock(p, fullbright, &self.material);
+                if !crate::character::skinning::overlap::gather_only() {
+                if let Some(art) = self.clock_art.get_mut(&id) {
+                    art.steam(p, &model.data, camera, atmosphere);
+                }
+                }
+                self.material.bind();
+                continue;
+            }
+            if let Some(p) = &actor.imp {
+                model.draw_imp(p, fullbright, &self.material);
+                continue;
+            }
+            if let Some(piece) = &actor.chess {
+                model.draw_chess(piece, fullbright, &self.material);
+                continue;
+            }
+            if let Some(ant) = &actor.ant {
+                model.draw_ant(ant, fullbright, &self.material);
+                continue;
+            }
+            if let Some(guard) = &actor.guard {
+                model.draw_guard(guard, fullbright, camera, atmosphere, &self.material, &PoseOverrides::default());
+                continue;
+            }
+            // This branch is exclusively ambient rendering: all gameplay rigs
+            // returned above, and safe() excludes every attachment/effect consumer.
+            let transform = Transform {
+                translation: actor.position(),
+                rotation: Quat::from_rotation_z(actor.yaw),
+            };
+            let decision = if crate::character::skinning::overlap::ready() {
+                self.visual_lod.get(&id).map_or(visual_lod::Decision::Exact, |lod| lod.prepared)
+            } else if lod_enabled {
+                let safe = visual_lod::safe(actor, &model.data);
+                let radius = model.data.visual_radius * model.data.def.scale * actor.spawn.scale;
+                let outside = config.anim_cull && safe && crate::render::outside_bounds(
+                    transform.translation - Vec3::splat(radius),
+                    transform.translation + Vec3::splat(radius));
+                #[cfg(target_os = "vita")]
+                { lod_counts[4] += u64::from(!safe); }
+                self.visual_lod.entry(id).or_default().decide(config, safe, outside,
+                    offset.length_squared(), transform, actor.spawn.scale, fullbright)
+            } else { visual_lod::Decision::Exact };
+            if crate::character::skinning::overlap::gather_only() {
+                self.visual_lod.entry(id).or_default().prepared = decision;
+            }
+            #[cfg(target_os = "vita")]
+            { lod_counts[match decision {
+                visual_lod::Decision::Exact => 0, visual_lod::Decision::Hidden => 1,
+                visual_lod::Decision::Refresh => 2, visual_lod::Decision::Reuse => 3,
+            }] += 1; }
+            match decision {
+                visual_lod::Decision::Hidden => continue,
+                visual_lod::Decision::Reuse => {
+                    for mesh in &self.visual_lod[&id].meshes { crate::render_fx::skin(mesh); }
+                    continue;
+                }
+                _ => {}
+            }
+            let d = &model.data;
+            let idle = actor
+                .spawn
+                .animation
+                .as_ref()
+                .filter(|n| d.clips.contains_key(*n))
+                .unwrap_or(&d.idle);
+            let idle = if let Some(g) = &actor.guide {
+                g.clip()
+            } else if actor.walk.is_some() {
+                "walk"
+            } else {
+                idle
+            };
+            let (mut local, clip, at, looping) = d.performance(
+                idle,
+                actor.greeting > 0. || actor.speaking,
+                actor.ending_talk,
+                actor.time,
+            );
+            actor.watch.apply(&d.skeleton, &mut local);
+            let animation = &d.clips[&clip];
+            let visual = d.events.visual(
+                &clip,
+                at,
+                animation.duration(),
+                animation.frame_time,
+                looping,
+            );
+            let transform = Transform {
+                translation: actor.position(),
+                rotation: Quat::from_rotation_z(actor.yaw),
+            };
+            let _consumer = crate::character::skinning::CullGuard::reason(
+                crate::character::skinning::overlap::single_preparing() && decision == visual_lod::Decision::Refresh,crate::phase_census::AMBIENT);
+            model.draw_pose(
+                &local,
+                actor.mouth,
+                actor.time,
+                true,
+                transform,
+                actor.spawn.scale,
+                fullbright,
+                true,
+                &visual,
+                None,
+            );
+            if decision == visual_lod::Decision::Refresh && !crate::character::skinning::overlap::gather_only() {
+                self.visual_lod.get_mut(&id).expect("ambient cache").capture(model);
+            }
+            model.draw_effects(
+                &clip,
+                at,
+                looping,
+                transform,
+                actor.spawn.scale,
+                camera,
+                atmosphere,
+            );
+            model.draw_electric(actor.electric);
+            self.material.bind();
         }
+        #[cfg(target_os = "vita")]
+        crate::frame_profile::counts(&[
+            ("characters_lod_exact",lod_counts[0]),("characters_lod_culled",lod_counts[1]),
+            ("characters_lod_refreshed",lod_counts[2]),("characters_lod_reused",lod_counts[3]),
+            // Whole ambient actor passes, not surface layers or GPU draw calls.
+            ("characters_lod_layer_passes_skipped",lod_counts[1]),
+            ("characters_lod_submit_passes_skipped",lod_counts[1]),
+            ("vita_actor_frustum_skipped",lod_counts[1]),
+            ("characters_lod_protected",lod_counts[4]),
+        ]);
+        if !crate::character::skinning::overlap::gather_only() { gl_use_default_material(); }
     }
-    /// Idempotent map-driven spawns, shared by play and route verification.
-    pub fn activate_levels(&mut self, levels: &[crate::level::Slot]) {
-        let ids: BTreeSet<_> = levels.iter().flat_map(|l| l.ctl.active_npcs()).collect();
-        for a in &mut self.actors {
-            if a.spawn.clock_spawn.is_some_and(|id| ids.contains(&id)) {
-                if let Some(c) = &mut a.clock { c.active = true; c.spawn_delay = None; }
-            }
+}
+struct ActorCaptureView {
+    camera: Vec3,
+    direction: Vec3,
+    skip_live: bool,
+    skip_ant_corpses: bool,
+    #[cfg(feature = "vita_renderer")]
+    near_cull: f32,
+}
+
+const MAX_SNAPSHOT_ACTORS: usize = 1024;
+
+impl NpcSim {
+    /// The owner supplies the generation of the registry this capture targets.
+    pub(crate) fn capture_owned_slots(&self, generation: u64) -> OwnedSlots {
+        OwnedSlots { generation, slots: owned_slots(&self.actors).collect() }
+    }
+
+    fn extract_actors(&self, view: ActorCaptureView) -> ActorInputs {
+        let ActorCaptureView { camera, direction, skip_live, skip_ant_corpses, .. } = view;
+        const MAX_BONES: usize = 65536;
+        const MAX_EFFECTS: usize = 16384;
+        let mut inputs = ActorInputs::default();
+        let mut bones = 0;
+        let mut effects = 0;
+        for (slot, actor) in self.actors.iter().enumerate() {
+            let Some(ant) = &actor.ant else { continue };
+            let corpse = ant.health <= 0.;
+            let mut visible = ant.enabled && !self.scene_hidden.contains(&actor.spawn.name)
+                && !self.registry_owns(actor) && !self.legacy_owns(actor)
+                && (!(actor.spawn.hidden || (self.owns_pandemonium
+                    && matches!(actor.spawn.name.as_str(), "rope_cat" | "cards_cat")))
+                    || actor.story_visible)
+                && !((corpse && skip_ant_corpses)
+                    || (!corpse && skip_live));
+            #[cfg(feature="vita_renderer")]
+            { visible &= !actor.near_culled(camera, view.near_cull); }
+            visible &= !actor.guide.as_ref().is_some_and(|g| !g.visible());
+            let offset = actor.target()-camera;
+            let body_visible = visible && !(offset.length_squared()>3500.*3500.
+                || (offset.length_squared()>200.*200. && offset.normalize().dot(direction)< -0.3));
+            let d = self.models[actor.model].as_ref();
+            let scale = ant.visual_scale(d);
+            let body = if body_visible && scale>0. {
+                let clip = &d.clips[ant.clip()];
+                let time = if ant.frozen { ant.time.min(clip.frame_time*5.) } else { ant.time };
+                bones += d.skeleton.bones.len();
+                if bones > MAX_BONES { inputs.overflow = true; break; }
+                let local = clip.sample(time, ant.loops());
+                let pose = d.mouth_rig.pose(&d.skeleton, &local, 0., None);
+                let scales = Vec::new();
+                Some(AntBodyInput { pose, scales,
+                    visual: d.events.visual(ant.clip(),time,clip.duration(),clip.frame_time,ant.loops()),
+                    transform: Transform { translation: ant.feet, rotation: Quat::from_rotation_z(ant.yaw) },
+                    scale, time: ant.time, alive: !corpse, frozen: ant.frozen, electric: ant.electric })
+            } else { None };
+            effects += ant.shots.len()+ant.blasts.len();
+            if effects>MAX_EFFECTS || inputs.ants.len()>=MAX_SNAPSHOT_ACTORS { inputs.overflow=true; break; }
+            inputs.ants.push(AntInput { slot, visible, corpse, preserve: actor.electric>0., body,
+                shots: if visible { ant.shots.clone() } else { Vec::new() },
+                blasts: if visible { ant.blasts.clone() } else { Vec::new() } });
         }
+        for (slot, actor) in self.actors.iter().enumerate().filter(|(_,a)| a.snapshot_ambient()) {
+            if inputs.overflow { break; }
+            let mut visible = !skip_live
+                && !self.scene_hidden.contains(&actor.spawn.name) && !self.registry_owns(actor)
+                && !self.legacy_owns(actor) && (!(actor.spawn.hidden || (self.owns_pandemonium
+                    && matches!(actor.spawn.name.as_str(), "rope_cat"|"cards_cat"))) || actor.story_visible);
+            #[cfg(feature="vita_renderer")]
+            { visible &= !actor.near_culled(camera, view.near_cull); }
+            let offset = actor.target()-camera;
+            visible &= !(offset.length_squared()>3500.*3500.
+                || (offset.length_squared()>200.*200. && offset.normalize().dot(direction)< -0.3));
+            let d = self.models[actor.model].as_ref();
+            let mut clip_slot = 0; let mut sample_time = 0.; let mut looping = false;
+            let body = if visible {
+                if d.skeleton.bones.len() > MAX_BONES.saturating_sub(bones) {
+                    inputs.overflow = true; break;
+                }
+                let idle = actor.spawn.animation.as_ref().filter(|n| d.clips.contains_key(*n)).unwrap_or(&d.idle);
+                let idle = if actor.walk.is_some() { "walk" } else { idle };
+                let (mut local, clip, at, loops) = d.performance(idle, actor.greeting>0. || actor.speaking,
+                    actor.ending_talk, actor.time);
+                actor.watch.apply(&d.skeleton, &mut local);
+                let animation = &d.clips[&clip];
+                clip_slot = d.clips.keys().position(|k| *k == clip).expect("resident ambient clip");
+                sample_time = at; looping = loops;
+                bones += d.skeleton.bones.len();
+                if bones>MAX_BONES { inputs.overflow=true; break; }
+                let pose = d.mouth_rig.pose(&d.skeleton, &local, actor.mouth, None);
+                let scales = Vec::new();
+                Some(AntBodyInput { pose, scales,
+                    visual: d.events.visual(&clip, at, animation.duration(), animation.frame_time, loops),
+                    transform: Transform { translation: actor.position(), rotation: Quat::from_rotation_z(actor.yaw) },
+                    scale: actor.spawn.scale, time: actor.time, alive: true, frozen: false, electric: actor.electric })
+            } else { None };
+            if inputs.ambient.len()+inputs.ants.len()>=MAX_SNAPSHOT_ACTORS { inputs.overflow=true; break; }
+            inputs.ambient.push(AmbientInput { slot, visible, preserve: actor.electric>0., body,
+                clip: clip_slot, sample_time, looping, lod_safe: visual_lod::safe(actor,d),
+                distance_squared: offset.length_squared(), radius: d.visual_radius*d.def.scale*actor.spawn.scale });
+        }
+        for (slot, actor) in self.actors.iter().enumerate().filter(|(_,a)| a.snapshot_resident()) {
+            if inputs.overflow { break; }
+            let p = actor.resident.as_ref().expect("selected resident");
+            // Check the model and bounded resident state before animation lookup or copying.
+            if let resident::Body::Snark(b) = &p.body {
+                if b.validate().is_err() || b.kind.model()!=actor.spawn.model || !self.models[actor.model].clips.contains_key(b.clip()) { inputs.overflow=true; break; }
+            }
+            if let resident::Body::Wildlife(b) = &p.body {
+                if b.validate().is_err() || b.kind.model()!=actor.spawn.model || !self.models[actor.model].clips.contains_key(b.clip()) { inputs.overflow=true; break; }
+            }
+            let dead = p.health() <= 0.;
+            let mut visible = (dead || !skip_live)
+                && !self.scene_hidden.contains(&actor.spawn.name) && !self.registry_owns(actor)
+                && !self.legacy_owns(actor) && (!(actor.spawn.hidden || (self.owns_pandemonium
+                    && matches!(actor.spawn.name.as_str(), "rope_cat" | "cards_cat"))) || actor.story_visible);
+            #[cfg(feature="vita_renderer")]
+            { visible &= !actor.near_culled(camera, view.near_cull); }
+            let d = self.models[actor.model].as_ref();
+            let offset = actor.target() - camera;
+            let body_in_view = !(offset.length_squared() > 3500.*3500.
+                || (offset.length_squared() > 200.*200. && offset.normalize().dot(direction) < -0.3));
+            if matches!(&p.body, resident::Body::Insect(_))
+                || matches!(&p.body, resident::Body::Snark(s) if s.kind == crate::snark::Kind::Water)
+            {
+                if let resident::Body::Insect(insect) = &p.body {
+                    if insect.kind.model() != actor.spawn.model || !d.clips.contains_key(insect.clip()) {
+                        inputs.overflow = true;
+                        break;
+                    }
+                }
+                inputs.residents.push(ResidentInput {
+                    slot, visible, preserve: actor.electric > 0., attached: true, body: None,
+                    effects: ResidentEffects::Flora {
+                        resident: (visible && p.active).then(|| Box::new(p.clone())),
+                        body_visible: body_in_view,
+                    },
+                });
+                continue;
+            }
+            let body_visible = visible && p.active && body_in_view;
+            let (clip, time, looping, scale, attached, frozen, electric) = match &p.body {
+                resident::Body::Ladybug(b) => {
+                    let (clip,time,loops) = b.clip(d.ladybug_timing.expect("resident Ladybug timing"));
+                    (clip,time,loops,b.visual_scale(),b.carrying,b.frozen,b.electric)
+                }
+                resident::Body::Plant(b) => (b.clip(),b.sample_time(d),b.loops(),b.visual_scale(d),true,b.frozen,0.),
+                resident::Body::Snark(b) => (b.clip(),b.sample_time(),b.loops(),b.visual_scale(d),true,b.frozen,0.),
+                resident::Body::Wildlife(b) => (b.clip(),b.sample_time(d),b.loops(),b.visual_scale(d),true,b.frozen,0.),
+                _ => unreachable!("selected resolved resident"),
+            };
+            let body = if body_visible && scale > 0. {
+                if d.skeleton.bones.len() > MAX_BONES.saturating_sub(bones) { inputs.overflow=true; break; }
+                bones += d.skeleton.bones.len();
+                let Some(animation)=d.clips.get(clip) else {inputs.overflow=true;break;}; let local = animation.sample(time, looping);
+                let pose = d.mouth_rig.pose(&d.skeleton, &local, 0., None);
+                let scales = Vec::new();
+                Some(AntBodyInput { pose, scales, visual: d.events.visual(clip,time,animation.duration(),animation.frame_time,looping),
+                    transform: Transform { translation:p.position(), rotation:Quat::from_rotation_z(p.yaw()) },
+                    scale, time, alive: p.health() > 0., frozen, electric })
+            } else { None };
+            // Bound every effect vector before copying. Ladybug effects require
+            // active residency; Plant projectiles precede that gate in the legacy path.
+            let effect_input = match &p.body {
+                // BiteOnly has no projectiles, tongue, or smoke. Validation above
+                // excludes ranged states.
+                resident::Body::Snark(_) => ResidentEffects::BiteOnly,
+                resident::Body::Wildlife(b) => ResidentEffects::Wildlife { active:p.active, input:wildlife_art::Input::capture(b,d) },
+                resident::Body::Ladybug(b) => {
+                    let count = if visible && p.active { b.acorns.len().saturating_add(b.bursts.len()) } else { 0 };
+                    if count > MAX_EFFECTS.saturating_sub(effects) { inputs.overflow=true; break; }
+                    effects += count;
+                    ResidentEffects::Ladybug { active: p.active,
+                        acorns: if visible && p.active { b.acorns.iter().map(|a|(a.position,a.age)).collect() } else { Vec::new() },
+                        bursts: if visible && p.active { b.bursts.iter().map(|b|(b.position,b.age)).collect() } else { Vec::new() },
+                    }
+                }
+                resident::Body::Plant(b) => {
+                    let count = if visible { b.shots.len() } else { 0 };
+                    if count > MAX_EFFECTS.saturating_sub(effects) { inputs.overflow=true; break; }
+                    effects += count;
+                    ResidentEffects::Plant { kind:b.kind, shots:if visible { b.shots.clone() } else { Vec::new() } }
+                }
+                _ => unreachable!("selected resolved resident"),
+            };
+            inputs.residents.push(ResidentInput { slot, visible, preserve:actor.electric>0., attached, body, effects:effect_input });
+        }
+        inputs
     }
     pub fn update(&mut self, dt: f32, world: &World, eye: Vec3) -> combat::Feedback {
         let _owner = crate::phase_census::owner(crate::phase_census::Owner::Npc);
@@ -2798,7 +3957,7 @@ impl Npcs {
         }
         self.companion_routes
             .update(&mut self.actors, dt, world, eye, |index, clip| {
-                let d = &self.models[index].data;
+                let d = self.models[index].as_ref();
                 d.clips[clip].distance * d.def.scale / d.clips[clip].duration()
             });
         {
@@ -2954,13 +4113,13 @@ impl Npcs {
             else if actor.guard.is_some() { profile::Kind::Guard }
             else { profile::Kind::Ambient };
             let _controller = profile::controller(kind, &world.npc_profile, true);
-            actor.ground(dt, world, &self.models[actor.model].data.meta);
+            actor.ground(dt, world, &self.models[actor.model].meta);
             if let Some(p) = &mut actor.resident {
                 p.update(
                     dt,
                     world,
                     eye,
-                    &self.models[actor.model].data,
+                    self.models[actor.model].as_ref(),
                     &mut feedback,
                 );
                 actor.yaw = p.yaw();
@@ -2971,7 +4130,7 @@ impl Npcs {
                     dt,
                     world,
                     eye,
-                    &self.models[actor.model].data,
+                    self.models[actor.model].as_ref(),
                     &mut feedback,
                 );
                 actor.yaw = p.yaw;
@@ -2982,7 +4141,7 @@ impl Npcs {
                     dt,
                     world,
                     eye,
-                    &self.models[actor.model].data,
+                    self.models[actor.model].as_ref(),
                     &mut feedback,
                 );
                 actor.yaw = p.yaw;
@@ -2993,7 +4152,7 @@ impl Npcs {
                     dt,
                     world,
                     eye,
-                    &self.models[actor.model].data,
+                    self.models[actor.model].as_ref(),
                     &mut feedback,
                 );
                 actor.yaw = piece.yaw;
@@ -3004,7 +4163,7 @@ impl Npcs {
                     dt,
                     world,
                     eye,
-                    &self.models[actor.model].data,
+                    self.models[actor.model].as_ref(),
                     &mut feedback,
                 );
                 actor.yaw = ant.yaw;
@@ -3015,7 +4174,7 @@ impl Npcs {
                     dt,
                     world,
                     eye,
-                    self.models[actor.model].data.combat.unwrap(),
+                    self.models[actor.model].combat.unwrap(),
                 );
                 actor.yaw = guard.yaw;
                 feedback.summon_hits.extend(events.summon_hits);
@@ -3033,7 +4192,7 @@ impl Npcs {
                 && actor.greeting <= 0.
                 && !actor.speaking
             {
-                let clip = &self.models[actor.model].data.clips["walk"];
+                let clip = &self.models[actor.model].clips["walk"];
                 ambient::advance(
                     actor,
                     dt,
@@ -3051,6 +4210,261 @@ impl Npcs {
             crate::sim_maps::probe::npc_decision("actor_frame", actor);
         }
         feedback
+    }
+    pub(crate) fn check_school2_ownership(&self) -> Result<()> {
+        let diamonds = self
+            .actors
+            .iter()
+            .filter(|a| a.spawn.model == "cardguard_diamond")
+            .collect::<Vec<_>>();
+        ensure!(
+            self.owns_school2
+                && diamonds.len() == 6
+                && diamonds.iter().all(|a| self.registry_owns(a)),
+            "School2 decorative Diamonds overlap combat ownership"
+        );
+        Ok(())
+    }
+    /// Whether a registered controller owns this placed actor.
+    fn registry_owns(&self, actor: &Actor) -> bool {
+        (self.owns_village
+            && matches!(
+                actor.spawn.name.as_str(),
+                "rabbit_actor1"
+                    | "cat_hole1"
+                    | "knife_cat"
+                    | "cat_shrink1"
+                    | "essence_cat"
+                    | "bridge_cat"
+            ))
+            || (self.owns_ladybugs && crate::pool::cinema::owns(&actor.spawn.name))
+            || (self.owns_school_first && crate::school::cinema::owns(&actor.spawn.name))
+            || (self.owns_school2 && (actor.spawn.model == "cardguard_diamond" || actor.spawn.name == "dice_cat"))
+            || self
+                .levels
+                .iter()
+                .any(|r| (r.owns_npc)(&actor.spawn.name, &actor.spawn.model))
+    }
+    fn legacy_owns(&self, actor: &Actor) -> bool {
+        (self.owns_duchess
+                && matches!(
+                    actor.spawn.name.as_str(),
+                    "billthelizard" | "mockturtle" | "walkyrocks"
+                ))
+                || (self.owns_ladybugs && actor.spawn.model == "c_ladybug")
+                || (self.owns_pandemonium
+                    && (actor.spawn.model.starts_with("cardguard_")
+                        || matches!(
+                            actor.spawn.name.as_str(),
+                            "airship_gnome"
+                                | "elder_gnome1"
+                                | "leave_gnome"
+                                | "minecart_torchgnome1"
+                                | "minecart_torchgnome2"
+                                | "minecart_torchgnome3"
+                        )))
+    }
+    pub fn scene_hidden(&mut self, names: &[&str]) {
+        self.scene_hidden = names.iter().map(|n| n.to_string()).collect();
+    }
+    pub fn scene_place(&mut self, name: &str, pose: Transform) {
+        if let Some(a) = self.actors.iter_mut().find(|a| a.spawn.name == name) {
+            // Rebuild the location after old saves without resetting the actor's
+            // later turns toward Alice every frame at an unchanged marker.
+            if a.footing
+                .is_none_or(|p| p.distance_squared(pose.translation) > 1.)
+            {
+                a.yaw = pose.rotation.to_euler(EulerRot::ZYX).0;
+            }
+            a.footing = Some(pose.translation);
+            a.falling = 0.;
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            actors: self.actors.clone(),
+            greetings: self.greetings,
+            garden: self.garden.as_ref().map(|g|g.saved.clone()),
+        }
+    }
+    pub fn notarget(&mut self, value: bool) {
+        for p in self.actors.iter_mut().filter_map(|a| a.resident.as_mut()) {
+            p.notarget(value);
+        }
+        for p in self.actors.iter_mut().filter_map(|a| a.clock.as_mut()) {
+            p.notarget = value;
+        }
+        for p in self.actors.iter_mut().filter_map(|a| a.imp.as_mut()) {
+            p.notarget = value;
+        }
+        for p in self.actors.iter_mut().filter_map(|a| a.chess.as_mut()) {
+            p.notarget = value;
+        }
+        for ant in self.actors.iter_mut().filter_map(|a| a.ant.as_mut()) {
+            ant.notarget = value;
+        }
+        for guard in self.actors.iter_mut().filter_map(|a| a.guard.as_mut()) {
+            guard.notarget = value;
+        }
+    }
+    pub fn lights(&self) -> Vec<crate::lighting::Light> {
+        self.actors
+            .iter()
+            .filter_map(|a| a.clock.as_ref())
+            .flat_map(|p| p.fists.iter())
+            .map(|f| crate::lighting::Light {
+                position: f.position,
+                color: vec3(1., 0.7, 0.2),
+                radius: 170.,
+                only_models: false,
+                flare: false,
+            })
+            .chain(
+                self.actors
+                    .iter()
+                    .filter_map(|a| a.resident.as_ref())
+                    .filter(|p| p.active)
+                    .flat_map(|p| match &p.body {
+                        resident::Body::Insect(g)
+                            if g.kind == crate::burrow::Kind::Larva && g.health > 0. =>
+                        {
+                            vec![crate::lighting::Light {
+                                position: g.feet + Vec3::Z * 10.,
+                                color: vec3(0.25, 0., 0.),
+                                radius: 50.,
+                                only_models: false,
+                                flare: false,
+                            }]
+                        }
+                        resident::Body::Card(g) => g
+                            .shots
+                            .iter()
+                            .map(|s| crate::lighting::Light {
+                                position: s.position,
+                                color: vec3(1., 0.2, 0.2),
+                                radius: 150.,
+                                only_models: false,
+                                flare: false,
+                            })
+                            .collect::<Vec<_>>(),
+                        resident::Body::Snark(g) if g.kind == crate::snark::Kind::Fire => g
+                            .shots
+                            .iter()
+                            .map(|s| crate::lighting::Light {
+                                position: s.position,
+                                color: vec3(1., 0.45, 0.1),
+                                radius: 120.,
+                                only_models: false,
+                                flare: false,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    }),
+            )
+            .chain(self.actors.iter().filter_map(|a| {
+                let p = a.resident.as_ref()?;
+                let resident::Body::Card(g) = &p.body else {
+                    return None;
+                };
+                let data = self.models[a.model].as_ref();
+                if !p.active
+                    || g.kind != crate::cards::Kind::Heart
+                    || !(g.phase == crate::cards::Phase::Charge
+                        || (g.phase == crate::cards::Phase::Slam
+                            && g.time < 44. * data.clips[g.clip()].frame_time))
+                {
+                    return None;
+                }
+                let tag = crate::clockwork::Rig::tag(data, g.clip(), g.time, "tag_barrel");
+                Some(crate::lighting::Light {
+                    position: g.feet + Quat::from_rotation_z(g.yaw) * tag.translation * g.scale,
+                    color: vec3(1., 0.2, 0.2),
+                    radius: 100.,
+                    only_models: false,
+                    flare: false,
+                })
+            }))
+            .collect()
+    }
+    pub fn chess_threats(&mut self, threatens: impl Fn(&combat::Target) -> bool) {
+        for (id, actor) in self.actors.iter_mut().enumerate() {
+            if let Some(p) = &mut actor.chess {
+                p.threatened(threatens(&p.target(id)));
+            }
+        }
+    }
+    pub fn summon(&mut self, target: Option<combat::Target>) {
+        for a in &mut self.actors {
+            if let Some(p) = &mut a.resident {
+                p.opponents().summon = target;
+            }
+            if let Some(p) = &mut a.clock {
+                p.opponents.summon = target;
+            }
+            if let Some(p) = &mut a.imp {
+                p.opponents.summon = target;
+            }
+            if let Some(p) = &mut a.chess {
+                p.opponents.summon = target;
+            }
+            if let Some(ant) = &mut a.ant {
+                ant.opponents.summon = target;
+            }
+            if let Some(g) = &mut a.guard {
+                g.opponents.summon = target;
+            }
+        }
+    }
+    pub fn provoke_summon(&mut self, id: usize) {
+        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.resident.as_mut()) {
+            p.opponents().demon = true;
+        }
+        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.clock.as_mut()) {
+            p.opponents.demon = true;
+        }
+        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.imp.as_mut()) {
+            p.opponents.demon = true;
+        }
+        if let Some(p) = self.actors.get_mut(id).and_then(|a| a.chess.as_mut()) {
+            p.opponents.demon = true;
+        }
+        if let Some(a) = self.actors.get_mut(id).and_then(|a| a.ant.as_mut()) {
+            a.opponents.demon = true;
+        }
+        if let Some(g) = self.actors.get_mut(id).and_then(|a| a.guard.as_mut()) {
+            g.opponents.demon = true;
+        }
+    }
+    pub fn companions(&self) -> Vec<crate::level::CompanionContact> {
+        self.actors.iter().filter_map(|a| a.guide.as_ref().map(|g| crate::level::CompanionContact {
+            name: a.spawn.name.clone(), feet: a.position(), half: vec3(16.,16.,30.)*a.spawn.scale,
+            visible: g.visible(), holding: g.holding(),
+        })).collect()
+    }
+    pub fn level_patrols(&mut self, levels: &[crate::level::Slot]) {
+        for level in levels {
+            let names = level.ctl.patrols();
+            if names.is_empty() { continue; }
+            for actor in &mut self.actors {
+                if names.contains(&actor.spawn.name.as_str()) {
+                    if let Some(resident) = &mut actor.resident {
+                        if let resident::Body::Ladybug(b) = &mut resident.body {
+                            b.patrol_started = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// Idempotent map-driven spawns, shared by play and route verification.
+    pub fn activate_levels(&mut self, levels: &[crate::level::Slot]) {
+        let ids: BTreeSet<_> = levels.iter().flat_map(|l| l.ctl.active_npcs()).collect();
+        for a in &mut self.actors {
+            if a.spawn.clock_spawn.is_some_and(|id| ids.contains(&id)) {
+                if let Some(c) = &mut a.clock { c.active = true; c.spawn_delay = None; }
+            }
+        }
     }
     pub fn loot_sources(&self) -> Vec<crate::loot::Source> {
         if self.owns_pandemonium {
@@ -3158,7 +4572,7 @@ impl Npcs {
                 {
                     return None;
                 }
-                let (min, max) = self.models[a.model].data.meta.bounds?;
+                let (min, max) = self.models[a.model].meta.bounds?;
                 Some(combat::Target {
                     id,
                     center: a.position() + (min + max) * (0.5 * a.spawn.scale),
@@ -3277,7 +4691,7 @@ impl Npcs {
                     && !self.registry_owns(a)
                     && !self.scene_hidden.contains(name)
                     && (!a.spawn.hidden || a.story_visible)
-                    && self.models[a.model].data.friendly
+                    && self.models[a.model].friendly
                     && a.can_greet(world, eye, aim)
             })
             .map(Actor::target)
@@ -3318,7 +4732,7 @@ impl Npcs {
             // Advancing the last line must not immediately reopen the whole
             // conversation. Keep this existing saved cooldown armed throughout
             // automatic conversations too; gameplay time releases it afterward.
-            if self.owns_village && actor.story_visible && self.models[actor.model].data.friendly {
+            if self.owns_village && actor.story_visible && self.models[actor.model].friendly {
                 actor.cooldown = actor.cooldown.max(1.);
             }
             let speaking = speaker == Some(actor.spawn.name.as_str());
@@ -3337,376 +4751,7 @@ impl Npcs {
             }
         }
     }
-    pub fn draw(
-        &mut self,
-        camera: Vec3,
-        direction: Vec3,
-        atmosphere: &Atmosphere,
-        fullbright: bool,
-    ) {
-        #[cfg(feature="vita_renderer")]
-        let render_config={let mut c=crate::vita_sim::effective().clone();c.anim_cull|=crate::render_fx::retained_active()&&crate::render::vita_renderer::config().actor_frustum_cull;c};
-        #[cfg(feature="vita_renderer")]
-        let config=&render_config;
-        #[cfg(not(feature="vita_renderer"))]
-        let config = crate::vita_sim::effective();
-        let lod_enabled = config.anim_cull || config.anim_far_every > 1;
-        #[cfg(target_os = "vita")]
-        let mut lod_counts = [0u64; 5];
-        self.material.atmosphere(atmosphere, camera);
-        self.material.bind();
-        for (id, actor) in self.actors.iter().enumerate() {
-            let corpse = actor.ant.as_ref().is_some_and(|a| a.health <= 0.);
-            let dead = corpse || actor.resident.as_ref().is_some_and(|p|p.health()<=0.)
-                || actor.clock.as_ref().is_some_and(|p|p.health<=0.) || actor.imp.as_ref().is_some_and(|p|p.health<=0.)
-                || actor.chess.as_ref().is_some_and(|p|p.health<=0.) || actor.guard.as_ref().is_some_and(|p|p.health<=0.);
-            if (corpse && crate::draw_diagnostics::skip(crate::draw_diagnostics::Class::AntCorpses))
-                || (!dead && crate::draw_diagnostics::skip(crate::draw_diagnostics::Class::LiveActors)) { continue; }
-            #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
-            if std::env::var_os("LOOKING_GLASS_ACTOR_CENSUS").is_some() && crate::sim_maps::probe::frame()==300 {
-                let d=&self.models[actor.model].data;
-                println!("[lg/actor-census] actor={id} identity={} model={} name={} dead={dead} bones={} surfaces={} triangles={} attachments={:?} position={:?} gathering={}",
-                    actor.skin_identity.census_id(),actor.spawn.model,actor.spawn.name,d.skeleton.bones.len(),d.skeleton.surfaces.len(),
-                    d.skeleton.surfaces.iter().map(|s|s.indices.len()/3).sum::<usize>(),d.meta.attachments,actor.position(),crate::character::skinning::overlap::gather_only());
-            }
-            let _identity = actor.skin_identity.scope();
-            let _skin_guard = crate::character::skinning::CullGuard::preserve(actor.electric > 0.);
-            if actor.ant.as_ref().is_some_and(|a| !a.enabled) { continue; }
-            #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
-            if std::env::var_os("LOOKING_GLASS_NEAR_TRACE").is_some() && !crate::character::skinning::overlap::gather_only() {
-                println!("[lg/near-trace] frame={} actor={id} model={} dead={} distance={:.1}", crate::sim_maps::probe::frame(),
-                    actor.spawn.model, actor.ant.as_ref().is_some_and(|a| a.health <= 0.), actor.near_distance(camera));
-            }
-            if actor.guide.as_ref().is_some_and(|g| !g.visible()) {
-                continue;
-            }
-            #[cfg(feature="vita_renderer")]
-            if actor.near_culled(camera, crate::render::vita_renderer::config().actor_near_cull) { continue; }
-            if self.scene_hidden.contains(&actor.spawn.name) {
-                continue;
-            }
-            if self.registry_owns(actor) {
-                continue;
-            }
-            if (self.owns_duchess
-                && matches!(
-                    actor.spawn.name.as_str(),
-                    "billthelizard" | "mockturtle" | "walkyrocks"
-                ))
-                || (self.owns_ladybugs && actor.spawn.model == "c_ladybug")
-                || (self.owns_pandemonium
-                    && (actor.spawn.model.starts_with("cardguard_")
-                        || matches!(
-                            actor.spawn.name.as_str(),
-                            "airship_gnome"
-                                | "elder_gnome1"
-                                | "leave_gnome"
-                                | "minecart_torchgnome1"
-                                | "minecart_torchgnome2"
-                                | "minecart_torchgnome3"
-                        )))
-            {
-                continue;
-            }
-            if (actor.spawn.hidden
-                || (self.owns_pandemonium
-                    && matches!(actor.spawn.name.as_str(), "rope_cat" | "cards_cat")))
-                && !actor.story_visible
-            {
-                continue;
-            }
-            if !crate::character::skinning::overlap::gather_only() {
-            if let Some(p) = &actor.resident {
-                if let resident::Body::Card(g) = &p.body {
-                    if p.active {
-                        let art = self.card_art.entry(id).or_insert_with(|| {
-                            card_art::Art::new(self.models[actor.model].own_effect.as_ref())
-                        });
-                        if let Some(props) = self.card_props.get_mut(&g.kind) {
-                            art.shots(g, props, camera, atmosphere, fullbright, &self.material);
-                        }
-                    }
-                }
-                if let resident::Body::Wildlife(g) = &p.body {
-                    if p.active {
-                        self.wildlife_art
-                            .entry(id)
-                            .or_insert_with(|| wildlife_art::Art::new(&self.models[actor.model]))
-                            .draw(g, &self.models[actor.model], camera, atmosphere, &self.attack_fx);
-                    }
-                }
-                if let resident::Body::Magma(g) = &p.body {
-                    if p.active {
-                        self.magma_art
-                            .entry(id)
-                            .or_insert_with(|| {
-                                magma_art::Art::new(self.models[actor.model].own_effect.as_ref())
-                            })
-                            .draw(
-                                g,
-                                &self.models[actor.model].data,
-                                self.magma_fire.as_ref(),
-                                camera,
-                                atmosphere,
-                            );
-                    }
-                }
-                if let resident::Body::Insect(g) = &p.body {
-                    if p.active {
-                        self.burrow_art
-                            .entry(id)
-                            .or_insert_with(|| {
-                                burrow_art::Art::new(self.models[actor.model].own_effect.as_ref())
-                            })
-                            .draw(g, &self.models[actor.model].data, camera, atmosphere);
-                    }
-                }
-                if let resident::Body::Snark(g) = &p.body {
-                    if p.active {
-                        let art = self.snark_art.entry(id).or_insert_with(|| {
-                            snark_art::Art::new(self.models[actor.model].own_effect.as_ref())
-                        });
-                        if let Some(props) = self.snark_props.get_mut(&g.kind) {
-                            art.shots(g, props, camera, atmosphere, fullbright, &self.material);
-                        }
-                        art.tongue(g, &self.models[actor.model].data);
-                    }
-                }
-                if let resident::Body::Plant(plant) = &p.body {
-                    self.spores.retain(|(owner, serial), _| {
-                        *owner != id || plant.shots.iter().any(|s| s.serial == *serial)
-                    });
-                    for shot in &plant.shots {
-                        let transform = Transform {
-                            translation: shot.position,
-                            rotation: Quat::from_rotation_arc(Vec3::X, shot.direction),
-                        };
-                        if plant.kind == crate::plants::Kind::Rose {
-                            if let Some(prop) = &mut self.thorn {
-                                self.material.bind();
-                                prop.draw_frame(transform, 1., fullbright, shot.age, true);
-                            }
-                        } else if let Some(template) = &self.spore {
-                            let effect = self
-                                .spores
-                                .entry((id, shot.serial))
-                                .or_insert_with(|| template.fork());
-                            effect.draw(
-                                shot.age,
-                                1.,
-                                |at, _| Transform {
-                                    translation: shot.position
-                                        - shot.direction * 600. * (shot.age - at),
-                                    ..transform
-                                },
-                                |_, _, default| default,
-                                camera,
-                                atmosphere,
-                            );
-                        }
-                    }
-                }
-                p.effects(&mut self.acorn, &mut self.resident_diamond, fullbright);
-                self.material.bind();
-            }
-            if let (Some(p), Some(prop)) = (&actor.clock, &mut self.clock_prop) {
-                let art = self.clock_art.entry(id).or_insert_with(|| {
-                    clock_art::Art::new(
-                        self.models[actor.model].own_effect.as_ref(),
-                        self.clock_trail.as_ref(),
-                    )
-                });
-                art.shots(p, prop, camera, atmosphere, fullbright, &self.material);
-            }
-            if let (Some(ant), Some(props)) = (&actor.ant, &mut self.ant_shots) {
-                for shot in &ant.shots {
-                    crate::ant::draw_shot(props, shot, fullbright);
-                }
-                crate::ant::draw_blasts(ant);
-                self.material.bind();
-            }
-            if let Some(p) = &actor.imp {
-                if let Some(parts) = &p.fragments {
-                    self.material.bind();
-                    for (prop, part) in self.imp_debris.iter_mut().zip(parts) {
-                        prop.draw(
-                            Transform {
-                                translation: part.position,
-                                rotation: part.rotation,
-                            },
-                            p.scale * (5. - p.time).clamp(0., 1.),
-                            fullbright,
-                        );
-                    }
-                }
-            }
-            if let Some(beam) = actor.chess.as_ref().and_then(|p| p.beam.as_ref()) {
-                self.attack_fx.lightning(beam.from, beam.to, camera, beam.age, 500., true, atmosphere);
-                self.material.bind();
-            }
-            } // effects are submitted once, after collect
-            let offset = actor.target() - camera;
-            if offset.length_squared() > 3500. * 3500.
-                || (offset.length_squared() > 200. * 200.
-                    && offset.normalize().dot(direction) < -0.3)
-            {
-                continue;
-            }
-            let model = &mut self.models[actor.model];
-            if let Some(p) = &actor.resident {
-                p.draw(model, fullbright, &self.material);
-                if p.active && !crate::character::skinning::overlap::gather_only() {
-                    if let resident::Body::Snark(g) = &p.body {
-                        if let Some(art) = self.snark_art.get_mut(&id) {
-                            art.smoke(g, &model.data, camera, atmosphere);
-                        }
-                    }
-                }
-                if p.active && !crate::character::skinning::overlap::gather_only() {
-                    if let resident::Body::Card(g) = &p.body {
-                        if let Some(art) = self.card_art.get_mut(&id) {
-                            art.charge(g, &model.data, camera, atmosphere);
-                        }
-                    }
-                }
-                self.material.bind();
-                continue;
-            }
-            if let Some(p) = &actor.clock {
-                model.draw_clock(p, fullbright, &self.material);
-                if !crate::character::skinning::overlap::gather_only() {
-                if let Some(art) = self.clock_art.get_mut(&id) {
-                    art.steam(p, &model.data, camera, atmosphere);
-                }
-                }
-                self.material.bind();
-                continue;
-            }
-            if let Some(p) = &actor.imp {
-                model.draw_imp(p, fullbright, &self.material);
-                continue;
-            }
-            if let Some(piece) = &actor.chess {
-                model.draw_chess(piece, fullbright, &self.material);
-                continue;
-            }
-            if let Some(ant) = &actor.ant {
-                model.draw_ant(ant, fullbright, &self.material);
-                continue;
-            }
-            if let Some(guard) = &actor.guard {
-                model.draw_guard(guard, fullbright, camera, atmosphere, &self.material);
-                continue;
-            }
-            // This branch is exclusively ambient rendering: all gameplay rigs
-            // returned above, and safe() excludes every attachment/effect consumer.
-            let transform = Transform {
-                translation: actor.position(),
-                rotation: Quat::from_rotation_z(actor.yaw),
-            };
-            let decision = if crate::character::skinning::overlap::ready() {
-                self.visual_lod.get(&id).map_or(visual_lod::Decision::Exact, |lod| lod.prepared)
-            } else if lod_enabled {
-                let safe = visual_lod::safe(actor, model);
-                let radius = model.data.visual_radius * model.data.def.scale * actor.spawn.scale;
-                let outside = config.anim_cull && safe && crate::render::outside_bounds(
-                    transform.translation - Vec3::splat(radius),
-                    transform.translation + Vec3::splat(radius));
-                #[cfg(target_os = "vita")]
-                { lod_counts[4] += u64::from(!safe); }
-                self.visual_lod.entry(id).or_default().decide(config, safe, outside,
-                    offset.length_squared(), transform, actor.spawn.scale, fullbright)
-            } else { visual_lod::Decision::Exact };
-            if crate::character::skinning::overlap::gather_only() {
-                self.visual_lod.entry(id).or_default().prepared = decision;
-            }
-            #[cfg(target_os = "vita")]
-            { lod_counts[match decision {
-                visual_lod::Decision::Exact => 0, visual_lod::Decision::Hidden => 1,
-                visual_lod::Decision::Refresh => 2, visual_lod::Decision::Reuse => 3,
-            }] += 1; }
-            match decision {
-                visual_lod::Decision::Hidden => continue,
-                visual_lod::Decision::Reuse => {
-                    for mesh in &self.visual_lod[&id].meshes { crate::render_fx::skin(mesh); }
-                    continue;
-                }
-                _ => {}
-            }
-            let d = &model.data;
-            let idle = actor
-                .spawn
-                .animation
-                .as_ref()
-                .filter(|n| d.clips.contains_key(*n))
-                .unwrap_or(&d.idle);
-            let idle = if let Some(g) = &actor.guide {
-                g.clip()
-            } else if actor.walk.is_some() {
-                "walk"
-            } else {
-                idle
-            };
-            let (mut local, clip, at, looping) = d.performance(
-                idle,
-                actor.greeting > 0. || actor.speaking,
-                actor.ending_talk,
-                actor.time,
-            );
-            actor.watch.apply(&d.skeleton, &mut local);
-            let animation = &d.clips[&clip];
-            let visual = d.events.visual(
-                &clip,
-                at,
-                animation.duration(),
-                animation.frame_time,
-                looping,
-            );
-            let transform = Transform {
-                translation: actor.position(),
-                rotation: Quat::from_rotation_z(actor.yaw),
-            };
-            let _consumer = crate::character::skinning::CullGuard::reason(
-                crate::character::skinning::overlap::single_preparing() && decision == visual_lod::Decision::Refresh,crate::phase_census::AMBIENT);
-            model.draw_pose(
-                &local,
-                actor.mouth,
-                actor.time,
-                true,
-                transform,
-                actor.spawn.scale,
-                fullbright,
-                true,
-                &visual,
-                None,
-            );
-            if decision == visual_lod::Decision::Refresh && !crate::character::skinning::overlap::gather_only() {
-                self.visual_lod.get_mut(&id).expect("ambient cache").capture(model);
-            }
-            model.draw_effects(
-                &clip,
-                at,
-                looping,
-                transform,
-                actor.spawn.scale,
-                camera,
-                atmosphere,
-            );
-            model.draw_electric(actor.electric);
-            self.material.bind();
-        }
-        #[cfg(target_os = "vita")]
-        crate::frame_profile::counts(&[
-            ("characters_lod_exact",lod_counts[0]),("characters_lod_culled",lod_counts[1]),
-            ("characters_lod_refreshed",lod_counts[2]),("characters_lod_reused",lod_counts[3]),
-            // Whole ambient actor passes, not surface layers or GPU draw calls.
-            ("characters_lod_layer_passes_skipped",lod_counts[1]),
-            ("characters_lod_submit_passes_skipped",lod_counts[1]),
-            ("vita_actor_frustum_skipped",lod_counts[1]),
-            ("characters_lod_protected",lod_counts[4]),
-        ]);
-        if !crate::character::skinning::overlap::gather_only() { gl_use_default_material(); }
-    }
+
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -3816,7 +4861,7 @@ pub fn check_combat(assets: &mut Assets) -> Result<()> {
     let mut world = World::from_bsp(&map)?;
     let interactions = crate::interaction::Interactions::load(&map)?;
     interactions.sync(&mut world);
-    let data = Data::load(assets, "cardguard_club", &[])?;
+    let data = ModelData::load(assets, "cardguard_club", &[])?;
     let timing = data.combat.context("Missing club guard combat clips")?;
     ensure!(
         timing.hit < timing.attack,
@@ -3889,7 +4934,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
     let mut clips = 0;
     for (name, extra) in &models {
         let checked = (|| -> Result<usize> {
-            let data = Data::load(assets, name, &extra.iter().cloned().collect::<Vec<_>>())?;
+            let data = ModelData::load(assets, name, &extra.iter().cloned().collect::<Vec<_>>())?;
             for s in &data.skeleton.surfaces {
                 if data.meta.hidden.contains(&s.name) || data.meta.hidden.contains("all") {
                     continue;
@@ -4052,34 +5097,34 @@ pub async fn render_placement(assets: &mut Assets) -> Result<()> {
         ("centipede2", "ant_guard2"),
         ("skool1", "return_insane2"),
     ] {
-        let mut scene = crate::render::Scene::load(assets, map)?;
+        let crate::render::Loaded { mut scene, mut world } = crate::render::Scene::load(assets, map)?;
         let mut interactions = crate::interaction::Interactions::load(&scene.map)?;
         interactions.set_entry(assets, &scene.map, map, None)?;
-        interactions.sync(&mut scene.world);
+        interactions.sync(&mut world);
         let mut npcs = Npcs::load(assets, &scene.map, map, None, false, false)?;
-        npcs.update(0., &scene.world, Vec3::splat(100000.));
+        npcs.update(0., &world, Vec3::splat(100000.));
         ensure!(
-            npcs.actors.iter().any(|a| a.spawn.name == name),
+            npcs.sim.actors.iter().any(|a| a.spawn.name == name),
             "Missing placement fixture actor"
         );
         // Isolate the inspected actor so a neighbouring ant cannot obscure the
         // feet or face. The authored world and this actor's placement are intact.
-        npcs.actors.retain(|a| a.spawn.name == name);
+        npcs.sim.actors.retain(|a| a.spawn.name == name);
         let index = 0;
-        let target = npcs.actors[index].target();
+        let target = npcs.sim.actors[index].target();
         let mut candidates = (0..16).filter_map(|i| {
             let angle = i as f32 * std::f32::consts::TAU / 16.;
             let eye = target + vec3(angle.cos() * 155., angle.sin() * 155., 24.);
-            let t = scene.world.sweep(target, eye, Vec3::splat(2.));
+            let t = world.sweep(target, eye, Vec3::splat(2.));
             (!t.start_solid && t.fraction >= 1.).then_some(eye)
         });
         let eye = candidates.next().context("No clear actor fixture camera")?;
         let target_yaw = (eye.y - target.y).atan2(eye.x - target.x);
-        npcs.actors[index].yaw = target_yaw + std::f32::consts::PI;
+        npcs.sim.actors[index].yaw = target_yaw + std::f32::consts::PI;
         for _ in 0..240 {
-            npcs.update(1. / 60., &scene.world, eye);
+            npcs.update(1. / 60., &world, eye);
         }
-        let a = &npcs.actors[index];
+        let a = &npcs.sim.actors[index];
         ensure!(
             a.walk.is_some()
                 || vec2(a.yaw.cos(), a.yaw.sin()).dot((eye - a.target()).truncate().normalize())
@@ -4090,7 +5135,7 @@ pub async fn render_placement(assets: &mut Assets) -> Result<()> {
         let saved = npcs.snapshot();
         npcs.restore(&saved)?;
         ensure!(
-            npcs.actors[index].spawn == identity,
+            npcs.sim.actors[index].spawn == identity,
             "Grounding changed saved identity"
         );
         for frame in 0..3 {
@@ -4106,7 +5151,7 @@ pub async fn render_placement(assets: &mut Assets) -> Result<()> {
             });
             let transforms = interactions.transforms();
             scene.draw(eye, 0., false, false, &transforms);
-            npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false);
+            npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false, false);
             crate::render::depth_read_only(|| scene.draw(eye, 0., false, true, &transforms));
             set_default_camera();
             if frame == 2 {
@@ -4119,13 +5164,13 @@ pub async fn render_placement(assets: &mut Assets) -> Result<()> {
         println!(
             "PASS staged actor {map}/{name}: {:?} -> {:?}, facing and saved identity retained",
             identity.origin,
-            npcs.actors[index].position()
+            npcs.sim.actors[index].position()
         );
     }
     Ok(())
 }
 
-impl crate::ant::Timing for Data {
+impl crate::ant::Timing for ModelData {
     fn duration(&self, _: &str, clip: &str) -> f32 {
         self.clips[clip].duration()
     }
@@ -4137,7 +5182,7 @@ impl crate::ant::Timing for Data {
         (c.distance * self.def.scale / c.duration()).max(1.)
     }
 }
-impl crate::clockwork::Rig for Data {
+impl crate::clockwork::Rig for ModelData {
     fn tag(&self, clip: &str, time: f32, tag: &str) -> Transform {
         let _npc_work = crate::npc::profile::work(crate::npc::profile::Phase::Animation);
         let bone = self
@@ -4168,24 +5213,24 @@ impl crate::clockwork::Rig for Data {
         }
     }
 }
-impl Model {
+impl ModelData {
     fn imp_fork(&self, p: &crate::fire_imp::Imp) -> Option<Transform> {
         let bone = self
-            .data
             .skeleton
             .bones
             .iter()
             .position(|b| b.name == "tag_fork")?;
         let pose = self
-            .data
             .skeleton
-            .global_pose(&self.data.clips[p.clip()].sample(p.time, p.loops()));
+            .global_pose(&self.clips[p.clip()].sample(p.time, p.loops()));
         let rotation = Quat::from_rotation_z(p.yaw);
         Some(Transform {
-            translation: p.feet + rotation * pose[bone].translation * self.data.def.scale * p.scale,
+            translation: p.feet + rotation * pose[bone].translation * self.def.scale * p.scale,
             rotation: rotation * pose[bone].rotation,
         })
     }
+}
+impl ModelArt {
     fn draw_clock(
         &mut self,
         piece: &crate::clockwork::Automaton,
@@ -4193,7 +5238,7 @@ impl Model {
         material: &crate::character::SkinMaterial,
     ) {
         let _consumer = crate::character::skinning::CullGuard::publication_reason(piece.frozen,crate::phase_census::FROZEN);
-        let Some(transform) = piece.visual(&self.data) else {
+        let Some(transform) = piece.visual(self.data.as_ref()) else {
             return;
         };
         let scale = piece.scale;
@@ -4235,7 +5280,7 @@ impl Model {
         material: &crate::character::SkinMaterial,
     ) {
         let _consumer = crate::character::skinning::CullGuard::publication_reason(piece.frozen,crate::phase_census::FROZEN);
-        let scale = piece.visual_scale(&self.data);
+        let scale = piece.visual_scale(self.data.as_ref());
         if scale <= 0. {
             return;
         }
@@ -4280,7 +5325,7 @@ impl Model {
         material: &crate::character::SkinMaterial,
     ) {
         let _consumer = crate::character::skinning::CullGuard::publication_reason(piece.frozen,crate::phase_census::FROZEN);
-        let scale = piece.visual_scale(&self.data);
+        let scale = piece.visual_scale(self.data.as_ref());
         if scale <= 0. {
             return;
         }
@@ -4327,7 +5372,7 @@ impl Model {
         #[cfg(feature="vita_renderer")]
         let _corpse = crate::render_fx::corpse_triangles::scope(ant.health <= 0.);
         let _consumer = crate::character::skinning::CullGuard::publication_reason(ant.frozen,crate::phase_census::FROZEN);
-        let scale = ant.visual_scale(&self.data);
+        let scale = ant.visual_scale(self.data.as_ref());
         if scale <= 0. {
             return;
         }
@@ -4377,15 +5422,98 @@ impl Model {
     }
 }
 
-impl crate::cards::Rig for Data {
+impl crate::cards::Rig for ModelData {
     fn sever(&self) -> Option<&crate::dismember::Recipe> {
         self.card_cut.as_ref()
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_split_and_owned_slots(assets: &mut Assets) {
+    let visit = "potears2";
+    let map = Bsp::parse(&assets.read(&format!("maps/{visit}.bsp")).unwrap()).unwrap();
+    let mut npcs = Npcs::load(assets, &map, visit, None, false, false).unwrap();
+    let extracted = npcs.extract_ants(Vec3::ZERO, Vec3::X);
+    let registry = &npcs.art.resources.snapshot_registry;
+    assert!(!registry.owned_slots.is_empty());
+    let owned = npcs.sim.capture_owned_slots(registry.generation);
+    assert_eq!(owned.slots, registry.owned_slots);
+    assert_eq!(owned.generation, registry.generation);
+    assert_ne!(owned.generation, 0);
+
+    let snapshot = serde_json::to_value(npcs.snapshot()).unwrap();
+    let slots = registry.slots.clone();
+    let actors = npcs.sim.actors.as_ptr();
+    let inputs = npcs.art.resources.actor_inputs.as_ref().unwrap().bytes();
+    let art = std::rc::Rc::clone(&npcs.art.resources.attack_fx);
+    let greetings = npcs.greetings();
+    let (sim, owner) = npcs.into_parts();
+    let mut npcs = Npcs::from_parts(sim, owner);
+    assert_eq!(serde_json::to_value(npcs.snapshot()).unwrap(), snapshot);
+    assert!(std::rc::Rc::ptr_eq(&npcs.art.resources.attack_fx, &art));
+    assert_eq!(npcs.sim.actors.as_ptr(), actors);
+    assert_eq!(npcs.greetings(), greetings);
+    assert_eq!(npcs.art.resources.actor_inputs.as_ref().unwrap().bytes(), inputs);
+    assert_eq!(npcs.art.resources.snapshot_registry.generation, owned.generation);
+    assert!(npcs.art.resources.snapshot_registry.slots == slots);
+    assert_eq!(npcs.extract_ants(Vec3::ZERO, Vec3::X), extracted);
+
+    npcs.art.resources.snapshot_registry.retire();
+    npcs.extract_ants(Vec3::ZERO, Vec3::X);
+    let rebuilt = &npcs.art.resources.snapshot_registry;
+    assert_ne!(rebuilt.generation, owned.generation);
+    assert_eq!(npcs.sim.capture_owned_slots(rebuilt.generation).slots, owned.slots);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actor_publication_rejects_membership_for_retired_generation() {
+        let mut registry = SnapshotRegistry::default();
+        let keys = vec![(Default::default(), 0)];
+        assert!(registry.publish_membership(keys.clone(), OwnedSlots { generation: 0, slots: vec![0] }));
+        let stale = OwnedSlots { generation: registry.generation, slots: vec![0] };
+        registry.retire();
+        assert!(!registry.publish_membership(keys.clone(), stale));
+        assert!(registry.slots.is_empty());
+        let current = OwnedSlots { generation: registry.generation, slots: vec![0] };
+        assert!(registry.publish_membership(keys, current));
+        assert_eq!(registry.owned_slots, vec![0]);
+    }
+
+    #[test]
+    fn actor_snapshot_rejects_stale_overflow_and_malformed_batches() {
+        fn assert_send<T: Send>() {} assert_send::<ActorInputs>();
+        let mut registry = SnapshotRegistry::default();
+        registry.retire();
+        registry.slots.push((Default::default(), 0)); registry.owned_slots.push(0);
+        let ant = || AntInput { slot: 0, visible: true, preserve: false, corpse: false,
+            body: None, shots: Vec::new(), blasts: Vec::new() };
+        let mut input = ActorInputs { generation: registry.generation, ants: vec![ant()], ambient: Vec::new(), residents: Vec::new(), overflow: false };
+        assert!(input.valid_for(&registry));
+        let required = registry.owned_slots.pop().unwrap(); assert!(!input.valid_for(&registry));
+        registry.owned_slots.push(required);
+        let missing = input.ants.pop().unwrap(); assert!(!input.valid_for(&registry)); input.ants.push(missing);
+        input.overflow = true;
+        assert!(!input.valid_for(&registry));
+        input.overflow = false;
+        input.ants[0].slot = 1;
+        assert!(!input.valid_for(&registry));
+        input.ants[0].slot = 0;
+        input.ants.push(ant());
+        assert!(!input.valid_for(&registry));
+        input.ants.pop();
+        let previous = registry.generation;
+        registry.retire();
+        registry.slots.push((Default::default(),0));
+        assert_ne!(previous, registry.generation);
+        assert!(!input.valid_for(&registry));
+        // A failed restore retires first too: stale inputs cannot become valid
+        // merely because the replacement visit has the same slot count/model.
+        registry.retire();
+        assert!(!input.valid_for(&registry));
+    }
     #[test]
     fn maze_precache_upgrade_accepts_only_the_reviewed_hidden_flag() {
         let mut current = actor().spawn;
@@ -4803,7 +5931,7 @@ mod tests {
 pub(crate) fn check_overlap_snapshots(assets: &mut Assets) -> Result<()> {
     let mut total=0;
     for name in ["c_insanechildnew", "c_cheshire", "cardguard_club"] {
-        let d=Data::load(assets,name,&[])?;
+        let d=ModelData::load(assets,name,&[])?;
         let clip=&d.clips[&d.idle];
         let poses:Vec<_> = clip.frames.iter().take(8).map(|f|d.skeleton.global_pose(&f.pose)).collect();
         let n=crate::character::skinning::overlap::check_skeleton(&d.skeleton,&poses)?;

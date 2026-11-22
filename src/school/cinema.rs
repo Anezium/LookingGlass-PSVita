@@ -96,10 +96,9 @@ pub struct Data {
     guards: [Vec<Vec3>; 2],
     guard_speed: f32,
     platforms: BTreeMap<usize, usize>,
-    camera_world: World,
 }
 impl Data {
-    pub fn load(assets: &mut Assets, map: &Bsp) -> Result<Self> {
+    fn load(assets: &mut Assets, map: &Bsp) -> Result<(Self, World)> {
         let mut tracks = BTreeMap::new();
         for name in [
             "skool_play",
@@ -269,7 +268,7 @@ impl Data {
             )?;
             Ok(a.distance * def.scale / a.duration())
         };
-        Ok(Self {
+        Ok((Self {
             tracks,
             points,
             lengths,
@@ -283,8 +282,7 @@ impl Data {
             ],
             guard_speed: speed(assets, "cardguard_diamond", "run")?,
             platforms,
-            camera_world: world,
-        })
+        }, world))
     }
     fn performance_camera2(&self) -> f32 {
         6.5 + self.lengths["pipeout"] + self.lengths["smoke"] * 2.
@@ -340,7 +338,9 @@ impl Data {
 impl School {
     pub fn configure_cinema(&mut self, assets: &mut Assets, map: &Bsp) -> Result<()> {
         if !self.returning {
-            self.cinema_data = Some(Data::load(assets, map)?);
+            let (data, world) = Data::load(assets, map)?;
+            self.cinema_data = Some(std::sync::Arc::new(data));
+            self.cinema_world = Some(world);
         } else {
             self.return_data = Some(super::return_cinema::Data::load(assets, map)?);
         }
@@ -348,11 +348,12 @@ impl School {
     }
     pub(crate) fn check_scene_walks(&self) -> Result<()> {
         let d = self.cinema_data.as_ref().context("Missing theatre data")?;
+        let world = self.cinema_world.as_ref().context("Missing theatre collision")?;
         for i in 0..143 {
             let t = i as f32 / 10.;
-            let p = d.alice_pose(t).translation;
+            let p = d.alice_pose(world, t).translation;
             ensure!(
-                !d.camera_world
+                !world
                     .sweep(p + Vec3::Z * 30., p + Vec3::Z * 30., vec3(12., 12., 28.))
                     .start_solid,
                 "Theatre Alice intersects architecture at {t}: {p:?}"
@@ -360,10 +361,10 @@ impl School {
         }
         for path in &d.guards {
             for i in 0..31 {
-                let p = theatre::walk(&d.camera_world, path, i as f32 / 10. * d.guard_speed)
+                let p = theatre::walk(world, path, i as f32 / 10. * d.guard_speed)
                     .translation;
                 ensure!(
-                    !d.camera_world
+                    !world
                         .sweep(p + Vec3::Z * 30., p + Vec3::Z * 30., vec3(12., 12., 28.))
                         .start_solid,
                     "Theatre reinforcement intersects architecture: {p:?}"
@@ -644,8 +645,7 @@ impl School {
                 let direction = delta.truncate().normalize_or_zero();
                 eye.x = focus.x + direction.x * 120.;
                 eye.y = focus.y + direction.y * 120.;
-                let hit = data
-                    .camera_world
+                let hit = self.cinema_world.as_ref().expect("theatre collision")
                     .sweep_geometry(focus, eye, Vec3::splat(6.));
                 if !hit.start_solid && hit.fraction < 1. {
                     eye = focus.lerp(eye, hit.fraction) + hit.normal * 2.;
@@ -729,7 +729,7 @@ impl School {
                     continue;
                 }
                 let at = (s.time - 43.6).max(0.);
-                let pose = theatre::walk(&d.camera_world, &d.guards[i], at * d.guard_speed);
+                let pose = theatre::walk(self.cinema_world.as_ref().expect("theatre collision"), &d.guards[i], at * d.guard_speed);
                 g.feet = pose.translation;
                 g.yaw = pose.rotation.to_euler(EulerRot::ZYX).0;
                 g.state = if at > 0. {
@@ -812,13 +812,26 @@ impl Art {
         })
     }
     pub fn story_pose(&mut self, story: &Story) {
-        self.alice.mouth(story.mouth(&["fakeplayer", "alice"]));
-        self.gnome.mouth(story.mouth(&["talk_gnome1"]));
-        self.cat.mouth(story.mouth(&["book_cat", "shelf_cat"]));
+        self.apply_story_pose(Self::capture_story_pose(story));
     }
-    pub fn draw(
+
+    pub(crate) fn capture_story_pose(story: &Story) -> [f32; 3] {
+        [
+            story.mouth(&["fakeplayer", "alice"]),
+            story.mouth(&["talk_gnome1"]),
+            story.mouth(&["book_cat", "shelf_cat"]),
+        ]
+    }
+
+    pub(crate) fn apply_story_pose(&mut self, [alice, gnome, cat]: [f32; 3]) {
+        self.alice.mouth(alice);
+        self.gnome.mouth(gnome);
+        self.cat.mouth(cat);
+    }
+
+    pub(super) fn draw(
         &mut self,
-        school: &School,
+        school: &super::FirstDraw,
         atmosphere: &crate::environment::Atmosphere,
         camera: Vec3,
         bright: bool,
@@ -943,7 +956,7 @@ impl Art {
         }
         let theatre = beat == Some(Beat::Theatre);
         let completed = school.theatre && !theatre;
-        if theatre && !(14.3..19.3).contains(&t) {
+        if let Some(alice_pose) = school.theatre_alice {
             self.alice.watch(d.watch(0, t));
             self.alice.draw(
                 if (0.2..14.3).contains(&t) {
@@ -957,7 +970,7 @@ impl Art {
                     t - 14.3
                 },
                 true,
-                d.alice_pose(t),
+                alice_pose,
                 1.,
                 bright,
             );

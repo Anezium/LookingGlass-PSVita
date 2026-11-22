@@ -23,7 +23,7 @@ fn main() {
             format!("{:x}", Sha256::digest(bytes))
         }).collect::<Vec<_>>().join(":");
         println!("cargo:rustc-env=LG_VITAGL_ID={identity}");
-        for symbol in ["malloc", "calloc", "realloc", "free", "memalign", "_malloc_r", "_calloc_r", "_realloc_r", "_memalign_r", "_free_r", "vglGetProcAddress", "glTexImage2D", "vglSwapBuffers", "sceCtrlPeekBufferPositive", "pthread_getspecific", "sceGxmBeginScene", "sceGxmEndScene", "sceDisplayWaitVblankStartMulti", "sceGxmSetFragmentTexture", "sceGxmSetVertexStream", "sceGxmSetVertexProgram", "sceGxmSetFragmentProgram", "sceGxmSetVertexDefaultUniformBuffer", "sceGxmSetFragmentDefaultUniformBuffer", "sceGxmDrawInstanced"] {
+        for symbol in ["malloc", "calloc", "realloc", "free", "memalign", "_malloc_r", "_calloc_r", "_realloc_r", "_memalign_r", "_free_r", "vglGetProcAddress", "glTexImage2D", "vglSwapBuffers", "sceGxmDisplayQueueAddEntry", "sceDisplaySetFrameBuf", "sceCtrlPeekBufferPositive", "pthread_getspecific", "sceGxmBeginScene", "sceGxmEndScene", "sceDisplayWaitVblankStartMulti", "sceGxmSetFragmentTexture", "sceGxmSetVertexStream", "sceGxmSetVertexProgram", "sceGxmSetFragmentProgram", "sceGxmSetVertexDefaultUniformBuffer", "sceGxmSetFragmentDefaultUniformBuffer", "sceGxmDrawInstanced"] {
             println!("cargo:rustc-link-arg=-Wl,--wrap={symbol}");
         }
         // sceGxm scene calls and the vblank wait: src/gpu_timing.rs, off by default, tail-call the real functions.
@@ -37,11 +37,12 @@ fn main() {
         }
         println!("cargo:rustc-link-arg=-Wl,--undefined=sceUserMainThreadStackSize");
         println!("cargo:rustc-link-arg=-Wl,--undefined=_newlib_heap_size_user");
-        // Startup tracing and actor diagnostics grow code/exception metadata.
+        // Startup tracing and actor diagnostics grow code/exception metadata, and the
+        // snapshot/overlap track adds more: the RW start moved from 0x82080000 to
+        // 0x82180000 when the merge of both no longer fitted (RX ended 49 KB past it).
         // Reserve SCE metadata slack (>=3348 bytes),
         // and verify the final program headers for every packaged build.
         // The integrated v1.1 code grew past 0x82080000.
-
         println!("cargo:rustc-link-arg=-Wl,--section-start=.init_array=0x82180000");
         if std::env::var_os("CARGO_FEATURE_VITA_RENDERER").is_some() {
             println!("cargo:rustc-link-arg=-Wl,--wrap=invoke_splashscreen");

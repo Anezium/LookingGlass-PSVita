@@ -165,12 +165,23 @@ impl Art {
         fullbright: bool,
         body: &crate::character::SkinMaterial,
     ) {
+        self.draw_input(ice.render_view(), data, jacks.render_view(), camera, fullbright, body);
+    }
+    pub(crate) fn draw_input(
+        &mut self,
+        ice: ice::RenderView<'_>,
+        data: &ice::Data,
+        jacks: jacks::RenderView<'_>,
+        camera: Vec3,
+        fullbright: bool,
+        body: &crate::character::SkinMaterial,
+    ) {
         body.bind();
-        for w in &ice.walls {
+        for w in ice.walls.iter() {
             let (stage, time, looping) = data.stage(w);
             self.walls[stage].draw_frame(w.pose(), 1., fullbright, time, looping);
         }
-        for p in &jacks.pieces {
+        for p in jacks.pieces.iter() {
             let index = if p.kind == jacks::Kind::Ball {
                 2
             } else {
@@ -254,7 +265,7 @@ impl Art {
                 },
                 |name, birth, _| {
                     let (index, t) = shell_frame(birth);
-                    let frame = (t / self.shell[index].model.frame_time) as usize;
+                    let frame = (t / self.shell[index].geometry.model.frame_time) as usize;
                     let large = name
                         .strip_prefix("smoke")
                         .and_then(|s| s.parse::<u8>().ok())

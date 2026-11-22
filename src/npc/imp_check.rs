@@ -6,7 +6,7 @@ use crate::{
 };
 
 pub fn check(assets: &mut Assets) -> Result<()> {
-    let data = Data::load(assets, MODEL, &[])?;
+    let data = ModelData::load(assets, MODEL, &[])?;
     for clip in crate::fire_imp::CLIPS {
         ensure!(data.clips.contains_key(*clip), "Missing Imp clip {clip}");
     }
@@ -94,27 +94,27 @@ fn step(npcs: &mut Npcs, world: &World, eye: Vec3, frames: usize) -> f32 {
 }
 pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
     std::fs::create_dir_all("private/imp")?;
-    let mut scene = crate::render::Scene::load(assets, "wforest")?;
+    let crate::render::Loaded { mut scene, mut world } = crate::render::Scene::load(assets, "wforest")?;
     let mut interactions = crate::interaction::Interactions::load(&scene.map)?;
     interactions.set_entry(assets, &scene.map, "wforest", None)?;
-    interactions.sync(&mut scene.world);
+    interactions.sync(&mut world);
     let mut npcs = Npcs::load(assets, &scene.map, "wforest", None, false, false)?;
-    npcs.update(0., &scene.world, Vec3::splat(10000.));
+    npcs.update(0., &world, Vec3::splat(10000.));
     let initial = npcs.snapshot();
     let id = npcs
-        .actors
+        .sim.actors
         .iter()
         .position(|a| a.imp.is_some() && a.spawn.imp_spawn.is_none())
         .context("Missing placed Imp")?;
     let (pending_id, entity) = npcs
-        .actors
+        .sim.actors
         .iter()
         .enumerate()
         .find_map(|(id, a)| {
             a.spawn
                 .imp_spawn
                 .filter(|e| {
-                    npcs.imp_ambushes
+                    npcs.sim.imp_ambushes
                         .iter()
                         .any(|b| b.receivers.iter().any(|(i, d)| i == e && *d > 1.))
                 })
@@ -122,7 +122,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         })
         .context("Missing delayed Imp")?;
     let ambush = npcs
-        .imp_ambushes
+        .sim.imp_ambushes
         .iter()
         .find(|a| a.receivers.iter().any(|(i, _)| *i == entity))
         .unwrap();
@@ -131,14 +131,14 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         !npcs.targets().iter().any(|t| t.id == pending_id),
         "Dormant Imp is targetable"
     );
-    npcs.update(0., &scene.world, trigger_eye);
+    npcs.update(0., &world, trigger_eye);
     ensure!(
         serde_json::to_value(&initial)? == serde_json::to_value(npcs.snapshot())?,
         "Paused Imp trigger changed state"
     );
-    step(&mut npcs, &scene.world, trigger_eye, 1);
+    step(&mut npcs, &world, trigger_eye, 1);
     ensure!(
-        npcs.actors[pending_id]
+        npcs.sim.actors[pending_id]
             .imp
             .as_ref()
             .unwrap()
@@ -147,7 +147,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         "Relay failed to schedule Imp"
     );
     let delayed = npcs.snapshot();
-    step(&mut npcs, &scene.world, Vec3::splat(10000.), 180);
+    step(&mut npcs, &world, Vec3::splat(10000.), 180);
     ensure!(
         npcs.targets().iter().any(|t| t.id == pending_id),
         "Delayed Imp failed to spawn away from trigger"
@@ -161,10 +161,10 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
     legacy.matches_placements(&scene.map, "wforest", None)?;
     npcs.restore(&legacy)?;
     ensure!(
-        !npcs.actors[pending_id].imp.as_ref().unwrap().active,
+        !npcs.sim.actors[pending_id].imp.as_ref().unwrap().active,
         "Old load retained a live new ambush"
     );
-    let feet = npcs.actors[id].position();
+    let feet = npcs.sim.actors[id].position();
     let target = feet + Vec3::Z * 25.;
     let eye = (0..32)
         .map(|i| {
@@ -172,7 +172,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             target + vec3(angle.cos() * 175., angle.sin() * 175., 25.)
         })
         .find(|p| {
-            let t = scene.world.sweep(target, *p, Vec3::splat(2.));
+            let t = world.sweep(target, *p, Vec3::splat(2.));
             !t.start_solid && t.fraction >= 1.
         })
         .context("No clear Imp camera")?;
@@ -185,8 +185,8 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             let mut loot = saved.loot;
             loot.validate()?;
             let before = npcs.loot_sources();
-            let damage = step(&mut npcs, &scene.world, saved.eye, 180);
-            loot.defeated(&before, &npcs.loot_sources(), &scene.world);
+            let damage = step(&mut npcs, &world, saved.eye, 180);
+            loot.defeated(&before, &npcs.loot_sources(), &world);
             ensure!(
                 serde_json::to_value(npcs.snapshot())? == serde_json::to_value(saved.expected)?
                     && damage == saved.damage,
@@ -218,12 +218,12 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             feet + vec3(65., 0., 48.)
         };
         if matches!(case, "attack" | "impact") {
-            let time = npcs.models[npcs.actors[id].model].data.clips["attack01"].frame_time * 11.;
-            let p = npcs.actors[id].imp.as_mut().unwrap();
+            let time = npcs.art.resources.models[npcs.sim.actors[id].model].data.clips["attack01"].frame_time * 11.;
+            let p = npcs.sim.actors[id].imp.as_mut().unwrap();
             p.phase = Phase::Attack;
             p.time = time;
             if case == "impact" {
-                step(&mut npcs, &scene.world, continuation_eye, 5);
+                step(&mut npcs, &world, continuation_eye, 5);
             }
         } else if case == "pain" {
             npcs.hit(Hit {
@@ -247,7 +247,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                         q.gibbed
                     })
                     .unwrap();
-                npcs.actors[id].imp = Some(Imp::new(feet, 0., 1., seed, true));
+                npcs.sim.actors[id].imp = Some(Imp::new(feet, 0., 1., seed, true));
             }
             npcs.hit(Hit {
                 id,
@@ -261,15 +261,15 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 },
                 knockback: Vec3::ZERO,
             });
-            loot.defeated(&before, &npcs.loot_sources(), &scene.world);
+            loot.defeated(&before, &npcs.loot_sources(), &world);
             ensure!(
                 loot.drops.len() == 1 && loot.drops[0].grade == crate::loot::Grade::Small,
                 "Wrong Imp reward"
             );
-            step(&mut npcs, &scene.world, continuation_eye, 12);
+            step(&mut npcs, &world, continuation_eye, 12);
         }
         let cast = npcs.snapshot();
-        let damage = step(&mut npcs, &scene.world, continuation_eye, 180);
+        let damage = step(&mut npcs, &world, continuation_eye, 180);
         let expected = npcs.snapshot();
         if mode == "imp-save-write" {
             std::fs::write(
@@ -291,7 +291,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         return Ok(());
     }
     npcs.restore(&initial)?;
-    npcs.actors = vec![npcs.actors[id].clone()];
+    npcs.sim.actors = vec![npcs.sim.actors[id].clone()];
     let stages = [
         ("idle", Phase::Idle, 0.2, false, 0),
         ("twitch", Phase::Twitch, 0.4, false, 0),
@@ -308,7 +308,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
     ];
     let mut hashes = BTreeSet::new();
     for (label, phase, time, frozen, variant) in stages {
-        let p = npcs.actors[0].imp.as_mut().unwrap();
+        let p = npcs.sim.actors[0].imp.as_mut().unwrap();
         p.phase = phase;
         p.time = time;
         p.frozen = frozen;
@@ -330,14 +330,14 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             p.gibbed
         })
         .unwrap();
-    npcs.actors[0].imp = Some(Imp::new(feet, 0., 1., seed, true));
+    npcs.sim.actors[0].imp = Some(Imp::new(feet, 0., 1., seed, true));
     npcs.hit(Hit {
         id: 0,
         damage: 100.,
         kind: DamageKind::Other,
         knockback: Vec3::ZERO,
     });
-    step(&mut npcs, &scene.world, eye, 8);
+    step(&mut npcs, &world, eye, 8);
     hashes.insert(capture(&mut npcs, &mut scene, &interactions, eye, target, "gib").await?);
     ensure!(hashes.len() == 13, "Imp visual states identical");
     println!("PASS 13 Imp animation/fork/frozen/gib/cleanup captures; authored relay, pause and legacy migration");
@@ -367,7 +367,7 @@ async fn capture(
         crate::render_fx::begin_view(&camera, 0., &scene.atmosphere, false);
         let transforms = interactions.transforms();
         scene.draw(eye, 0., false, false, &transforms);
-        npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false);
+        npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false, false);
         crate::render::depth_read_only(|| scene.draw(eye, 0., false, true, &transforms));
         let (_, dropped) = crate::render_fx::finish();
         ensure!(dropped == 0, "Imp render queue dropped geometry");

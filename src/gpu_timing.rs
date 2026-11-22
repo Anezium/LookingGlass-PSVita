@@ -309,8 +309,12 @@ mod vita {
         log.end(enter, now().wrapping_sub(enter), waiting, fragment_value, vertex_value);
         result
     }
+    // Set before vitaGL starts. The display queue reads it on its callback thread.
+    pub(super) static CAP_30: AtomicBool = AtomicBool::new(false);
+
     #[no_mangle]
     pub unsafe extern "C" fn __wrap_sceDisplayWaitVblankStartMulti(vcount: u32) -> i32 {
+        let vcount = if CAP_30.load(Relaxed) { vcount.max(2) } else { vcount };
         let result = __real_sceDisplayWaitVblankStartMulti(vcount);
         if armed() { if let Some(log) = log() { log.display_vblank(now()); } }
         result
@@ -371,6 +375,15 @@ pub(crate) fn before_gl_init() {
     {
         let config = crate::render::vita_renderer::config();
         set_mask(config.gpu_mask.iter().filter_map(|name| mask_bit(name)).fold(0, |all, bit| all | bit));
+        #[cfg(target_os = "vita")]
+        if config.diag_sim_timing {
+            crate::display_timing::enable();
+        }
+        #[cfg(target_os = "vita")]
+        if config.sim_overlap_cap_30 {
+            vita::CAP_30.store(true, Relaxed);
+            println!("[lg/display] cap_vblanks=2");
+        }
         #[cfg(target_os = "vita")]
         if let Some([display, fbo]) = config.rt_scenes { vita::set_render_target_scenes(display, fbo); }
         #[cfg(target_os = "vita")]

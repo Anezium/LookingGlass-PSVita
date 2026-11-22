@@ -20,9 +20,28 @@ pub struct Art {
     warning_frame: f32,
     back: usize,
     mouth: usize,
+    view: RefCell<(Atmosphere, Vec3)>,
+}
+
+#[derive(Default)]
+pub(crate) struct State {
     visible: bool,
     warning: Option<f32>,
-    view: RefCell<(Atmosphere, Vec3)>,
+}
+impl State {
+    #[must_use = "true means the owner must fork the bubble emitter history (art-side write)"]
+    pub(crate) fn sync(&mut self, player: &Player) -> bool {
+        self.visible = player.breath.shell
+            && player.immersion.level >= 2
+            && player.immersion.kind != crate::water::Liquid::Lava;
+        let warning = (player.immersion.level == 3)
+            .then(|| player.breath.warning_age())
+            .flatten();
+        let reset_emitter = self.warning.is_some() && warning.is_none();
+        self.warning = warning;
+        reset_emitter
+    }
+    pub(crate) fn render_state(&self) -> (bool, Option<f32>) { (self.visible, self.warning) }
 }
 
 /// Exercise the actual Character draw path, including immediate paused restores.
@@ -35,18 +54,18 @@ pub async fn check(a: &mut Assets) -> Result<()> {
     use anyhow::ensure;
     let root = std::path::Path::new("private/turtle-shell");
     std::fs::create_dir_all(root)?;
-    let mut scene = crate::render::Scene::load(a, "garden1")?;
+    let crate::render::Loaded { mut scene, mut world } = crate::render::Scene::load(a, "garden1")?;
     // The authored entrance current carries an idle player out of this pool.
     // Isolate breathing here, as --swim-check does; normal gameplay keeps it.
-    for current in &mut scene.world.traversal.pushes {
+    for current in &mut world.traversal.pushes {
         current.enabled = false;
     }
     let mut player =
-        Player::spawn(&scene.world, scene.map.spawn().0).context("Garden swimming spawn")?;
+        Player::spawn(&world, scene.map.spawn().0).context("Garden swimming spawn")?;
     let stats = crate::inventory::Stats::for_level("garden1", None);
     stats.prepare_player(&mut player);
     for _ in 0..120 * 6 {
-        player.tick(&scene.world, Controls::default());
+        player.tick(&world, Controls::default());
     }
     ensure!(
         player.immersion.level == 3 && player.breath.shell && player.breath.hits == 0,
@@ -65,7 +84,7 @@ pub async fn check(a: &mut Assets) -> Result<()> {
                 ..Default::default()
             },
             &crate::combat::Context {
-                world: &scene.world,
+                world: &world,
                 targets: &[],
             },
         );
@@ -121,7 +140,7 @@ pub async fn check(a: &mut Assets) -> Result<()> {
         actor.water_appearance(&player);
         clear_background(Color::new(0.12, 0.2, 0.27, 1.));
         set_camera(&camera);
-        crate::lighting::select(vec![], camera.position, &scene.world);
+        crate::lighting::select(vec![], camera.position, &world);
         let atmosphere = Atmosphere::default();
         crate::render_fx::begin_view(&camera, 2., &atmosphere, true);
         actor.atmosphere(&atmosphere, camera.position);
@@ -165,7 +184,7 @@ pub async fn check(a: &mut Assets) -> Result<()> {
     player = saved_player;
     alice.water_appearance(&player);
     let (eye, target, show) =
-        crate::camera::Follow::default().update(&scene.world, player.feet, Vec3::X, 128., 1. / 60.);
+        crate::camera::Follow::default().update(&world, player.feet, Vec3::X, 128., 1. / 60.);
     ensure!(show, "Garden swimming follow camera hides Alice");
     let view = Camera3D {
         position: eye,
@@ -237,48 +256,39 @@ impl Art {
             warning_frame,
             back: tag("tag_back")?,
             mouth: tag("tag_mouth")?,
-            visible: false,
-            warning: None,
             view: RefCell::new((Atmosphere::default(), Vec3::ZERO)),
         })
     }
-    pub fn reset(&mut self) {
-        self.visible = false;
-        self.warning = None;
-        self.bubbles = self.bubbles.fork();
-    }
-    pub fn sync(&mut self, player: &Player) {
-        self.visible = player.breath.shell
-            && player.immersion.level >= 2
-            && player.immersion.kind != crate::water::Liquid::Lava;
-        let warning = (player.immersion.level == 3)
-            .then(|| player.breath.warning_age())
-            .flatten();
-        if self.warning.is_some() && warning.is_none() {
-            self.bubbles = self.bubbles.fork();
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn fixture_bubble_count(&mut self, seed: bool) -> usize {
+        if seed {
+            self.bubbles = crate::particles::tests::attached_fixture(1);
+            self.bubbles.sample(0.25, 1.,
+                |_, _| Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY },
+                |_, _, _| true);
         }
-        self.warning = warning;
+        self.bubbles.live_puffs()
+    }
+
+    pub(crate) fn reset_emitter(&mut self) {
+        self.bubbles = self.bubbles.fork();
     }
     pub fn atmosphere(&self, atmosphere: &Atmosphere, camera: Vec3) {
         *self.view.borrow_mut() = (atmosphere.clone(), camera);
     }
-    pub fn draw(
-        &mut self,
-        pose: &[Transform],
-        body: Transform,
-        scale: f32,
-        time: f32,
-        fullbright: bool,
+    pub(crate) fn draw_input(
+        &mut self, state: (bool, Option<f32>), pose: &[Transform], body: Transform,
+        scale: f32, time: f32, fullbright: bool,
     ) {
         let tag = |index: usize| Transform {
             translation: body.point(pose[index].translation * scale),
             rotation: body.rotation * pose[index].rotation,
         };
-        if self.visible {
+        if state.0 {
             self.shell
                 .draw_frame(tag(self.back), scale, fullbright, time, true);
         }
-        if let Some(age) = self.warning {
+        if let Some(age) = state.1 {
             let mouth = tag(self.mouth);
             let (atmosphere, camera) = &*self.view.borrow();
             self.bubbles.draw(

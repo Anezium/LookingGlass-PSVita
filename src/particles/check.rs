@@ -22,15 +22,16 @@ pub(crate) async fn ambient_render(assets: &mut Assets) -> Result<()> {
             if !matches!(name, "lantern.tik" | "firefly.tik") {
                 continue;
             }
-            let emitter = steam
-                .emitters
+            let (emitter, visual) = steam
+                .sim.emitters
                 .iter()
-                .find(|e| e.id == id)
+                .zip(&steam.art.emitters)
+                .find(|(e, _)| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("Missing ambient emitter {map_name}:{id}"))?;
             if name == "lantern.tik" {
                 lanterns += 1;
                 ensure!(
-                    emitter.spec.constrain == Some(Vec3::splat(3.5)) && emitter.textures.len() == 1,
+                    emitter.spec.constrain == Some(Vec3::splat(3.5)) && visual.textures.len() == 1,
                     "Lantern bounds or sprite missing"
                 );
                 ensure!(
@@ -78,9 +79,9 @@ pub(crate) async fn ambient_render(assets: &mut Assets) -> Result<()> {
         ("gvillage", 56, vec3(80., -75., 35.)),
         ("potears2", 28, vec3(70., -100., 25.)),
     ] {
-        let mut scene = crate::render::Scene::load(assets, name)?;
+        let crate::render::Loaded { mut scene, world } = crate::render::Scene::load(assets, name)?;
         let mut steam = Steam::load(assets, &scene.map)?;
-        let emitter = steam.emitters.iter().find(|e| e.id == id).unwrap();
+        let emitter = steam.sim.emitters.iter().find(|e| e.id == id).unwrap();
         let target = emitter.origin
             + if name == "gvillage" {
                 Vec3::Z * 10.
@@ -92,7 +93,7 @@ pub(crate) async fn ambient_render(assets: &mut Assets) -> Result<()> {
                 .into_iter()
                 .map(|axis| target + emitter.rotation * axis * 96. + Vec3::Z * 12.)
                 .find(|eye| {
-                    let sight = scene.world.sweep(target, *eye, Vec3::splat(1.));
+                    let sight = world.sweep(target, *eye, Vec3::splat(1.));
                     !sight.start_solid && sight.fraction == 1.
                 })
                 .ok_or_else(|| anyhow::anyhow!("No clear firefly inspection camera"))?
@@ -100,18 +101,18 @@ pub(crate) async fn ambient_render(assets: &mut Assets) -> Result<()> {
             target + offset
         };
         for _ in 0..100 {
-            steam.update(0.05, eye, &scene.world);
+            steam.update(0.05, eye, &world);
         }
         if name == "gvillage" {
             ensure!(
                 steam
-                    .puffs
+                    .sim.puffs
                     .iter()
-                    .any(|p| steam.emitters[p.emitter].id == id),
+                    .any(|p| steam.sim.emitters[p.emitter].id == id),
                 "Lantern pixie died inside its enclosure"
             );
-            for p in &steam.puffs {
-                if let Some(bounds) = steam.emitters[p.emitter].spec.constrain {
+            for p in &steam.sim.puffs {
+                if let Some(bounds) = steam.sim.emitters[p.emitter].spec.constrain {
                     ensure!(
                         (p.position - p.constraint_center)
                             .abs()
@@ -125,7 +126,7 @@ pub(crate) async fn ambient_render(assets: &mut Assets) -> Result<()> {
         let mut reference: Option<Vec<u8>> = None;
         for shot in ["live", "paused"] {
             steam.animate(5.);
-            steam.update(0., eye, &scene.world);
+            steam.update(0., eye, &world);
             clear_background(scene.atmosphere.background());
             set_camera(&Camera3D {
                 position: eye,
@@ -136,7 +137,7 @@ pub(crate) async fn ambient_render(assets: &mut Assets) -> Result<()> {
                 z_far: 10000.,
                 ..Default::default()
             });
-            crate::lighting::select(steam.lights(), eye, &scene.world);
+            crate::lighting::select(steam.lights(), eye, &world);
             let direction = (target - eye).normalize();
             crate::render_fx::begin(eye, direction, 5., &scene.atmosphere, false);
             scene.draw(eye, 5., false, false, &[]);

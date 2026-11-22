@@ -238,7 +238,7 @@ fn probe(r: &Route, spec: &str) -> Result<()> {
 }
 
 async fn capture(a: &mut Assets, r: &mut Route) -> Result<()> {
-    let mut scene = crate::render::Scene::load(a, "hedge3")?;
+    let crate::render::Loaded { mut scene, world: _world } = crate::render::Scene::load(a, "hedge3")?;
     r.interactions.presentation.apply(&mut scene);
     let eye = std::env::var("LOOKING_GLASS_HEDGE3_EYE")
         .ok()
@@ -271,6 +271,7 @@ async fn capture(a: &mut Assets, r: &mut Route) -> Result<()> {
                 eye,
                 (target - eye).normalize_or_zero(),
                 &scene.atmosphere,
+                false,
                 false,
             );
         }

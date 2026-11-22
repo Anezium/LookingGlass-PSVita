@@ -774,6 +774,10 @@ impl Cinema {
         }
     }
     pub fn apply_npcs(&self, npcs: &mut crate::npc::Npcs) {
+        self.apply_npc_sim(npcs.sim_mut());
+    }
+
+    pub(crate) fn apply_npc_sim(&self, npcs: &mut crate::npc::NpcSim) {
         let mut hidden = vec!["rabbit_actor1", "cat_hole1", "knife_cat"];
         match self.state.beat {
             Some(Beat::Gnome(i) | Beat::End(i)) => {
@@ -1097,7 +1101,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
 
 pub async fn render_check(assets: &mut Assets) -> Result<()> {
     crate::character::check_shared_material().await?;
-    let mut scene = crate::render::Scene::load(assets, "gvillage")?;
+    let crate::render::Loaded { mut scene, world: _world } = crate::render::Scene::load(assets, "gvillage")?;
     let village = super::Village::load(assets, &scene.map)?;
     let mut c = Cinema::load(assets, &scene.map)?;
     let mut art = Art::load(assets)?;

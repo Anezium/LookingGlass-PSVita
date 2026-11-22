@@ -61,7 +61,7 @@ async fn audit(a: &mut Assets) -> Result<()> {
             if restored { interactions.restore(&snapshot, &map)?; }
             for _ in 0..60 {
                 steam.sync(&interactions.event_world);
-                interactions.place_level_particles(&mut steam);
+                interactions.place_level_particles(steam.sim_mut());
                 steam.update(1. / 60., at, &world);
             }
             let (enabled, count) = steam.emission(Id(id)).context("Missing scripted altar emitter")?;
@@ -75,7 +75,7 @@ async fn audit(a: &mut Assets) -> Result<()> {
             interactions.prepare_player(&mut stats, &mut p);
             ensure!(stats.staff_component, "Staff pickup fixture missed the altar");
             steam.sync(&interactions.event_world);
-            interactions.place_level_particles(&mut steam);
+            interactions.place_level_particles(steam.sim_mut());
             ensure!(steam.emission(Id(id)).is_some_and(|s| !s.0), "Staff altar kept emitting after pickup");
         }
     }
@@ -86,7 +86,7 @@ async fn audit(a: &mut Assets) -> Result<()> {
 pub(super) async fn render(a: &mut Assets) -> Result<()> {
     audit(a).await?;
     std::fs::create_dir_all("private/jabberwock/captures")?;
-    let mut scene = crate::render::Scene::load(a, "jlair2")?;
+    let crate::render::Loaded { mut scene, world } = crate::render::Scene::load(a, "jlair2")?;
     let mut o = Encounter::load(a, &scene.map, Kind::Lair)?;
     let mut art = art::Art::load(a, &o)?;
     let interactions = crate::interaction::Interactions::load(&scene.map)?;
@@ -109,15 +109,15 @@ pub(super) async fn render(a: &mut Assets) -> Result<()> {
         let mut steam = Steam::load(a, &scene.map)?;
         for _ in 0..120 {
             steam.sync(&interactions.event_world);
-            if gate { o.particles(&mut steam); }
-            steam.update(1. / 60., camera.eye, &scene.world);
+            if gate { o.particles(steam.sim_mut()); }
+            steam.update(1. / 60., camera.eye, &world);
         }
         let state = steam.emission(id).unwrap();
         ensure!(if gate { state == (false,0) } else { state.0 && state.1 > 0 },
             "Placed altar emission differs: {label}: {state:?}");
         for frame in 0..3 {
             clear_background(BLACK); set_camera(&cam);
-            crate::lighting::select(steam.lights(), camera.eye, &scene.world);
+            crate::lighting::select(steam.lights(), camera.eye, &world);
             crate::render_fx::begin_view(&cam, 2., &scene.atmosphere, false);
             scene.draw(camera.eye, 2., false, false, &o.transforms());
             art.draw(&o, &scene.atmosphere, camera.eye, false);

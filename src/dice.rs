@@ -1074,8 +1074,26 @@ impl Art {
             atmosphere: Default::default(),
         })
     }
+    pub(crate) fn extract_render_pose(&self, input:&mut RenderInput) {
+        input.puppet=input.demon.as_ref().map(|d| {
+            let growth=match d.phase { Phase::Appear=>(d.time/0.7).clamp(0.01,1.), Phase::Vanish=>(1.-d.time/0.5).max(0.), _=>1. };
+            let (clip,looping)=d.clip();
+            (d.kind,self.puppets[d.kind].extract_draw(clip,d.time,looping,
+                Transform {translation:d.feet,rotation:Quat::from_rotation_z(d.yaw)},[1.25,1.5,2.][d.kind]*growth))
+        });
+    }
+    pub(crate) fn valid_render_input(&self,input:&RenderInput)->bool {
+        summon_binding(input.demon.as_ref().map(|d|d.kind),input.puppet.as_ref().map(|(slot,_)|*slot),self.puppets.len().min(self.poof.len()))
+            && input.puppet.as_ref().is_none_or(|(slot,p)|self.puppets[*slot].valid_input(p) && p.bones()<=65536)
+    }
+    pub(crate) fn draw_owned(&mut self,input:&RenderInput,bright:bool) {
+        if let Some((slot,pose))=&input.puppet { self.puppets[*slot].draw_input(pose,bright); }
+    }
     pub fn draw(&mut self, state: &State, fullbright: bool) {
-        if let Some(d) = &state.demon {
+        self.draw_input(state.render_view(), fullbright);
+    }
+    pub(crate) fn draw_input(&mut self, state: RenderView<'_>, fullbright: bool) {
+        if let Some(d) = state.demon {
             let growth = match d.phase {
                 Phase::Appear => (d.time / 0.7).clamp(0.01, 1.),
                 Phase::Vanish => (1. - d.time / 0.5).max(0.),
@@ -1096,8 +1114,11 @@ impl Art {
         }
     }
     pub fn effects(&mut self, state: &State, camera: Vec3) {
+        self.effects_input(state.render_view(), camera);
+    }
+    pub(crate) fn effects_input(&mut self, state: RenderView<'_>, camera: Vec3) {
         let atmosphere = self.atmosphere.borrow();
-        if let Some(d) = &state.demon {
+        if let Some(d) = state.demon {
             let pose = Transform {
                 translation: d.center(),
                 rotation: Quat::from_rotation_z(d.yaw),
@@ -1141,7 +1162,7 @@ impl Art {
         }
         self.emitters
             .retain(|id, _| state.bolts.iter().any(|p| p.id == *id));
-        for p in &state.bolts {
+        for p in state.bolts.iter() {
             let pose = Transform {
                 translation: p.position,
                 rotation: Quat::from_rotation_arc(Vec3::X, p.velocity.normalize_or_zero()),
@@ -1282,16 +1303,16 @@ pub fn check(assets: &mut Assets) -> Result<()> {
 
 /// Explicitly staged art checks, separate from the live combat and traversal checks.
 pub async fn render_check(assets: &mut Assets) -> Result<()> {
-    let mut scene = crate::render::Scene::load(assets, "skool2")?;
+    let crate::render::Loaded { mut scene, world } = crate::render::Scene::load(assets, "skool2")?;
     let mut i = crate::interaction::Interactions::load(&scene.map)?;
     i.set_entry(assets, &scene.map, "skool2", None)?;
-    let mut visuals = crate::weapons::Visuals::load(assets)?;
+    let (mut visuals, mut visual_art) = crate::weapons::Visuals::load(assets)?;
     let material = crate::character::skin_material()?;
     let data = Data::load(assets)?;
     // Stage on the gym floor, below its rafters, with room for the largest summon.
     let start = vec3(2280., -2830., 100.);
     let end = start - Vec3::Z * 1100.;
-    let floor = scene.world.sweep(start, end, Vec3::splat(2.));
+    let floor = world.sweep(start, end, Vec3::splat(2.));
     ensure!(
         !floor.start_solid && floor.fraction < 1. && floor.normal.z > 0.7,
         "Demon visual fixture needs clear supported ground"
@@ -1299,8 +1320,7 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
     let feet = start.lerp(end, floor.fraction) - Vec3::Z * 1.9;
     let camera = vec3(2100., -3050., feet.z + 140.);
     ensure!(
-        !scene
-            .world
+        !world
             .sweep(camera, camera, Vec3::splat(2.))
             .start_solid,
         "Demon visual fixture camera is obstructed"
@@ -1338,6 +1358,7 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
         };
         for phase in phases {
             visuals.clear();
+            visual_art.clear();
             let delta = if matches!(
                 phase,
                 Phase::Melee | Phase::Claw | Phase::Follow | Phase::ChargeHit
@@ -1365,7 +1386,7 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
             });
             let center = visuals.dice.demon.as_ref().unwrap().center();
             ensure!(
-                visible(&scene.world, camera, center),
+                visible(&world, camera, center),
                 "Demon visual fixture is occluded"
             );
             let target = Target {
@@ -1374,7 +1395,7 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
                 half: Vec3::splat(24.),
             };
             ensure!(
-                visible(&scene.world, center, target.center),
+                visible(&world, center, target.center),
                 "Demon visual attack is obstructed"
             );
             let time = if phase == Phase::Appear {
@@ -1400,7 +1421,7 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
                 visuals.dice.advance(
                     1. / 60.,
                     &Context {
-                        world: &scene.world,
+                        world: &world,
                         targets: &[target],
                     },
                     camera,
@@ -1418,8 +1439,8 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
                 });
                 scene.draw(camera, 0., false, false, &i.transforms());
                 material.atmosphere(&scene.atmosphere, camera);
-                visuals.atmosphere(&scene.atmosphere, camera);
-                visuals.draw_effects(&material, camera, false, false);
+                visual_art.atmosphere(&scene.atmosphere, camera);
+                visual_art.draw_effects(&visuals, &material, camera, false, false);
                 crate::render::depth_read_only(|| {
                     scene.draw(camera, 0., false, true, &i.transforms())
                 });
@@ -1795,5 +1816,51 @@ mod tests {
                 .is_empty());
         }
         assert!(s.demon.is_none());
+    }
+}
+
+/// Owned per-effect render values, without simulation owner or graphics resources.
+#[derive(Default)]
+pub(crate) struct RenderInput {
+    pub(crate) puppet: Option<(usize,crate::npc::PuppetInput)>,
+    pub(crate) dice: Vec<Die>,
+    pub(crate) demon: Option<Demon>,
+    pub(crate) bolts: Vec<Bolt>,
+    pub(crate) beams: Vec<Beam>,
+}
+pub(crate) struct RenderView<'a> {
+    pub(crate) dice: &'a [Die],
+    pub(crate) demon: &'a Option<Demon>,
+    pub(crate) bolts: &'a [Bolt],
+    pub(crate) beams: &'a [Beam],
+}
+impl RenderInput {
+    pub(crate) fn records(&self)->usize { self.dice.len()+self.bolts.len()+self.beams.len() }
+    pub(crate) fn heap_bytes(&self)->usize { self.dice.len()*std::mem::size_of::<Die>() + self.bolts.len()*std::mem::size_of::<Bolt>() + self.beams.len()*std::mem::size_of::<Beam>() + self.puppet.as_ref().map_or(0,|(_,p)|p.bytes()-std::mem::size_of::<crate::npc::PuppetInput>()) }
+    pub(crate) fn view(&self) -> RenderView<'_> { RenderView {dice: &self.dice,demon: &self.demon,bolts: &self.bolts,beams: &self.beams} }
+}
+impl State {
+    pub(crate) fn render_records(&self)->usize { self.dice.len()+self.bolts.len()+self.beams.len() }
+    pub(crate) fn render_view(&self) -> RenderView<'_> { RenderView {dice: &self.dice,demon: &self.demon,bolts: &self.bolts,beams: &self.beams} }
+    pub(crate) fn extract_render(&self, out:&mut RenderInput) {
+        out.dice.clone_from(&self.dice);
+        out.demon.clone_from(&self.demon);
+        out.bolts.clone_from(&self.bolts);
+        out.beams.clone_from(&self.beams);
+    }
+}
+
+fn summon_binding(kind:Option<usize>,slot:Option<usize>,resources:usize)->bool {
+    match (kind,slot) {(None,None)=>true,(Some(kind),Some(slot))=>kind==slot && slot<resources,_=>false}
+}
+#[cfg(test)]
+mod snapshot_binding_tests {
+    use super::summon_binding;
+    #[test]
+    fn summon_binding_rejects_missing_wrong_and_retired_resource_slots() {
+        assert!(summon_binding(None,None,3));assert!(summon_binding(Some(0),Some(0),3));
+        assert!(!summon_binding(Some(1),Some(0),3));assert!(!summon_binding(None,Some(0),3));
+        assert!(!summon_binding(Some(0),None,3));assert!(!summon_binding(Some(3),Some(3),3));
+        assert!(!summon_binding(Some(0),Some(0),0));
     }
 }

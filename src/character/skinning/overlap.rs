@@ -626,7 +626,7 @@ impl Store {
                 && d.key==skeleton as *const Skeleton as usize && same_transform(d.transform,p.transform)
                 && d.scale.to_bits()==p.scale.to_bits() && d.flat==p.flat && d.fullbright==p.fullbright
                 && d.alpha.to_bits()==p.alpha.to_bits()).map(|d|(&**old,d)));
-        let instance=previous.map_or_else(super::identity::next_instance,|(_,d)|d.instance);
+        let instance=previous.map_or_else(super::identity::next_art_instance,|(_,d)|d.instance);
         let start = i.surfaces.len();
         let mut share = crate::render_fx::GpuSkinShare::default();
         for (mesh_id, (surface, mesh)) in skeleton.surfaces.iter().zip(meshes).enumerate() {
@@ -1019,6 +1019,21 @@ impl Frame {
             assert_eq!(s.cursor, i.draws.len(), "unconsumed gathered skin draws");
         });
         super::prepared::assert_consumed();
+    }
+    /// Read only while the gather owns the input arena, before dispatch.
+    pub(crate) fn snapshot_census(&self) -> (usize, usize, usize, usize) {
+        assert!(gathering());
+        STORE.with(|s| {
+            let s = s.borrow();
+            let s = s.as_ref().unwrap();
+            let i = unsafe { &*s.input.get() };
+            let bytes = i.draws.len() * std::mem::size_of::<Draw>()
+                + i.surfaces.len() * std::mem::size_of::<Surface>()
+                + i.pose.len() * std::mem::size_of::<Transform>()
+                + i.scales.len() * std::mem::size_of::<f32>()
+                + i.palette.len() * std::mem::size_of::<(Mat3, Vec3)>();
+            (bytes, i.draws.len(), i.pose.len(), i.surfaces.len())
+        })
     }
     pub(crate) fn dispatch(&mut self) {
         assert!(gathering());

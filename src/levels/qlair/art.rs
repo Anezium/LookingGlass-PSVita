@@ -578,6 +578,9 @@ impl LevelArt for Art {
             }
         }
     }
+    fn hud_capture_source(&self) -> Option<crate::level::HudSource> {
+        Some(crate::level::HudSource { resource: self.ui.resource_id(), capture: capture_hud })
+    }
     fn hud(&mut self, l: &dyn LevelController) {
         let o = l.downcast_ref::<Queen>().unwrap();
         let remaining = match o.saved.phase {
@@ -597,4 +600,19 @@ impl LevelArt for Art {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+fn capture_hud(
+    l: &dyn LevelController,
+    _view: crate::level::HudCaptureView,
+    paint: &mut crate::render_snapshot::Painter<'_>,
+) {
+    let o = l.downcast_ref::<Queen>().unwrap();
+    let remaining = match o.saved.phase {
+        Phase::Queen1 if o.saved.queen1 > 0. => o.saved.queen1 / 2500.,
+        // The second form dies at the authored 1,000-health threshold.
+        Phase::Queen2 if o.saved.queen2 >= 1000. => (o.saved.queen2 - 1000.) / 3500.,
+        _ => return,
+    };
+    paint.boss( "QUEEN OF HEARTS", remaining);
 }

@@ -738,7 +738,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
 }
 /// Explicitly staged snapshots; combat and trigger checks run separately.
 pub async fn render_check(assets: &mut Assets) -> Result<()> {
-    let mut scene = crate::render::Scene::load(assets, "potears1")?;
+    let crate::render::Loaded { mut scene, world } = crate::render::Scene::load(assets, "potears1")?;
     let mut logic = crate::interaction::Interactions::load(&scene.map)?;
     logic.set_entry(assets, &scene.map, "potears1", None)?;
     let timing = Timing::load(assets)?;
@@ -767,7 +767,7 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
         b.notarget = stage == "patrol";
         let mut reached = false;
         for step in 0..2400 {
-            b.advance(STEP, &scene.world, eye, timing);
+            b.advance(STEP, &world, eye, timing);
             reached = match stage {
                 "patrol" => step > 24,
                 "attack" => b.state == State::Attack && b.time > timing.release * 0.5,
@@ -790,8 +790,8 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
             .find_map(|n| {
                 let angle = n as f32 * std::f32::consts::TAU / 24.;
                 let p = center + vec3(angle.cos() * 280., angle.sin() * 280., 80.);
-                (!scene.world.sweep(p, p, Vec3::splat(4.)).start_solid
-                    && visible(&scene.world, p, center))
+                (!world.sweep(p, p, Vec3::splat(4.)).start_solid
+                    && visible(&world, p, center))
                 .then_some(p)
             })
             .context("Clear Ladybug fixture camera")?;
@@ -837,6 +837,18 @@ pub async fn render_check(assets: &mut Assets) -> Result<()> {
     );
     Ok(())
 }
+/// Owned Ladybug body/acorn draw input. No controller, World or animation data
+/// is retained: resources stay resident in `Art`.
+pub(crate) struct RenderInput {
+    body: crate::npc::PuppetInput,
+    electric: f32,
+    acorns: Vec<(Vec3, f32)>,
+}
+impl RenderInput {
+    pub(crate) fn bytes(&self) -> usize {
+        self.body.bytes() + self.acorns.len() * std::mem::size_of::<(Vec3, f32)>()
+    }
+}
 pub struct Art {
     actor: crate::npc::Puppet,
     acorn: crate::weapons::Prop,
@@ -850,6 +862,51 @@ impl Art {
             actor: crate::npc::Puppet::load(assets, "c_ladybug", &CLIPS, specs)?,
             acorn: crate::weapons::Prop::load_animation(assets, "prj_acorn", "acorn", specs)?,
         })
+    }
+    pub(crate) fn snapshot_bones(&self) -> usize { self.actor.snapshot_bones() }
+    pub(crate) fn extract_input(&self, b: &Ladybug, timing: Timing) -> RenderInput {
+        let (clip, time, looping) = b.clip(timing);
+        RenderInput {
+            body: self.actor.extract_draw(
+                clip,
+                time,
+                looping,
+                Transform {
+                    translation: b.feet,
+                    rotation: Quat::from_rotation_z(b.yaw),
+                },
+                b.visual_scale(),
+            ).with_attachments(b.carrying),
+            electric: b.electric,
+            acorns: b.acorns.iter().map(|a| (a.position, a.age)).collect(),
+        }
+    }
+    pub(crate) fn valid_input(&self, i: &RenderInput) -> bool {
+        self.actor.valid_input(&i.body) && i.acorns.len() <= 16384
+            && i.electric.is_finite() && (0. ..=crate::electric::LIFE).contains(&i.electric)
+    }
+    pub(crate) fn draw_input(&mut self, i: &RenderInput, fullbright: bool) {
+        let consumer = self.actor.electric_consumer(i.electric);
+        self.actor.draw_input(&i.body, fullbright);
+        drop(consumer);
+        self.actor.draw_electric(i.electric);
+        for (position, age) in &i.acorns {
+            self.acorn.draw_frame(
+                Transform {
+                    translation: *position,
+                    rotation: Quat::from_euler(
+                        EulerRot::XYZ,
+                        *age * 1.75,
+                        *age * 3.5,
+                        *age * 5.25,
+                    ),
+                },
+                1.,
+                fullbright,
+                *age,
+                true,
+            );
+        }
     }
     pub fn draw(&mut self, b: &Ladybug, timing: Timing, fullbright: bool) {
         let (clip, time, looping) = b.clip(timing);
@@ -886,6 +943,10 @@ impl Art {
                 true,
             );
         }
+    }
+    pub(crate) fn extract_effects(b:&Ladybug,out:&mut Vec<crate::render_snapshot::WaveInput>) {
+        let remaining=16385usize.saturating_sub(out.len());
+        out.extend(b.bursts.iter().take(remaining).map(|w|crate::render_snapshot::WaveInput::Ladybug(w.position,w.age)));
     }
     pub fn effects(b: &Ladybug) {
         for burst in &b.bursts {

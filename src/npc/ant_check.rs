@@ -19,7 +19,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
             .into_iter()
             .filter(|s| crate::ant::is_ant(&s.model))
         {
-            let d = Data::load(assets, &s.model, &[])?;
+            let d = ModelData::load(assets, &s.model, &[])?;
             for clip in if s.model == "c_armyantcorp" {
                 crate::ant::CORPORAL
             } else {
@@ -52,7 +52,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
         let mut results = Vec::new();
         for fps in [30, 60, 144] {
             let mut a = Ant::new(11, corporal, Vec3::Z * 0.1, 0.);
-            let data = Data::load(assets, a.model(), &[])?;
+            let data = ModelData::load(assets, a.model(), &[])?;
             let mut out = Feedback::default();
             for _ in 0..fps * 20 {
                 a.update(
@@ -93,32 +93,32 @@ struct Saved {
 pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
     std::fs::create_dir_all("private/ants")?;
     for (map, corporal) in [("potears1", false), ("potears2", true)] {
-        let mut scene = crate::render::Scene::load(assets, map)?;
+        let crate::render::Loaded { mut scene, mut world } = crate::render::Scene::load(assets, map)?;
         let mut interactions = crate::interaction::Interactions::load(&scene.map)?;
         interactions.set_entry(assets, &scene.map, map, None)?;
-        interactions.sync(&mut scene.world);
+        interactions.sync(&mut world);
         let mut npcs = Npcs::load(assets, &scene.map, map, None, false, false)?;
-        npcs.update(0., &scene.world, Vec3::splat(10000.));
+        npcs.update(0., &world, Vec3::splat(10000.));
         ensure!(
-            npcs.actors
+            npcs.sim.actors
                 .iter()
-                .filter(|a| npcs.registry_owns(a))
+                .filter(|a| npcs.sim.registry_owns(a))
                 .all(|a| a.ant.is_none()),
             "Scripted Ant acquired duplicate combat ownership"
         );
         let id = npcs
-            .actors
+            .sim.actors
             .iter()
             .position(|a| a.ant.as_ref().is_some_and(|g| g.corporal == corporal))
             .context("Missing generic Ant fixture")?;
         let initial = npcs.snapshot();
-        let a = npcs.actors[id].ant.as_ref().unwrap();
+        let a = npcs.sim.actors[id].ant.as_ref().unwrap();
         let target = a.target(id).center;
         let eye = (0..32)
             .filter_map(|i| {
                 let angle = i as f32 * std::f32::consts::TAU / 32.;
                 let p = target + vec3(angle.cos() * 230., angle.sin() * 230., 32.);
-                let trace = scene.world.sweep(target, p, Vec3::splat(2.));
+                let trace = world.sweep(target, p, Vec3::splat(2.));
                 (!trace.start_solid && trace.fraction >= 1.).then_some(p)
             })
             .next()
@@ -132,9 +132,9 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             loot.validate()?;
             let before = npcs.loot_sources();
             for _ in 0..120 {
-                npcs.update(1. / 60., &scene.world, saved.eye);
+                npcs.update(1. / 60., &world, saved.eye);
             }
-            loot.defeated(&before, &npcs.loot_sources(), &scene.world);
+            loot.defeated(&before, &npcs.loot_sources(), &world);
             ensure!(
                 serde_json::to_value(npcs.snapshot())? == serde_json::to_value(saved.expected)?,
                 "Fresh-process Ant continuation differs"
@@ -155,8 +155,8 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         }
         npcs.restore(&old)?;
         ensure!(
-            npcs.actors[id].ant.is_some()
-                && npcs.actors[id].position() == initial.actors[id].position(),
+            npcs.sim.actors[id].ant.is_some()
+                && npcs.sim.actors[id].position() == initial.actors[id].position(),
             "Legacy Ant migration failed"
         );
         npcs.restore(&initial)?;
@@ -169,7 +169,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         })
         .context("Ant did not accept weapon hit")?;
         let mut loot = crate::loot::Loot::default();
-        loot.defeated(&before, &npcs.loot_sources(), &scene.world);
+        loot.defeated(&before, &npcs.loot_sources(), &world);
         ensure!(
             loot.drops.len() == 1
                 && loot.drops[0].grade
@@ -181,11 +181,11 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             "Wrong Ant death reward"
         );
         for _ in 0..20 {
-            npcs.update(1. / 60., &scene.world, eye);
+            npcs.update(1. / 60., &world, eye);
         }
         let cast = npcs.snapshot();
         for _ in 0..120 {
-            npcs.update(1. / 60., &scene.world, eye);
+            npcs.update(1. / 60., &world, eye);
         }
         let expected = npcs.snapshot();
         if mode == "ant-save-write" {
@@ -204,8 +204,8 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         }
         npcs.restore(&initial)?;
         // Hide neighbours only in the staged visual fixture; saved cast checks use all actors.
-        let actor = npcs.actors[id].clone();
-        npcs.actors = vec![actor];
+        let actor = npcs.sim.actors[id].clone();
+        npcs.sim.actors = vec![actor];
         let mut hashes = BTreeSet::new();
         for (label, phase, time, frozen, variant) in [
             ("idle", Phase::Idle, 0.2, false, 0),
@@ -218,7 +218,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             ("frozen", Phase::Dead, 0.5, true, 0),
             ("removed", Phase::Dead, 30., false, 0),
         ] {
-            let a = npcs.actors[0].ant.as_mut().unwrap();
+            let a = npcs.sim.actors[0].ant.as_mut().unwrap();
             a.phase = phase;
             a.health = if phase == Phase::Dead { 0. } else { 50. };
             a.time = time;
@@ -239,7 +239,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 });
                 let transforms = interactions.transforms();
                 scene.draw(eye, 0., false, false, &transforms);
-                npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false);
+                npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false, false);
                 crate::render::depth_read_only(|| scene.draw(eye, 0., false, true, &transforms));
                 set_default_camera();
                 if frame == 2 {

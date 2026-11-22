@@ -87,12 +87,12 @@ impl Data {
             self.ship.sample(t - self.performance_camera2(), true)
         }
     }
-    pub(super) fn alice_pose(&self, t: f32) -> Transform {
+    pub(in crate::school) fn alice_pose(&self, world: &World, t: f32) -> Transform {
         if t < 0.2 {
             self.points["fake_pos1"]
         } else if t < 14.3 {
             walk(
-                &self.camera_world,
+                world,
                 &self.alice_walk,
                 (t - 0.2) * self.alice_speed,
             )

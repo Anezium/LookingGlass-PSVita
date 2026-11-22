@@ -5,6 +5,7 @@ pub(super) struct Art {
     alice: Puppet,
     ant: Puppet,
     shots: [Prop; 2],
+    input: Option<DrawInput>,
 }
 impl Art {
     pub fn load(a: &mut Assets) -> Result<Self> {
@@ -15,6 +16,7 @@ impl Art {
         Ok(Self {
             boss,
             alice: Puppet::load(a, "alice", data::ALICE, &specs)?,
+            input: None,
             ant: Puppet::load(a, "c_armyant", crate::ant::REGULAR, &specs)?,
             shots: [
                 Prop::load_animation(a, "prj_bullet", "idle", &specs)?,
@@ -23,97 +25,156 @@ impl Art {
         })
     }
 }
+struct BossDraw {
+    clip: &'static str,
+    time: f32,
+    looping: bool,
+    pose: Transform,
+    alice: Transform,
+    alice_time: f32,
+}
+struct AntDraw {
+    ant: crate::ant::Ant,
+    moving: bool,
+    scale: f32,
+}
+struct DrawInput {
+    mouth: f32,
+    boss: Option<BossDraw>,
+    ants: Vec<AntDraw>,
+}
+
+impl DrawInput {
+    fn capture(o: &Flora, mouth: f32) -> Self {
+        Self {
+            mouth,
+            boss: boss_draw(o),
+            ants: ant_draws(o).map(|(ant, moving, scale)| AntDraw {
+                ant: ant.clone(), moving, scale,
+            }).collect(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.ants.len() * std::mem::size_of::<AntDraw>()
+            + self.ants.iter().map(|a| std::mem::size_of_val(a.ant.shots.as_slice())
+                + std::mem::size_of_val(a.ant.blasts.as_slice())).sum::<usize>()
+    }
+}
+
 impl LevelArt for Art {
+    fn extract_snapshot(&mut self, level: &dyn LevelController, story: &Story) -> (usize, bool) {
+        let o = level.downcast_ref::<Flora>().expect("Flora controller");
+        self.input = (o.saved.ants.len() <= 24
+            && o.saved.ants.iter().all(|s| s.ant.shots.len() <= 32 && s.ant.blasts.len() <= 32))
+            .then(|| DrawInput::capture(o, story.mouth(&["centipede_actor1"])));
+        (self.snapshot_bytes(), !self.snapshot_ready())
+    }
+
+    fn snapshot_ready(&self) -> bool { self.input.is_some() }
+    fn snapshot_bytes(&self) -> usize { self.input.as_ref().map_or(0, DrawInput::bytes) }
+    fn clear_snapshot(&mut self) { self.input = None; }
+
+    fn draw_snapshot(&mut self, atm: &crate::environment::Atmosphere, camera: Vec3, bright: bool) -> bool {
+        let Some(input) = self.input.take() else { return false; };
+        self.boss.mouth(input.mouth);
+        self.draw_cast(input.boss.as_ref(), input.ants.iter().map(AntDraw::view), atm, camera, bright);
+        self.input = Some(input);
+        true
+    }
+
+    fn effects_snapshot(&mut self, camera: Vec3, atm: &crate::environment::Atmosphere) -> bool {
+        let Some(input) = self.input.take() else { return false; };
+        self.draw_effects(input.boss.as_ref(), input.ants.iter().map(AntDraw::view), camera, atm);
+        self.input = Some(input);
+        true
+    }
+
     fn story_pose(&mut self, s: &Story) {
         self.boss.mouth(s.mouth(&["centipede_actor1"]));
     }
-    fn draw(
-        &mut self,
-        l: &dyn LevelController,
-        atm: &crate::environment::Atmosphere,
-        camera: Vec3,
-        bright: bool,
+
+    fn draw(&mut self, l: &dyn LevelController, atm: &crate::environment::Atmosphere, camera: Vec3, bright: bool) {
+        let flora = l.downcast_ref::<Flora>().expect("Flora controller");
+        self.draw_cast(boss_draw(flora).as_ref(), ant_draws(flora), atm, camera, bright);
+    }
+
+    fn effects(&mut self, l: &dyn LevelController, camera: Vec3, atm: &crate::environment::Atmosphere) {
+        let flora = l.downcast_ref::<Flora>().expect("Flora controller");
+        self.draw_effects(boss_draw(flora).as_ref(), ant_draws(flora), camera, atm);
+    }
+
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
+
+impl AntDraw {
+    fn view(&self) -> (&crate::ant::Ant, bool, f32) {
+        (&self.ant, self.moving, self.scale)
+    }
+}
+
+fn boss_draw(o: &Flora) -> Option<BossDraw> {
+    o.reveal().then(|| {
+        let (clip, time, looping) = o.boss_clip();
+        BossDraw {
+            clip, time, looping, pose: o.data.points["cent_posx1"],
+            alice: o.saved.alice, alice_time: o.saved.time as f32,
+        }
+    })
+}
+
+fn ant_draws(o: &Flora) -> impl Iterator<Item = (&crate::ant::Ant, bool, f32)> {
+    o.saved.ants.iter().map(|s| &s.ant).filter(|ant| ant.enabled).map(|ant| {
+        let moving = o.saved.phase == Phase::Rush && o.data.runners.contains_key(&ant.id)
+            && ant.health > 0.;
+        (ant, moving, ant.visual_scale(&o.data))
+    })
+}
+
+impl Art {
+    fn draw_cast<'a>(
+        &mut self, boss: Option<&BossDraw>, ants: impl Iterator<Item = (&'a crate::ant::Ant, bool, f32)>,
+        atm: &crate::environment::Atmosphere, camera: Vec3, bright: bool,
     ) {
-        let o = l.downcast_ref::<Flora>().unwrap();
         for a in [&mut self.boss, &mut self.alice, &mut self.ant] {
             a.atmosphere(atm, camera);
         }
-        if o.reveal() {
-            let (clip, t, looping) = o.boss_clip();
-            self.boss
-                .draw(clip, t, looping, o.data.points["cent_posx1"], 1., bright);
-            self.alice.draw(
-                "idle_stand",
-                o.saved.time as f32,
-                true,
-                o.saved.alice,
-                1.,
-                bright,
-            );
+        if let Some(boss) = boss {
+            self.boss.draw(boss.clip, boss.time, boss.looping, boss.pose, 1., bright);
+            self.alice.draw("idle_stand", boss.alice_time, true, boss.alice, 1., bright);
         }
-        for s in o.saved.ants.iter().filter(|s| s.ant.enabled) {
-            let a = &s.ant;
-            let moving =
-                o.saved.phase == Phase::Rush && o.data.runners.contains_key(&a.id) && a.health > 0.;
-            let electric_consumer = self.ant.electric_consumer(a.electric);
+        for (ant, moving, scale) in ants {
+            let electric_consumer = self.ant.electric_consumer(ant.electric);
             self.ant.draw(
-                if moving { "walk_fast" } else { a.clip() },
-                a.time,
-                moving || a.loops(),
-                Transform {
-                    translation: a.feet,
-                    rotation: Quat::from_rotation_z(a.yaw),
-                },
-                a.visual_scale(&o.data),
-                bright,
+                if moving { "walk_fast" } else { ant.clip() },
+                ant.time, moving || ant.loops(), ant_pose(ant), scale, bright,
             );
             drop(electric_consumer);
-            self.ant.draw_electric(a.electric);
-            for shot in &a.shots {
+            self.ant.draw_electric(ant.electric);
+            for shot in &ant.shots {
                 crate::ant::draw_shot(&mut self.shots, shot, bright);
             }
         }
     }
-    fn effects(
-        &mut self,
-        l: &dyn LevelController,
-        camera: Vec3,
-        atm: &crate::environment::Atmosphere,
+
+    fn draw_effects<'a>(
+        &mut self, boss: Option<&BossDraw>, ants: impl Iterator<Item = (&'a crate::ant::Ant, bool, f32)>,
+        camera: Vec3, atm: &crate::environment::Atmosphere,
     ) {
-        let o = l.downcast_ref::<Flora>().unwrap();
-        if o.reveal() {
-            let (clip, t, looping) = o.boss_clip();
-            self.boss.draw_effects(
-                clip,
-                t,
-                looping,
-                o.data.points["cent_posx1"],
-                1.,
-                camera,
-                atm,
-            );
+        if let Some(boss) = boss {
+            self.boss.draw_effects(boss.clip, boss.time, boss.looping, boss.pose, 1., camera, atm);
         }
-        for s in o.saved.ants.iter().filter(|s| s.ant.enabled) {
-            let a = &s.ant;
-            self.ant.draw_effects(
-                a.clip(),
-                a.time,
-                a.loops(),
-                Transform {
-                    translation: a.feet,
-                    rotation: Quat::from_rotation_z(a.yaw),
-                },
-                a.visual_scale(&o.data),
-                camera,
-                atm,
-            );
-            crate::ant::draw_blasts(a);
+        for (ant, _, scale) in ants {
+            self.ant.draw_effects(ant.clip(), ant.time, ant.loops(), ant_pose(ant), scale, camera, atm);
+            crate::ant::draw_blasts(ant);
         }
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+}
+
+fn ant_pose(ant: &crate::ant::Ant) -> Transform {
+    Transform {
+        translation: ant.feet,
+        rotation: Quat::from_rotation_z(ant.yaw),
     }
 }

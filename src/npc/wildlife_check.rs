@@ -11,7 +11,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
         .context("Jabberspawn fixture missing")?;
     let world = World::fixture(&[(vec3(-4000., -4000., -20.), vec3(4000., 4000., 0.))]);
     for kind in Kind::ALL {
-        let data = Data::load(assets, kind.model(), &[])?;
+        let data = ModelData::load(assets, kind.model(), &[])?;
         for clip in kind.clips() {
             ensure!(data.clips[*clip].duration() > 0., "Empty creature clip");
         }
@@ -125,7 +125,7 @@ fn clockwork_departures(assets: &mut Assets) -> Result<()> {
         let mut g = crate::wildlife::Creature::new(Kind::WallSpider, s.origin, s.yaw, s.scale, 1);
         let b = g.target(0);
         let f = vec3(s.yaw.cos(), s.yaw.sin(), 0.);
-        let data = Data::load(assets, "c_spider_wall", &[])?;
+        let data = ModelData::load(assets, "c_spider_wall", &[])?;
         let mut out = combat::Feedback::default();
         for _ in 0..1200 { g.step(&world, b.center + f * 200., &data, &mut out); }
         ensure!(g.phase != Phase::Wall && g.feet.distance(s.origin) > 100., "Clockwork spider failed to leave wall");
@@ -137,7 +137,7 @@ fn clockwork_departures(assets: &mut Assets) -> Result<()> {
 
 pub async fn native(assets: &mut Assets) -> Result<()> {
     attack_fx::render_check(assets).await?;
-    let mut scene = crate::render::Scene::load(assets, "hedge1")?;
+    let crate::render::Loaded { mut scene, world } = crate::render::Scene::load(assets, "hedge1")?;
     let template = placements(&scene.map, "hedge1", None, false)
         .into_iter()
         .find(|s| s.model == "c_jabberspawn" && s.origin.z > 1700.)
@@ -147,13 +147,13 @@ pub async fn native(assets: &mut Assets) -> Result<()> {
     let material = crate::character::skin_material()?;
     std::fs::create_dir_all("private/wildlife/captures")?;
     for kind in Kind::ALL {
-        let mut model = Model::load(assets, kind.model(), &[], &specs)?;
+        let mut model = ModelArt::load(assets, kind.model(), &[], &specs)?;
         let mut spawn = template.clone();
         spawn.model = kind.model().into();
         spawn.name.clear();
         spawn.resident_spawn = None;
         let mut p = resident::Resident::new(&spawn, &scene.map, "hedge1")?.unwrap();
-        p.place(&scene.world);
+        p.place(&world);
         let b = p.target(0);
         let target = b.center;
         let eye = (0..64)
@@ -167,7 +167,7 @@ pub async fn native(assets: &mut Assets) -> Result<()> {
                     )
             })
             .find(|eye| {
-                let t = scene.world.sweep(target, *eye, Vec3::splat(2.));
+                let t = world.sweep(target, *eye, Vec3::splat(2.));
                 !t.start_solid && t.fraction >= 1.
             })
             .context("No creature camera")?;
@@ -262,7 +262,7 @@ pub fn fresh(assets: &mut Assets, read: bool) -> Result<()> {
     let eye = vec3(90., 0., 48.);
     std::fs::create_dir_all("private/wildlife/saves")?;
     for kind in Kind::ALL {
-        let data = Data::load(assets, kind.model(), &[])?;
+        let data = ModelData::load(assets, kind.model(), &[])?;
         for (name, phase) in [
             ("idle", Phase::Idle),
             ("wake", Phase::Wake),

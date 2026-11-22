@@ -138,7 +138,7 @@ pub struct ReflectionActor {
     pub pose: crate::skeletal::Transform, pub time: f32, pub alpha: f32,
 }
 
-pub trait LevelController: Any {
+pub trait LevelController: Any + Send {
     /// The Appendix F id (`garden1`, `wforest-return`). Rule keys are `<id>/...`, fact keys `<id>....`
     fn id(&self) -> &'static str;
 
@@ -243,7 +243,7 @@ pub trait LevelController: Any {
     /// Commit an existing presentation thread through the same fog/sky owner as a trigger.
     fn take_presentation_event(&mut self) -> Option<&'static str> { None }
     /// Authored emitter visibility and binding; server breath points are independent.
-    fn particles(&self, _steam: &mut crate::particles::Steam) {}
+    fn particles(&self, _steam: &mut crate::particles::SteamSim) {}
     /// Animated lights owned by this visit, selected with ordinary world lights.
     fn lights(&self) -> Vec<crate::lighting::Light> { Vec::new() }
 
@@ -420,6 +420,79 @@ impl dyn LevelController {
     }
 }
 
+/// Story values a capture reads, published as plain numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StoryPose {
+    /// Lip amplitudes of the capture's speakers, in the capture's own order.
+    pub mouths: [f32; 2],
+    /// Line index and elapsed time of the capture's dialogue; zero when it is not playing.
+    pub line: usize,
+    pub clock: f32,
+}
+
+/// The simulation half of a registered art's snapshot. It holds shared CPU data only, reads the
+/// controller and plain story numbers, and returns a plain value for `LevelArt::publish_snapshot`.
+pub trait LevelCapture: Send + Sync {
+    fn story(&self, story: &Story) -> StoryPose;
+    fn capture(&self, level: &dyn LevelController, story: &StoryPose) -> Box<dyn Any + Send>;
+}
+
+/// Values sampled on the owner at the HUD capture point.
+#[derive(Clone, Copy)]
+pub(crate) struct HudCaptureView {
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+}
+
+/// A level HUD capture can append bounded commands from the controller and a
+/// sampled viewport. The owner binds the UI identity when it constructs the
+/// painter and validates the resulting batch before drawing.
+pub(crate) trait HudCapture: Send + Sync {
+    fn capture_hud(
+        &self,
+        level: &dyn LevelController,
+        view: HudCaptureView,
+        painter: &mut crate::render_snapshot::Painter<'_>,
+    );
+}
+
+type HudCaptureFn = fn(&dyn LevelController, HudCaptureView, &mut crate::render_snapshot::Painter<'_>);
+
+impl HudCapture for HudCaptureFn {
+    fn capture_hud(
+        &self,
+        level: &dyn LevelController,
+        view: HudCaptureView,
+        paint: &mut crate::render_snapshot::Painter<'_>,
+    ) {
+        self(level, view, paint);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HudSource {
+    pub(crate) resource: u64,
+    pub(crate) capture: HudCaptureFn,
+}
+
+impl HudSource {
+    pub(crate) fn capture(
+        self,
+        level: &dyn LevelController,
+        view: HudCaptureView,
+        out: &mut Vec<crate::render_snapshot::HudCommand>,
+    ) {
+        let mut painter = crate::render_snapshot::Painter::for_resource(self.resource, out);
+        self.capture.capture_hud(level, view, &mut painter);
+    }
+}
+
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<Slot>();
+    send::<Box<dyn LevelController>>();
+};
+
 /// The drawing half of a visit. It owns GPU resources, so it lives in the viewer's `LevelArt`
 /// group and is replaced on every level change. It downcasts its controller inside the module.
 pub trait LevelArt: Any {
@@ -432,9 +505,27 @@ pub trait LevelArt: Any {
     ) {
     }
     fn story_pose(&mut self, _story: &Story) {}
+    /// Optional complete registered-art schema. Default families stay serial.
+    fn extract_snapshot(&mut self, _level: &dyn LevelController, _story: &Story) -> (usize, bool) { (0, false) }
+    /// The simulation half of this art's snapshot, when the capture reads no art. Such an art
+    /// receives the captured value through `publish_snapshot` instead of `extract_snapshot`.
+    fn capture_source(&self) -> Option<std::sync::Arc<dyn LevelCapture>> { None }
+    /// Accept one value made by this art's `capture_source`. Returns bytes and overflow.
+    fn publish_snapshot(&mut self, _captured: Box<dyn Any + Send>) -> (usize, bool) { (0, true) }
+    fn snapshot_ready(&self) -> bool { false }
+    fn snapshot_bytes(&self) -> usize {0}
+    fn clear_snapshot(&mut self) {}
+    fn draw_snapshot(&mut self, _atmosphere: &Atmosphere, _camera: Vec3, _fullbright: bool) -> bool { false }
+    fn effects_snapshot(&mut self, _camera: Vec3, _atmosphere: &Atmosphere) -> bool { false }
+
+    /// An empty effect schema is explicit; unregistered families remain fenced.
+    fn snapshot_effects_empty(&self) -> bool { false }
     /// Effects drawn with the particle pass, after the world.
     fn effects(&mut self, _level: &dyn LevelController, _camera: Vec3, _atmosphere: &Atmosphere) {}
     fn hud(&mut self, _level: &dyn LevelController) {}
+    fn hud_capture_source(&self) -> Option<HudSource> { None }
+    #[cfg(all(test, target_os = "linux"))]
+    fn hud_input(&self, _level: &dyn LevelController, _out: &mut Vec<crate::render_snapshot::HudCommand>) {}
     /// The pose Alice resumes from when a scene hands control back.
     fn handoff_pose(&self) -> Option<&ActorPose> {
         None
@@ -495,6 +586,46 @@ pub fn step_controllers(slots: &mut [Slot], combat: &mut Combat<'_>) -> Feedback
         total.will_drain += f.will_drain;
     }
     total
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_hud_capture(assets: &mut crate::assets::Assets) {
+    use crate::render_snapshot::{HudCommand, Painter};
+
+    struct FixtureArt(std::rc::Rc<crate::ui::Ui>);
+    impl LevelArt for FixtureArt {
+        fn hud_input(&self, level: &dyn LevelController, out: &mut Vec<HudCommand>) {
+            let mut paint = Painter::new(&self.0, out);
+            paint.boss(level.id(), 0.5);
+            paint.dialog(Rect::new(macroquad::prelude::screen_width() - 180., 12., 180., 48.));
+            paint.rectangle(0., macroquad::prelude::screen_height() - 12., 32., 7., RED);
+        }
+        fn as_any(&self) -> &dyn Any { self }
+        fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    }
+    fn capture(level: &dyn LevelController, view: HudCaptureView, paint: &mut Painter<'_>) {
+        paint.boss(level.id(), 0.5);
+        paint.dialog(Rect::new(view.width - 180., 12., 180., 48.));
+        paint.rectangle(0., view.height - 12., 32., 7., RED);
+    }
+
+    use macroquad::prelude::{Rect, RED, screen_height, screen_width};
+    let art = FixtureArt(crate::ui::Ui::load(assets).unwrap());
+    let level = tests::hud_fixture();
+    let mut owner = Vec::new();
+    art.hud_input(level.as_ref(), &mut owner);
+    let view = HudCaptureView { width: screen_width(), height: screen_height() };
+    let source = HudSource { resource: art.0.resource_id(), capture };
+    let pure = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        source.capture(level.as_ref(), view, &mut out);
+        out
+    }).join().unwrap();
+    assert_eq!(pure.len(), 3);
+    assert_eq!(pure, owner);
+    assert!(pure.iter().all(HudCommand::valid));
+    drop(art);
+    assert!(pure.iter().all(|command| !command.valid()));
 }
 
 #[cfg(test)]
@@ -578,6 +709,11 @@ mod tests {
                 notarget_seen: false,
             }),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn hud_fixture() -> Box<dyn LevelController> {
+        slot(&POOL, &[], 0.).ctl
     }
 
     #[test]

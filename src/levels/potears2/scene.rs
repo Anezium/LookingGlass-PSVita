@@ -392,7 +392,44 @@ impl PoolTwo {
     }
 }
 
+// Ordered, owned commands; indices select graphics resources, never controllers.
+struct PropInput { slot: usize, at: Transform, scale: f32, time: f32, looping: bool }
+enum DrawInput { Prop(PropInput), Puppet(usize, crate::npc::PuppetInput, bool), Blasts(Vec<crate::ant::Blast>) }
+struct ArtInput { visit: u64, draws: Vec<DrawInput>, spray: Option<(Vec3,f32)> }
+impl ArtInput {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.draws.len()*std::mem::size_of::<DrawInput>()
+            + self.draws.iter().map(|d|match d { DrawInput::Puppet(_,p,_)=>p.bytes(),
+                DrawInput::Blasts(b)=>b.len()*std::mem::size_of::<crate::ant::Blast>(), _=>0 }).sum::<usize>()
+    }
+}
+/// The puppets' CPU side, shared with the simulation for the art's whole visit.
+pub(super) struct Rigs { visit: u64, bill: PuppetRig, alice: PuppetRig, guards: [PuppetRig; 2] }
+/// One capture, as the simulation hands it to the art. `story` is absent when the source
+/// counts overflowed before any pose was read; `input` carries the ordered draw commands.
+#[derive(Default)]
+pub(super) struct Captured { story: Option<StoryPose>, input: Option<ArtInput> }
+const _: fn() = || {
+    fn send<T: Send>() {}
+    fn shared<T: Send + Sync>() {}
+    send::<PoolTwo>();
+    send::<Captured>();
+    shared::<Rigs>();
+};
+fn story_pose(story: &Story) -> StoryPose {
+    let (line, clock) = story.progress(DIALOGUE).unwrap_or_default();
+    StoryPose { mouths: [story.mouth(&["billthelizard"]), story.mouth(&["fakeplayer"])], line, clock }
+}
+impl LevelCapture for Rigs {
+    fn story(&self, story: &Story) -> StoryPose { story_pose(story) }
+    fn capture(&self, level: &dyn LevelController, story: &StoryPose) -> Box<dyn Any + Send> {
+        Box::new(level.downcast_ref::<PoolTwo>().map_or_else(Captured::default, |o| o.capture(self, story)))
+    }
+}
 pub(super) struct Art {
+    visit: crate::render_snapshot::RenderVisit,
+    input: Option<ArtInput>,
+    rigs: std::sync::Arc<Rigs>,
     pub bill: Puppet,
     pub alice: Puppet,
     guards: [Puppet; 2],
@@ -409,13 +446,20 @@ pub(super) struct Art {
 impl Art {
     pub fn load(assets: &mut Assets) -> Result<Self> {
         let specs = crate::texture::read_materials(assets)?;
+        let visit = crate::render_snapshot::RenderVisit::default();
+        let bill = Puppet::load(assets, "c_bill", BILL_CLIPS, &specs)?;
+        let alice = Puppet::load(assets, "alice", ALICE_CLIPS, &specs)?;
+        let guards = [
+            Puppet::load(assets, "c_armyant", guards::REGULAR, &specs)?,
+            Puppet::load(assets, "c_armyantcorp", guards::CORPORAL, &specs)?,
+        ];
+        let rigs = std::sync::Arc::new(Rigs { visit: visit.id(), bill: bill.rig(), alice: alice.rig(),
+            guards: [guards[0].rig(), guards[1].rig()] });
         Ok(Self {
-            bill: Puppet::load(assets, "c_bill", BILL_CLIPS, &specs)?,
-            alice: Puppet::load(assets, "alice", ALICE_CLIPS, &specs)?,
-            guards: [
-                Puppet::load(assets, "c_armyant", guards::REGULAR, &specs)?,
-                Puppet::load(assets, "c_armyantcorp", guards::CORPORAL, &specs)?,
-            ],
+            visit, input: None, rigs,
+            bill,
+            alice,
+            guards,
             shots: [
                 crate::weapons::Prop::load_animation(assets, "prj_bullet", "idle", &specs)?,
                 crate::weapons::Prop::load_animation(assets, "prj_grenade", "idle", &specs)?,
@@ -443,13 +487,135 @@ impl Art {
         })
     }
 }
+impl Art {
+    fn puppet(&self, slot: usize) -> Option<&Puppet> { match slot {
+        0=>Some(&self.bill),1=>Some(&self.alice),2=>Some(&self.guards[0]),3=>Some(&self.guards[1]),_=>None } }
+    fn valid(&self, input: &ArtInput) -> bool {
+        input.visit==self.visit.id() && input.draws.len()<=32768 && input.draws.iter().all(|d|match d {
+            DrawInput::Prop(p)=>p.slot<7,
+            DrawInput::Puppet(slot,p,_)=>self.puppet(*slot).is_some_and(|a|a.valid_input(p)),
+            DrawInput::Blasts(b)=>b.len()<=16384,
+        })
+    }
+    fn pose(&mut self, story: &StoryPose) {
+        self.bill.mouth(story.mouths[0]);
+        self.alice.mouth(story.mouths[1]);
+        self.bill.mouth_angle(if story.line == 0 { 10. } else { 45. });
+        self.clock = story.clock;
+    }
+    fn publish(&mut self, captured: Captured) -> (usize,bool) {
+        self.input=None;
+        let Some(story)=captured.story else {return (0,true);};
+        self.pose(&story);
+        let Some(input)=captured.input else {return (0,true);};
+        if !self.valid(&input) {return (input.bytes(),true);}
+        let bytes=input.bytes();self.input=Some(input);
+        #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+        if std::env::var_os("LOOKING_GLASS_SNAPSHOT_REJECT_POTEARS2").is_some() {
+            self.input.as_mut().unwrap().visit=0;
+        }
+        (bytes,false)
+    }
+}
+impl PoolTwo {
+    /// The simulation half of the art snapshot. It reads the controller, the shared rigs and
+    /// the story numbers; the art sees only the value this returns.
+    fn capture(&self, rigs: &Rigs, story: &StoryPose) -> Captured {
+        let o=self;
+        // Check every source count before walking/copying any effect or pose arena.
+        if o.pond.props.len()>16384 || o.saved.guards.len()>1024 { return Captured::default(); }
+        let mut effects=0usize; let mut bones=2*rigs.bill.snapshot_bones()+2*rigs.alice.snapshot_bones();
+        for g in &o.saved.guards {
+            effects=effects.saturating_add(g.shots.len()).saturating_add(g.blasts.len());
+            bones=bones.saturating_add(rigs.guards[usize::from(g.corporal)].snapshot_bones());
+            if effects>16384 || bones>65536 { return Captured::default(); }
+        }
+        if bones>65536 || o.pond.props.len()+2*o.saved.guards.len()+effects+6>32768 {return Captured::default();}
+        let mut bill=rigs.bill.clone();bill.mouth(story.mouths[0]);bill.mouth_angle(if story.line==0 {10.}else{45.});
+        let mut alice=rigs.alice.clone();alice.mouth(story.mouths[1]);
+        let mut input=ArtInput {visit:rigs.visit,draws:Vec::new(),
+            spray:o.saved.fish.attack.filter(|t|*t>=0.5).map(|t|(o.saved.fish.at+Vec3::Z*64.,t as f32-0.5))};
+        let prop=|slot,at,scale,time,looping|DrawInput::Prop(PropInput{slot,at,scale,time,looping});
+        for (i,p) in o.pond.props.iter().enumerate() {
+            if transport::Data::prop_visible(&o.saved.pond,i) {
+                input.draws.push(prop(if p.model=="lilypad" {1}else{0},p.at,p.scale,o.saved.pond.age as f32,true));
+            }
+        }
+        if let Some(t)=o.saved.fish.attack {
+            if t<1. {input.draws.push(DrawInput::Puppet(1,alice.extract_draw("held",t as f32,true,
+                Transform {translation:o.saved.fish.at,rotation:Quat::IDENTITY},1.),true));}
+            if t>=0.5 {
+                input.draws.push(prop(2,Transform {translation:o.saved.fish.at-Vec3::X*64.,rotation:Quat::IDENTITY},1.,t as f32-0.5,false));
+                if t<1.5 {input.draws.push(prop(3,Transform {translation:o.saved.fish.at+Vec3::Z*64.,rotation:Quat::IDENTITY},1.5,t as f32-0.5,false));}
+            }
+        }
+        for g in &o.saved.guards {
+            let slot=usize::from(g.corporal);let time=if g.frozen {g.time.min(o.data.frame(g.model(),g.clip())*5.)}else{g.time};
+            input.draws.push(DrawInput::Puppet(2+slot,rigs.guards[slot].extract_draw(g.clip(),time,g.loops(),
+                Transform {translation:g.feet,rotation:Quat::from_rotation_z(g.yaw)},g.visual_scale(&o.data)),false));
+            for shot in &g.shots {
+                let rotation=if shot.grenade {Quat::from_euler(EulerRot::XYZ,(100.*shot.age).to_radians(),
+                    (200.*shot.age).to_radians(),(300.*shot.age).to_radians())}else{Quat::from_rotation_arc(Vec3::X,shot.direction)};
+                input.draws.push(prop(4+usize::from(shot.grenade),Transform {translation:shot.at,rotation},1.,shot.age,true));
+            }
+            input.draws.push(DrawInput::Blasts(g.blasts.clone()));
+        }
+        let s=&o.saved.scene;
+        if !matches!(s.phase,Phase::Dormant|Phase::Done) && !s.skipping {
+            let bill_visible=s.phase!=Phase::Approach || s.time>=0.1;
+            for (slot,model,at) in [(0,"c_bill",o.bill_pose()),(1,"alice",o.alice_pose())] {
+                if slot==0 && !bill_visible {continue;}
+                let (clip,time,loops)=o.acting(model);
+                input.draws.push(DrawInput::Puppet(slot,[&bill,&alice][slot].extract_draw(clip,time,loops,at,1.),false));
+            }
+            if bill_visible {
+                let (clip,time,loops)=o.acting("c_bill");
+                let tag=if loops {bill.looping_tag("tag_tools",clip,time,o.bill_pose(),1.)}
+                    else{bill.tag("tag_tools",clip,time,o.bill_pose(),1.)};
+                if let Some(at)=tag {input.draws.push(prop(6,at,1.,time,true));}
+            }
+        }
+        Captured {story:Some(*story),input:Some(input)}
+    }
+}
 impl LevelArt for Art {
+    fn capture_source(&self) -> Option<std::sync::Arc<dyn LevelCapture>> {Some(self.rigs.clone())}
+    fn publish_snapshot(&mut self, captured: Box<dyn Any + Send>) -> (usize,bool) {
+        match captured.downcast::<Captured>() {Ok(c)=>self.publish(*c),Err(_)=>{self.input=None;(0,true)}}
+    }
+    fn snapshot_ready(&self) -> bool {self.input.as_ref().is_some_and(|i|self.valid(i))}
+    fn snapshot_bytes(&self) -> usize {self.input.as_ref().map_or(0,ArtInput::bytes)}
+    fn clear_snapshot(&mut self) {self.input=None;}
+    fn draw_snapshot(&mut self, atmosphere: &crate::environment::Atmosphere, camera: Vec3, fullbright: bool) -> bool {
+        if !self.snapshot_ready() {return false;}
+        let input=self.input.as_ref().unwrap();
+        self.material.atmosphere(atmosphere,camera);self.material.bind();
+        for command in &input.draws {match command {
+            DrawInput::Prop(p)=>{
+                let art=match p.slot {0=>&mut self.leaf,1=>&mut self.lily,2=>&mut self.fish,3=>&mut self.splash,
+                    4=>&mut self.shots[0],5=>&mut self.shots[1],6=>&mut self.belt,_=>unreachable!("validated prop slot")};
+                art.draw_frame(p.at,p.scale,fullbright,p.time,p.looping);
+            }
+            DrawInput::Puppet(slot,p,restore)=>{
+                let art=match slot {0=>&mut self.bill,1=>&mut self.alice,2=>&mut self.guards[0],3=>&mut self.guards[1],_=>unreachable!("validated puppet slot")};
+                art.atmosphere(atmosphere,camera);art.draw_input(p,fullbright);
+                // Legacy fish-Alice restores the prop material; guard/scene draws do not.
+                if *restore {self.material.bind();}
+            }
+            DrawInput::Blasts(b)=>crate::ant::draw_blast_inputs(b),
+        }}
+        true
+    }
+    fn effects_snapshot(&mut self, camera: Vec3, atmosphere: &crate::environment::Atmosphere) -> bool {
+        if !self.snapshot_ready() {return false;}
+        if let Some((position,time))=self.input.as_ref().unwrap().spray {
+            self.spray.draw(time,1.5,|_,_|Transform {translation:position,rotation:Quat::IDENTITY},|_,_,_|true,camera,atmosphere);
+        }
+        true
+    }
+
     fn story_pose(&mut self, story: &Story) {
-        self.bill.mouth(story.mouth(&["billthelizard"]));
-        self.alice.mouth(story.mouth(&["fakeplayer"]));
-        let (line, time) = story.progress(DIALOGUE).unwrap_or_default();
-        self.bill.mouth_angle(if line == 0 { 10. } else { 45. });
-        self.clock = time;
+        self.pose(&story_pose(story));
     }
     fn draw(
         &mut self,
@@ -615,3 +781,9 @@ impl LevelArt for Art {
         self
     }
 }
+
+#[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+#[path="snapshot_check.rs"]
+mod snapshot_check;
+#[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+pub(crate) async fn snapshot_render_check(assets:&mut Assets)->Result<()> {snapshot_check::check(assets).await}

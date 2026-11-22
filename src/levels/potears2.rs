@@ -22,9 +22,9 @@ use crate::{
     collision::{Collider, World},
     event::{Condition, Facts},
     interaction::{Events, Interactions},
-    level::{LevelArt, LevelController, TriggerClass, TriggerInfo},
+    level::{LevelArt, LevelCapture, LevelController, StoryPose, TriggerClass, TriggerInfo},
     movement::Player,
-    npc::Puppet,
+    npc::{Puppet, PuppetRig},
     skeletal::Transform,
     story::{registry::AnimationRef, BeatSpec, Story},
 };
@@ -803,3 +803,6 @@ mod tests {
         assert!(s.validate(visit).is_err());
     }
 }
+
+#[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+pub(crate) use scene::snapshot_render_check;

@@ -55,7 +55,7 @@ pub(super) fn launch(map: &Bsp, spawn: &Spawn) -> Result<Option<Vec3>> {
 }
 pub(super) fn check(assets: &mut Assets) -> Result<()> {
     use crate::magma::{CLIPS, MODEL};
-    let data = Data::load(assets, MODEL, &[])?;
+    let data = ModelData::load(assets, MODEL, &[])?;
     let fireball_model = "models/prj_fireball.tik";
     let source = crate::bsp::tokens(&String::from_utf8_lossy(
         &assets.read("models/c_magmamen.tik")?,
@@ -189,10 +189,9 @@ struct AmbushSave {
 }
 pub(super) async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
     for name in ["wforest", "jlair1", "grounds2"] {
-        let scene = crate::render::Scene::load(assets, name)?;
+        let crate::render::Loaded { scene, mut world } = crate::render::Scene::load(assets, name)?;
         let mut interactions = crate::interaction::Interactions::load(&scene.map)?;
         interactions.set_entry(assets, &scene.map, name, None)?;
-        let mut world = scene.world;
         interactions.sync(&mut world);
         let mut npcs = Npcs::load(assets, &scene.map, name, None, false, false)?;
         npcs.notarget(true);
@@ -204,7 +203,7 @@ pub(super) async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             .retain(|a| a.spawn.model != crate::magma::MODEL);
         previous.matches_placements(&scene.map, name, None)?;
         npcs.restore(&previous)?;
-        for (i, a) in npcs.actors.iter().enumerate() {
+        for (i, a) in npcs.sim.actors.iter().enumerate() {
             if a.spawn.model == crate::magma::MODEL {
                 let p = a.resident.as_ref().unwrap();
                 ensure!(
@@ -220,7 +219,7 @@ pub(super) async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             );
         }
         let triggers: Vec<_> = npcs
-            .resident_ambushes
+            .sim.resident_ambushes
             .iter()
             .filter_map(|t| {
                 let ids: Vec<_> = t
@@ -266,7 +265,7 @@ pub(super) async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 }
                 for id in &ids {
                     let a = npcs
-                        .actors
+                        .sim.actors
                         .iter()
                         .find(|a| a.spawn.resident_spawn == Some(*id))
                         .unwrap();

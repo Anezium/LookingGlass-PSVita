@@ -28,7 +28,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
         if model == "c_larva" {
             burrow_check::larva_fixture(&mut map)?;
         }
-        let data = Data::load(assets, model, &[])?;
+        let data = ModelData::load(assets, model, &[])?;
         let mut spawn = placements(&map, map_name, None, false)
             .into_iter()
             .find(|s| {
@@ -226,16 +226,17 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         if snarks_only && crate::snark::Kind::from_model(family).is_none() {
             continue;
         }
-        let mut scene = crate::render::Scene::load(assets, map_name)?;
+        let crate::render::Loaded { mut scene, mut world } = crate::render::Scene::load(assets, map_name)?;
         if family == "c_larva" {
-            burrow_check::larva_fixture(&mut scene.map)?;
+            // The fresh scene still owns the only map handle before fixture setup.
+            burrow_check::larva_fixture(scene.map_mut())?;
         }
         let mut interactions = crate::interaction::Interactions::load(&scene.map)?;
         interactions.set_entry(assets, &scene.map, map_name, None)?;
-        interactions.sync(&mut scene.world);
+        interactions.sync(&mut world);
         let mut npcs = Npcs::load(assets, &scene.map, map_name, None, false, false)?;
-        npcs.update(0., &scene.world, Vec3::splat(10000.));
-        for a in &mut npcs.actors {
+        npcs.update(0., &world, Vec3::splat(10000.));
+        for a in &mut npcs.sim.actors {
             if let Some(resident::Resident {
                 body: Body::Snark(p),
                 ..
@@ -244,9 +245,9 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 p.notarget = true;
                 for _ in 0..360 {
                     p.step(
-                        &scene.world,
+                        &world,
                         Vec3::splat(10000.),
-                        &npcs.models[a.model].data,
+                        npcs.art.resources.models[a.model].data.as_ref(),
                         &mut combat::Feedback::default(),
                     );
                 }
@@ -258,10 +259,9 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                         let next = p.feet + Vec3::Z * 2.;
                         let body = p.target(0);
                         let trace =
-                            scene
-                                .world
+                            world
                                 .sweep(body.center, body.center + Vec3::Z * 2., body.half);
-                        if !p.kind.wet(&scene.world, next)
+                        if !p.kind.wet(&world, next)
                             || trace.start_solid
                             || trace.fraction < 1.
                         {
@@ -274,14 +274,14 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         }
         let initial = npcs.snapshot();
         let id = npcs
-            .actors
+            .sim.actors
             .iter()
             .position(|a| {
                 a.resident.as_ref().is_some_and(|p| p.model() == family)
                     && (a.spawn.resident_spawn.is_none() || family == crate::magma::MODEL)
             })
             .context("Missing active resident")?;
-        let mut framed = npcs.actors[id].resident.clone().unwrap();
+        let mut framed = npcs.sim.actors[id].resident.clone().unwrap();
         framed.active = true;
         if let Body::Insect(p) = &mut framed.body {
             p.set(crate::burrow::Phase::Idle);
@@ -299,7 +299,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 target + vec3(a.cos() * radius, a.sin() * radius, 24.)
             })
             .find(|p| {
-                let t = scene.world.sweep(target, *p, Vec3::splat(2.));
+                let t = world.sweep(target, *p, Vec3::splat(2.));
                 !t.start_solid && t.fraction >= 1.
             })
             .context("No clear resident camera")?;
@@ -311,7 +311,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         legacy.matches_placements(&scene.map, map_name, None)?;
         npcs.restore(&legacy)?;
         ensure!(
-            npcs.actors[id].resident.is_some(),
+            npcs.sim.actors[id].resident.is_some(),
             "Legacy resident did not migrate"
         );
         // Upgrade the immediately preceding resident release without disturbing live neighbors.
@@ -327,7 +327,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
         }
         previous.matches_placements(&scene.map, map_name, None)?;
         npcs.restore(&previous)?;
-        for (index, a) in npcs.actors.iter().enumerate() {
+        for (index, a) in npcs.sim.actors.iter().enumerate() {
             if crate::burrow::Kind::from_model(&a.spawn.model).is_none() {
                 ensure!(
                     serde_json::to_value(&a.resident)?
@@ -336,14 +336,14 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 );
             }
         }
-        let pending = npcs.actors.iter().position(|a| {
+        let pending = npcs.sim.actors.iter().position(|a| {
             a.spawn.resident_spawn.is_some()
                 && a.resident.as_ref().is_some_and(|p| p.model() == family)
         });
         if let Some(pending) = pending {
-            let entity = npcs.actors[pending].spawn.resident_spawn.unwrap();
+            let entity = npcs.sim.actors[pending].spawn.resident_spawn.unwrap();
             let trigger = npcs
-                .resident_ambushes
+                .sim.resident_ambushes
                 .iter()
                 .find(|a| a.receivers.iter().any(|(i, _)| *i == entity))
                 .unwrap();
@@ -353,25 +353,25 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 !npcs.targets().iter().any(|t| t.id == pending),
                 "Dormant resident targetable"
             );
-            npcs.update(0., &scene.world, trigger_eye);
+            npcs.update(0., &world, trigger_eye);
             ensure!(
                 serde_json::to_value(npcs.snapshot())? == serde_json::to_value(&initial)?,
                 "Paused trigger changed state"
             );
-            step(&mut npcs, &scene.world, trigger_eye, 1);
-            let p = npcs.actors[pending].resident.as_ref().unwrap();
+            step(&mut npcs, &world, trigger_eye, 1);
+            let p = npcs.sim.actors[pending].resident.as_ref().unwrap();
             ensure!(
                 p.active || p.delay.is_some(),
                 "Touch did not activate resident"
             );
-            step(&mut npcs, &scene.world, Vec3::splat(10000.), 1900);
+            step(&mut npcs, &world, Vec3::splat(10000.), 1900);
             ensure!(
-                npcs.actors[pending].resident.as_ref().unwrap().active,
+                npcs.sim.actors[pending].resident.as_ref().unwrap().active,
                 "Pending resident did not activate"
             );
             npcs.restore(&legacy)?;
             ensure!(
-                !npcs.actors[pending].resident.as_ref().unwrap().active,
+                !npcs.sim.actors[pending].resident.as_ref().unwrap().active,
                 "Legacy save retained spawned resident"
             );
         }
@@ -431,8 +431,8 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 let mut loot = saved.loot;
                 loot.validate()?;
                 let before = npcs.loot_sources();
-                let damage = step(&mut npcs, &scene.world, saved.eye, 120);
-                loot.defeated(&before, &npcs.loot_sources(), &scene.world);
+                let damage = step(&mut npcs, &world, saved.eye, 120);
+                loot.defeated(&before, &npcs.loot_sources(), &world);
                 ensure!(
                     serde_json::to_value(npcs.snapshot())? == serde_json::to_value(saved.expected)?
                         && damage == saved.damage,
@@ -447,14 +447,14 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             }
             npcs.restore(&initial)?;
             if !delayed {
-                npcs.actors[id].resident.as_mut().unwrap().active = true;
+                npcs.sim.actors[id].resident.as_mut().unwrap().active = true;
             }
             let mut loot = crate::loot::Loot::default();
             let before = npcs.loot_sources();
             if let Some(resident::Resident {
                 body: Body::Plant(p),
                 ..
-            }) = npcs.actors[id].resident.as_mut()
+            }) = npcs.sim.actors[id].resident.as_mut()
             {
                 p.set(crate::plants::Phase::Ready);
             }
@@ -462,7 +462,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 case,
                 "burrow-up" | "burrow-down" | "tunnel" | "attached" | "draining"
             ) {
-                let actor = &mut npcs.actors[id];
+                let actor = &mut npcs.sim.actors[id];
                 let Some(Resident {
                     body: Body::Insect(g),
                     ..
@@ -485,9 +485,9 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                     };
                     for _ in 0..1800 {
                         g.step(
-                            &scene.world,
+                            &world,
                             eye,
-                            &npcs.models[actor.model].data,
+                            npcs.art.resources.models[actor.model].data.as_ref(),
                             &mut combat::Feedback::default(),
                         );
                         if g.phase == desired {
@@ -503,10 +503,10 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 }
             } else if delayed {
                 if case == "delay" {
-                    npcs.actors[id].resident.as_mut().unwrap().delay = Some(1.35);
+                    npcs.sim.actors[id].resident.as_mut().unwrap().delay = Some(1.35);
                 }
             } else if matches!(case, "attack" | "projectile" | "tongue") {
-                let p = npcs.actors[id].resident.as_mut().unwrap();
+                let p = npcs.sim.actors[id].resident.as_mut().unwrap();
                 match &mut p.body {
                     Body::Wildlife(_) => unreachable!(),
                     Body::Magma(g) => {
@@ -571,7 +571,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                 if let Some(Resident {
                     body: Body::Insect(g),
                     ..
-                }) = npcs.actors[id].resident.as_mut()
+                }) = npcs.sim.actors[id].resident.as_mut()
                 {
                     g.set(crate::burrow::Phase::Idle);
                 }
@@ -598,14 +598,14 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                     knockback: Vec3::ZERO,
                 });
             }
-            loot.defeated(&before, &npcs.loot_sources(), &scene.world);
-            step(&mut npcs, &scene.world, eye, 8);
+            loot.defeated(&before, &npcs.loot_sources(), &world);
+            step(&mut npcs, &world, eye, 8);
             let cast = npcs.snapshot();
             let future_before = npcs.loot_sources();
-            let damage = step(&mut npcs, &scene.world, eye, 120);
+            let damage = step(&mut npcs, &world, eye, 120);
             let expected = npcs.snapshot();
             let mut future_loot = loot.clone();
-            future_loot.defeated(&future_before, &npcs.loot_sources(), &scene.world);
+            future_loot.defeated(&future_before, &npcs.loot_sources(), &world);
             if mode == "resident-save-write" {
                 std::fs::write(
                     path,
@@ -624,8 +624,8 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             continue;
         }
         npcs.restore(&initial)?;
-        npcs.actors = vec![npcs.actors[id].clone()];
-        let mut base = npcs.actors[0].resident.clone().unwrap();
+        npcs.sim.actors = vec![npcs.sim.actors[id].clone()];
+        let mut base = npcs.sim.actors[0].resident.clone().unwrap();
         base.active = true;
         let mut idle_pixels: Option<Vec<u8>> = None;
         for pose in [
@@ -853,9 +853,9 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                     if pose == "cut" {
                         g.cut = true;
                         g.time = 0.;
-                        let data = &npcs.models[npcs.actors[0].model].data;
+                        let data = npcs.sim.models[npcs.sim.actors[0].model].as_ref();
                         for _ in 0..48 {
-                            g.step(&scene.world, eye, data, &mut combat::Feedback::default());
+                            g.step(&world, eye, data, &mut combat::Feedback::default());
                         }
                     }
                     if pose == "projectile" {
@@ -954,7 +954,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
                     b.frozen = pose == "ice";
                 }
             }
-            npcs.actors[0].resident = Some(p);
+            npcs.sim.actors[0].resident = Some(p);
             let pixels = capture(
                 &mut npcs,
                 &mut scene,
@@ -970,7 +970,7 @@ pub async fn native(assets: &mut Assets, mode: &str) -> Result<()> {
             {
                 if pose == "ice" {
                     ensure!(
-                        npcs.models[npcs.actors[0].model].frozen.is_some(),
+                        npcs.art.resources.models[npcs.sim.actors[0].model].frozen.is_some(),
                         "Snark frozen material missing"
                     );
                     if family == "c_firesnark" {
@@ -1027,7 +1027,7 @@ async fn capture(
         crate::render_fx::begin_view(&camera, 0., &scene.atmosphere, false);
         let transforms = interactions.transforms();
         scene.draw(eye, 0., false, false, &transforms);
-        npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false);
+        npcs.draw(eye, (target - eye).normalize(), &scene.atmosphere, false, false);
         crate::render::depth_read_only(|| scene.draw(eye, 0., false, true, &transforms));
         let (_, dropped) = crate::render_fx::finish();
         ensure!(dropped == 0, "Resident geometry dropped");

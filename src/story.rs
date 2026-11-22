@@ -1,5 +1,5 @@
 //! Selected dialogue beats read from the user's archives. Never executes game scripts.
-use crate::{assets::Assets, audio::Audio, bsp::Bsp};
+use crate::{assets::Assets, audio::step::VoiceRequest, bsp::Bsp};
 use anyhow::{ensure, Context, Result};
 use macroquad::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -784,18 +784,17 @@ impl Story {
         }
         false
     }
-    pub fn update(&mut self, dt: f32, advance: bool, assets: &mut Assets, audio: &mut Audio) {
+    pub fn update(&mut self, dt: f32, advance: bool) -> Option<VoiceRequest> {
         let had_line = self.line().is_some();
         if self.tick(dt, advance) {
-            if let Some(line) = self.line() {
-                audio.speak_from(
-                    assets,
-                    &line.path,
-                    self.current.as_ref().map_or(0., |p| p.elapsed),
-                );
-            }
+            self.line().map(|line| VoiceRequest::Play {
+                path: line.path.clone(),
+                offset_seconds: self.current.as_ref().map_or(0., |p| p.elapsed),
+            })
         } else if had_line && self.line().is_none() {
-            audio.stop_voice();
+            Some(VoiceRequest::Stop)
+        } else {
+            None
         }
     }
     pub fn take_completed(&mut self) -> Vec<String> {
@@ -803,7 +802,7 @@ impl Story {
     }
     /// On recovery replay an interrupted beat from the start, retaining finished history.
     /// In particular discard a pending exit so retry never transports Alice from the entrance.
-    pub fn recover(&mut self, audio: &mut Audio) {
+    pub fn recover(&mut self) -> VoiceRequest {
         self.exit = None;
         if let Some(p) = self.current.take() {
             if p.sequence.id != "cheshire_hint" {
@@ -811,7 +810,7 @@ impl Story {
             }
         }
         self.queue.retain(|s| s.id != "cheshire_hint");
-        audio.stop_voice();
+        VoiceRequest::Stop
     }
     pub fn objective(&self) -> Option<&str> {
         match self.map.as_str() {
@@ -822,6 +821,13 @@ impl Story {
             "gvillage" => Some("Explore the village; approach its gnomes and press E to talk."),
             _ => None,
         }
+    }
+    pub(crate) fn subtitle_input(&self) -> Option<crate::render_snapshot::Subtitle> {
+        let line = self.line()?;
+        Some(crate::render_snapshot::Subtitle {
+            text: line.text.clone(), speaker: speaker(&line.path).to_owned(),
+            elapsed: self.current.as_ref().unwrap().elapsed, duration: line.duration,
+        })
     }
     pub fn draw(&self, use_key: &str, ui: &crate::ui::Ui) {
         let Some(line) = self.line() else {
@@ -1436,16 +1442,22 @@ mod tests {
     #[test]
     fn recovery_replays_interrupted_dialogue_but_cancels_exit() {
         let mut s = story();
-        let mut audio = Audio::new(true, None);
+        let play = || {
+            Some(VoiceRequest::Play {
+                path: "sound/character/test.wav".into(),
+                offset_seconds: 0.,
+            })
+        };
         s.trigger("a");
-        s.tick(0.01, false);
-        s.tick(0.01, true);
+        assert_eq!(s.update(0.01, false), play());
+        assert_eq!(s.update(0.01, true), play());
         s.defer_exit(("next".into(), None));
-        s.recover(&mut audio);
-        assert!(s.tick(0.01, false));
+        assert_eq!(s.recover(), VoiceRequest::Stop);
+        assert_eq!(s.update(0.01, false), play());
         assert_eq!(s.current.as_ref().unwrap().index, 0);
-        s.tick(0.01, true);
-        s.tick(0.01, true);
+        assert_eq!(s.update(0.01, true), play());
+        assert_eq!(s.update(0.01, true), Some(VoiceRequest::Stop));
+        assert!(s.update(0.01, false).is_none());
         assert!(s.take_exit().is_none());
         assert!(s.trigger("a"));
         assert!(!s.busy());

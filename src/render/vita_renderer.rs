@@ -184,6 +184,15 @@ pub struct Config {
     /// Diagnostic per-draw clocks; normal play keeps only phase/tail timings.
     pub render_draw_timing: bool,
     pub worker_probe: bool,
+    /// Overlap kill-test instrumentation and dedicated CPU1 reservation. Default off.
+    pub diag_overlap: bool,
+    /// Serial owned HUD input extraction experiment; no scheduling changes.
+    pub diag_snapshot: bool,
+    /// Emit per-frame snapshot diagnostics. Omission preserves the pre-overlap default.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "optional_bool")]
+    pub diag_snapshot_log: Option<bool>,
+    /// Memory-touching CPU1 load per render frame; zero disables the burn thread.
+    pub diag_overlap_burn_ms: u32,
     pub skin_workers: usize,
     /// Gather final poses before world submission and collect before characters.
     pub skin_overlap: bool,
@@ -532,9 +541,23 @@ pub struct Config {
     pub route_world_wish: bool,
     /// Record a play into this tape file (src/replay). Empty: off. Needs replay_start.
     pub replay_record: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sim_overlap: bool,
+    /// Maps eligible for lag one during playback or an opted-in live chapter run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sim_overlap_maps: Vec<String>,
+    /// Start a live chapter without a tape. Lag one also needs sim_overlap and a map list.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sim_overlap_live: bool,
+    /// Vita display queue interval of two vblanks (nominally 30 fps), for lag-one runs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sim_overlap_cap_30: bool,
+    /// Buffer stamped simulation and presentation timings until viewer teardown.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub diag_sim_timing: bool,
     /// Replay this tape file instead of the pad. Empty: off.
     pub replay_play: String,
-    /// Where a recording starts: "save:<slot>" or "chapter:<map>[$<entrance>][@<difficulty>]".
+    /// Where a recording or opted-in live diagnostic starts: "save:<slot>" or "chapter:<map>[$<entrance>][@<difficulty>]".
     pub replay_start: String,
     /// Steps between check values in a recording.
     pub replay_check_every: u32,
@@ -687,7 +710,7 @@ impl Default for Config {
             world_parameter_time_split: true,
             uniform_field_cache: true,
             render_draw_timing: false,
-            worker_probe: false, skin_workers: 2, skin_overlap: true,
+            worker_probe: false, diag_snapshot: false, diag_snapshot_log: None, diag_overlap: false, diag_overlap_burn_ms: 0, skin_workers: 2, skin_overlap: true,
             lights_early_out: true, fx_submit_state_cache: true, actor_layer_reuse: false, actor_single_prepare: true,
             actor_publication_occurrences: true,
             actor_deferred_layers: true,
@@ -790,6 +813,11 @@ impl Default for Config {
             route_heading_lock:true,
             route_world_wish: false,
             replay_record: String::new(),
+            sim_overlap: false,
+            sim_overlap_maps: Vec::new(),
+            sim_overlap_live: false,
+            sim_overlap_cap_30: false,
+            diag_sim_timing: false,
             replay_play: String::new(),
             replay_start: String::new(),
             replay_check_every: 30,
@@ -856,11 +884,41 @@ impl Config {
         self.actor_single_prepare && self.skin_overlap && self.skin_workers > 0 && self.actor_fast_path && self.actor_layer_cache
             && self.fx_prepare_cache && !self.actor_layer_reuse && self.renderer=="vita"
     }
+    pub(crate) fn cpu1_reserved(&self) -> bool {
+        self.diag_overlap || self.sim_overlap
+    }
+    pub(crate) fn snapshot_log_enabled(&self) -> bool {
+        self.diag_snapshot && self.diag_snapshot_log.unwrap_or(!self.sim_overlap)
+    }
+    pub(crate) fn timed_kernel_allocations(&self) -> bool {
+        !self.sim_overlap
+    }
     fn validate(&self) -> Result<()> {
         ensure!(self.spike_log_last_frame == 0 || self.spike_log_last_frame >= self.spike_log_first_frame, "invalid spike frame window");
         ensure!(!self.phase_census_window || (!self.phase_census && !self.replay_play.is_empty()
             && self.spike_log_first_frame > 0 && self.spike_log_last_frame >= self.spike_log_first_frame),
             "phase_census_window requires replay_play, explicit positive spike frame bounds, and phase_census off");
+        ensure!(!self.sim_overlap || self.replay_record.is_empty(), "replay_record and sim_overlap are exclusive");
+        ensure!(!self.sim_overlap || self.renderer == "vita", "sim_overlap requires renderer=vita");
+        ensure!(self.sim_overlap_maps.is_empty()
+            || (self.sim_overlap && (!self.replay_play.is_empty() || self.sim_overlap_live)),
+            if self.sim_overlap_live { "sim_overlap_maps requires sim_overlap in live play" }
+            else { "sim_overlap_maps requires sim_overlap and a replay tape" });
+        if self.sim_overlap_live {
+            ensure!(self.replay_play.is_empty() && self.replay_record.is_empty(),
+                "sim_overlap_live requires live input without playback or recording");
+            let start = crate::replay::parse_start(&self.replay_start)?;
+            ensure!(start.kind == "chapter" && start.map == "potears2"
+                && self.sim_overlap_maps.iter().all(|map| map == "potears2"),
+                "sim_overlap_live is available only with chapter:potears2");
+            ensure!(!self.sim_overlap || !self.sim_overlap_maps.is_empty(),
+                "live lag one requires an explicit sim_overlap_maps allowlist");
+        }
+        ensure!(self.sim_overlap_maps.iter().all(|map|
+            matches!(map.as_str(), "potears2" | "skool1" | "centipede1")),
+            "lag-one overlap is available on potears2, skool1 and centipede1");
+        ensure!(!self.sim_overlap_cap_30 || !self.sim_overlap_maps.is_empty(),
+            "sim_overlap_cap_30 requires an explicit lag-one map allowlist");
         crate::replay::validate_settings(&crate::replay::Settings { record: self.replay_record.clone(),
             play: self.replay_play.clone(), start: self.replay_start.clone(), check_every: self.replay_check_every,
             state_every: self.replay_state_every, stop_after: self.replay_stop_after })?;
@@ -873,7 +931,13 @@ impl Config {
         ensure!(self.audio_ambient_voices<=128 && self.audio_cull_gain.is_finite() && (0. ..=0.1).contains(&self.audio_cull_gain), "invalid audio voice budget");
         ensure!(!self.actor_single_prepare || self.actor_single_prepare_active(),
             "actor_single_prepare requires renderer=vita, skin_overlap=true, skin_workers>0, actor_fast_path=true, actor_layer_cache=true, fx_prepare_cache=true and actor_layer_reuse=false");
+        ensure!(self.timed_kernel_allocations() || !self.skin_worker_bench,
+            "sim_overlap excludes skin_worker_bench and its timed allocation scopes");
         ensure!(!self.skin_worker_bench || self.skin_workers == 0, "skin_worker_bench requires skin_workers=0 to isolate overlap");
+        ensure!(self.diag_overlap_burn_ms <= 20, "diag_overlap_burn_ms must be 0..20");
+        ensure!(self.diag_overlap || self.diag_overlap_burn_ms == 0, "burn requires diag_overlap");
+        ensure!(!self.cpu1_reserved() || (self.skin_workers == 1 && self.skin_overlap && self.audio_pcm_worker && self.audio_producer_affinity == 0x40000),
+            "CPU1 reservation requires one overlapping skin worker, buffered audio and audio on CPU2");
         ensure!(!self.skin_overlap || self.skin_workers > 0, "skin_overlap requires skin_workers=1 or 2");
         ensure!(self.skin_workers <= 2, "skin_workers must be 0, 1 or 2");
         ensure!(matches!(self.save_preview.as_str(), "throttled" | "every_frame"), "save_preview must be throttled or every_frame");
@@ -968,6 +1032,10 @@ fn config_log_lines(c: &Config) -> [String; 2] {
         format!("[lg/vita-renderer] report_cadence effective_log_frame_time_every={}", report_cadence(c)),
     ]
 }
+fn optional_bool<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<bool>, D::Error> {
+    <bool as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
 /// Reject a malformed report cadence, or a join without a live parameter table, without
 /// discarding unrelated flags.
 fn parse_runtime_config(bytes: &[u8]) -> Result<(Config, Option<String>)> {
@@ -3640,7 +3708,8 @@ pub(crate) async fn visualizer(
         options.map == "gvillage",
         "jalon 2 visualizer supports gvillage"
     );
-    let mut scene = Scene::load_for(&mut assets, &options.map, options.difficulty)?;
+    let super::Loaded { mut scene, world } =
+        Scene::load_for(&mut assets, &options.map, options.difficulty)?;
     let mut interactions = crate::interaction::Interactions::load(&scene.map)?;
     interactions.set_entry(
         &mut assets,
@@ -3652,7 +3721,7 @@ pub(crate) async fn visualizer(
     let yaw = 4.692389_f32;
     let direction = vec3(yaw.cos(), yaw.sin(), 0.);
     let (eye, target, _) = crate::camera::Follow::default().update(
-        &scene.world,
+        &world,
         vec3(-4188., 6004., 32.03125),
         direction,
         132.,
@@ -3904,7 +3973,7 @@ mod tests {
         let defaults=serde_json::to_value(Config::default()).unwrap();
         for (key,value) in defaults.as_object().unwrap().iter().filter(|(k,_)| round5_key(k)) {
             if key.starts_with("diag_skip_") || key.starts_with("ant_corpse_") || key == "sim_flight_memo"
-                || key == "fx_add_lean" || key == "fx_add_fog_free" || key == "actor_cutout_discard_free" || key == "actor_frontface_cull" || key == "actor_discard_free_shader" || key == "actor_opaque_shader" || key == "actor_consumer_frustum_cull"
+                || key == "fx_add_lean" || key == "fx_add_fog_free" || key == "actor_cutout_discard_free" || key == "actor_frontface_cull" || key == "actor_discard_free_shader" || key == "actor_opaque_shader" || key == "actor_consumer_frustum_cull" || key == "diag_overlap" || key == "diag_snapshot"
                 || matches!(key.as_str(), "gpu_skin_ants" | "gpu_skin_actors" | "gpu_skin_capture" | "diag_actor_timing" | "skin_vector" | "skin_pose_reuse" | "skin_duplicate_reuse") {
                 assert_eq!(value, false);
                 assert!(serde_json::from_value::<Config>(serde_json::json!({key:true})).is_ok());
@@ -4301,7 +4370,7 @@ mod tests {
     // new opt-in is checked as off; every earlier runtime key remains pinned by these tests.
     // The two actor keys arrived after every frozen era file, so those files stay valid
     // unchanged and their omitted opt-in must read as an explicit off.
-    fn round5_key(k: &str) -> bool { matches!(k, "gpu_skin_ants" | "gpu_skin_actors" | "gpu_skin_capture" | "diag_actor_timing" | "skin_vector" | "skin_pose_reuse" | "skin_duplicate_reuse") || k.starts_with("diag_skip_") || matches!(k, "sim_flight_memo" | "spike_log_first_frame" | "spike_log_last_frame" | "ant_corpse_triangle_cull" | "ant_corpse_opaque_shader" | "fx_add_lean" | "fx_add_fog_free" | "actor_cutout_discard_free" | "actor_frontface_cull" | "actor_discard_free_shader" | "actor_opaque_shader" | "actor_consumer_frustum_cull") }
+    fn round5_key(k: &str) -> bool { matches!(k, "gpu_skin_ants" | "gpu_skin_actors" | "gpu_skin_capture" | "diag_actor_timing" | "skin_vector" | "skin_pose_reuse" | "skin_duplicate_reuse") || k.starts_with("diag_skip_") || matches!(k, "diag_snapshot" | "diag_overlap" | "diag_overlap_burn_ms" | "sim_flight_memo" | "spike_log_first_frame" | "spike_log_last_frame" | "ant_corpse_triangle_cull" | "ant_corpse_opaque_shader" | "fx_add_lean" | "fx_add_fog_free" | "actor_cutout_discard_free" | "actor_frontface_cull" | "actor_discard_free_shader" | "actor_opaque_shader" | "actor_consumer_frustum_cull") }
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
@@ -5100,6 +5169,66 @@ mod tests {
             assert_eq!(variant, baseline, "an isolated RC4 variant changes only its declared keys");
         }
     }
+    #[test]
+    fn runtime_config_refuses_recording_with_sim_overlap() {
+        assert!(serde_json::to_value(Config::default()).unwrap().get("sim_overlap").is_none());
+        assert!(parse_runtime_config(br#"{"sim_overlap":true,"skin_workers":1,"audio_pcm_worker":true}"#).unwrap().0.sim_overlap);
+        let record = br#"{"replay_record":"play.lgtape","replay_start":"chapter:potears2"}"#;
+        assert!(parse_runtime_config(record).is_ok());
+        let both = br#"{"replay_record":"play.lgtape","replay_start":"chapter:potears2","sim_overlap":true}"#;
+        let error = parse_runtime_config(both).err().expect("recording with overlap was accepted");
+        assert_eq!(error.to_string(), "replay_record and sim_overlap are exclusive");
+    }
+
+    #[test]
+    fn lag_one_requires_an_explicit_supported_map_and_input_mode() {
+        let mut config = Config {
+            sim_overlap: true,
+            skin_overlap: true,
+            skin_workers: 1,
+            audio_pcm_worker: true,
+            sim_overlap_maps: vec!["potears2".into()],
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+        config.replay_play = "a2-04.lgtape".into();
+        assert!(config.validate().is_ok());
+        config.sim_overlap_maps.extend(["skool1", "centipede1"].map(String::from));
+        config.sim_overlap_cap_30 = true;
+        assert!(config.validate().is_ok());
+        config.sim_overlap_maps.push("potears1".into());
+        assert!(config.validate().is_err());
+        let defaults = serde_json::to_value(Config::default()).unwrap();
+        assert!(defaults.get("sim_overlap_maps").is_none());
+        assert!(defaults.get("sim_overlap_live").is_none());
+        assert!(defaults.get("sim_overlap_cap_30").is_none());
+
+        config.sim_overlap_maps.pop();
+        config.sim_overlap_live = true;
+        config.replay_start = "chapter:potears2".into();
+        assert!(config.validate().is_err()); // Live opt-in with playback.
+        config.replay_play.clear();
+        assert!(config.validate().is_err()); // Tape-only maps are unavailable in live play.
+        config.sim_overlap_maps.truncate(1);
+        assert!(config.validate().is_ok());
+        config.replay_start = "chapter:skool1".into();
+        assert!(config.validate().is_err());
+        config.replay_start = "chapter:potears2".into();
+        config.replay_record = "play.lgtape".into();
+        assert!(config.validate().is_err());
+        config.replay_record.clear();
+        config.sim_overlap_maps.clear();
+        assert!(config.validate().is_err()); // No implicit all-map overlap.
+        config.sim_overlap = false;
+        assert!(config.validate().is_err()); // No cap without lag one.
+        config.sim_overlap_cap_30 = false;
+        assert!(config.validate().is_ok()); // Live serial control.
+        config.replay_start.clear();
+        assert!(config.validate().is_err());
+        config.replay_start = "save:auto".into();
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn release_inputs_add_only_their_declared_keys_and_packages_add_their_replay_keys() {
         use sha2::{Digest, Sha256};
@@ -6553,5 +6682,112 @@ mod tests {
         s.alpha_test = 2;
         s.depth_write = false;
         assert!(!opaque_stage(&s));
+    }
+}
+
+#[cfg(test)]
+mod overlap_probe_tests {
+    use super::Config;
+    #[test]
+    fn cpu1_reservation_requires_the_reserved_layout_in_each_arm() {
+        for (diag, sim) in [(false, false), (true, false), (false, true), (true, true)] {
+            let reserved = diag || sim;
+            let mut config = Config {
+                diag_overlap: diag, sim_overlap: sim, skin_workers: 1,
+                audio_pcm_worker: true, actor_single_prepare: false, ..Config::default()
+            };
+            assert_eq!(config.cpu1_reserved(), reserved);
+            super::with_config(|current| *current = config.clone(), || {
+                assert_eq!(crate::skin_worker::mask(0), if reserved { 0x40000 } else { 0x20000 });
+                assert_eq!(crate::skin_worker::mask(1), 0x40000);
+            });
+            config.validate().unwrap();
+            for (workers, skin_overlap, buffered, affinity) in [
+                (2, true, true, 0x40000),
+                (1, false, true, 0x40000),
+                (1, true, false, 0x40000),
+                (1, true, true, 0x20000),
+            ] {
+                config.skin_workers = workers;
+                config.skin_overlap = skin_overlap;
+                config.audio_pcm_worker = buffered;
+                config.audio_producer_affinity = affinity;
+                assert_eq!(config.validate().is_err(), reserved);
+            }
+            config.audio_producer_affinity = 0x40000;
+            config.diag_overlap_burn_ms = 6;
+            assert_eq!(config.validate().is_ok(), diag);
+        }
+    }
+
+    #[cfg(not(target_os = "vita"))]
+    #[test]
+    fn validated_sim_overlap_cannot_enter_timed_allocation_scopes_on_two_threads() {
+        use super::{parse_runtime_config, with_config};
+        use std::sync::Barrier;
+
+        for sim_overlap in [false, true] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "sim_overlap": sim_overlap, "skin_workers": 1, "audio_pcm_worker": true,
+                "diag_snapshot": true, "diag_snapshot_log": true,
+            })).unwrap();
+            let (config, _) = parse_runtime_config(&bytes).unwrap();
+            let start = Barrier::new(2);
+            let entered = Barrier::new(2);
+            std::thread::scope(|threads| {
+                for _ in 0..2 {
+                    threads.spawn(|| with_config(|current| *current = config.clone(), || {
+                        start.wait();
+                        let scope = crate::kernel_alloc::Scope::begin_timed();
+                        entered.wait(); // Both threads have attempted entry before either drops its scope.
+                        assert_eq!(scope.is_some(), !sim_overlap);
+                    }));
+                }
+            });
+        }
+
+        let error = parse_runtime_config(br#"{"sim_overlap":true,"skin_workers":1,"audio_pcm_worker":true,"skin_worker_bench":true}"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("timed allocation scopes"));
+    }
+
+    #[test]
+    fn snapshot_rows_default_by_sim_mode_and_accept_boolean_overrides() {
+        assert!(serde_json::to_value(Config::default()).unwrap().get("diag_snapshot_log").is_none());
+        for sim in [false, true] {
+            for snapshot in [false, true] {
+                for override_log in [None, Some(false), Some(true)] {
+                    let mut value = serde_json::json!({
+                        "sim_overlap": sim, "diag_snapshot": snapshot,
+                        "skin_workers": 1, "audio_pcm_worker": true,
+                    });
+                    if let Some(enabled) = override_log {
+                        value["diag_snapshot_log"] = enabled.into();
+                    }
+                    let (config, _) = super::parse_runtime_config(&serde_json::to_vec(&value).unwrap()).unwrap();
+                    assert_eq!(config.snapshot_log_enabled(), snapshot && override_log.unwrap_or(!sim));
+                    assert_eq!(config.diag_snapshot_log, override_log);
+                }
+            }
+        }
+        for invalid in [serde_json::json!(1), serde_json::json!("false"), serde_json::Value::Null] {
+            assert!(serde_json::from_value::<Config>(serde_json::json!({"diag_snapshot_log": invalid})).is_err());
+        }
+    }
+
+    #[test]
+    fn overlap_reservation_and_burn_are_explicit() {
+        let default=Config::default();
+        assert!(!default.diag_overlap && default.diag_overlap_burn_ms==0);
+        for value in [serde_json::json!({"diag_overlap_burn_ms":12}),
+            serde_json::json!({"diag_overlap":true}),
+            serde_json::json!({"diag_overlap":true,"skin_workers":1,"diag_overlap_burn_ms":21}),
+            serde_json::json!({"diag_overlap":true,"skin_workers":1,"audio_producer_affinity":0x20000})] {
+            assert!(serde_json::from_value::<Config>(value).unwrap().validate().is_err());
+        }
+        for ms in [0,6,12] {
+            let c:Config=serde_json::from_value(serde_json::json!({"diag_overlap":true,"skin_workers":1,"audio_pcm_worker":true,"diag_overlap_burn_ms":ms})).unwrap();
+            c.validate().unwrap();
+        }
     }
 }

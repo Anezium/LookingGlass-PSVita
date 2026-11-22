@@ -1,7 +1,7 @@
 //! Original archive materials and animation-owned smoke; shared GPU resources.
 use crate::mesh::Mesh;
 use super::{
-    heavy::{Kind, State},
+    heavy::Kind,
     Prop,
 };
 use crate::{
@@ -163,7 +163,6 @@ impl BeamRig {
 pub(super) struct Art {
     props: Vec<Prop>,
     beam: BeamRig,
-    pub view_muzzle: Option<Vec3>,
     templates: Vec<Attached>,
     emitters: BTreeMap<(usize, u32), Attached>,
     pub atmosphere: std::cell::RefCell<Atmosphere>,
@@ -238,7 +237,6 @@ impl Art {
         templates[4].orient_velocity("burst1");
         Ok(Self {
             beam: BeamRig::load(a, specs)?,
-            view_muzzle: None,
             props,
             templates,
             emitters: Default::default(),
@@ -248,9 +246,10 @@ impl Art {
     pub fn cannon(&mut self, pose: Transform, scale: f32, time: f32, fullbright: bool) {
         self.props[0].draw_frame(pose, scale, fullbright, time, false);
     }
-    pub fn draw(
+    pub(crate) fn draw_input(
         &mut self,
-        s: &State,
+        s: super::heavy::RenderView<'_>,
+        view_muzzle: Option<Vec3>,
         camera: Vec3,
         fullbright: bool,
         first_person: bool,
@@ -258,9 +257,9 @@ impl Art {
     ) {
         let mut active = BTreeSet::new();
         let atmosphere = self.atmosphere.borrow();
-        if let Some(c) = &s.charge {
+        if let Some(c) = s.charge {
             let source = Transform {
-                translation: self.view_muzzle.unwrap_or(c.pose.translation),
+                translation: view_muzzle.unwrap_or(c.pose.translation),
                 ..c.pose
             };
             let view_offset = source.translation - c.pose.translation;
@@ -373,7 +372,7 @@ impl Art {
                     );
             }
         }
-        for v in &s.volleys {
+        for v in s.volleys.iter() {
             let key = (8, v.id);
             active.insert(key);
             self.emitters
@@ -423,7 +422,7 @@ impl Art {
                     );
             }
         }
-        for p in &s.impacts {
+        for p in s.impacts.iter() {
             let pose = Transform {
                 translation: p.origin,
                 rotation: Quat::from_rotation_arc(Vec3::X, p.normal),

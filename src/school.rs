@@ -156,7 +156,8 @@ enum Book {
 }
 pub struct School {
     pub first_cinema: Option<cinema::State>,
-    cinema_data: Option<cinema::Data>,
+    cinema_data: Option<std::sync::Arc<cinema::Data>>,
+    cinema_world: Option<World>,
     pub(crate) return_data: Option<return_cinema::Data>,
     objects: Vec<Object>,
     pictures: Vec<(usize, Vec3, Collider)>,
@@ -320,6 +321,7 @@ impl School {
         let mut s = Self {
             first_cinema: None,
             cinema_data: None,
+            cinema_world: None,
             return_data: None,
             objects,
             pictures,
@@ -1228,6 +1230,91 @@ impl School {
         Ok(())
     }
 }
+struct BookDraw {
+    clip: usize,
+    pose: Transform,
+    time: f32,
+    looping: bool,
+}
+
+/// First-visit art uses only these captured values and the immutable cinema tracks.
+pub(crate) struct FirstDraw {
+    cinema_data: Option<std::sync::Arc<cinema::Data>>,
+    first_cinema: Option<cinema::State>,
+    theatre_alice: Option<Transform>,
+    clock: f32,
+    theatre: bool,
+    recipe: bool,
+    book_top: Vec3,
+    glass: Option<Transform>,
+    flying: [BookDraw; 4],
+    falling: Option<(Transform, f32)>,
+    recipe_book: BookDraw,
+}
+
+impl FirstDraw {
+    pub(crate) fn capture(school: &School) -> Self {
+        let flying = std::array::from_fn(|i| {
+            let (clip, time, looping) = match school.books[i] {
+                Book::Waiting => (0, 0., true),
+                Book::Flying if school.book_times[i] < 0.55 => (1, school.book_times[i], false),
+                Book::Flying | Book::Descending => (2, school.book_times[i], true),
+                _ => (3, school.clock, true),
+            };
+            let support = school.object(&format!("flyingsupport{}", i + 1));
+            BookDraw {
+                clip, time, looping,
+                pose: Transform {
+                    translation: support.pose.origin + school.book_offsets[i],
+                    rotation: Quat::from_rotation_z(school.book_yaws[i]),
+                },
+            }
+        });
+        let recipe_book = if let Some((clip, pose, time)) = school.staged_book() {
+            BookDraw { clip, pose, time, looping: matches!(clip, 0 | 2 | 3) }
+        } else {
+            let (clip, pos) = if !school.recipe {
+                (0, school.book_top)
+            } else if school.recipe_time < 3. {
+                (
+                    1,
+                    school
+                        .book_top
+                        .lerp(school.book_bottom, (school.recipe_time / 3.).powi(2)),
+                )
+            } else {
+                (2, school.book_bottom)
+            };
+            BookDraw {
+                clip, time: school.recipe_time, looping: clip != 1,
+                pose: Transform {
+                    translation: pos,
+                    rotation: Quat::from_rotation_z(90_f32.to_radians()),
+                },
+            }
+        };
+        Self {
+            cinema_data: school.cinema_data.clone(),
+            first_cinema: school.first_cinema.clone(),
+            theatre_alice: school.first_cinema.as_ref().filter(|s|
+                s.beat == Some(cinema::Beat::Theatre) && !(14.3..19.3).contains(&s.time))
+                .zip(school.cinema_data.as_ref().zip(school.cinema_world.as_ref()))
+                .map(|(s, (data, world))| data.alice_pose(world, s.time)),
+            clock: school.clock,
+            theatre: school.theatre,
+            recipe: school.recipe,
+            book_top: school.book_top,
+            glass: (!school.secret_claimed).then_some(Transform {
+                translation: school.secret_reward,
+                rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            }),
+            flying,
+            falling: school.falling_book(),
+            recipe_book,
+        }
+    }
+}
+
 pub struct Art {
     pub first: cinema::Art,
     pub(crate) returning: crate::school_return::Art,
@@ -1273,70 +1360,35 @@ impl Art {
             gl_use_default_material();
             return;
         }
-        self.first.draw(school, atmosphere, camera, fullbright);
+        self.draw_first(&FirstDraw::capture(school), fullbright, atmosphere, camera);
+    }
+
+    pub(crate) fn draw_first(
+        &mut self,
+        input: &FirstDraw,
+        fullbright: bool,
+        atmosphere: &crate::environment::Atmosphere,
+        camera: Vec3,
+    ) {
+        self.first.draw(input, atmosphere, camera, fullbright);
         self.material.atmosphere(atmosphere, camera);
         self.material.bind();
-        if !school.secret_claimed {
-            self.glass.draw(
-                Transform {
-                    translation: school.secret_reward,
-                    rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
-                },
-                1.,
-                fullbright,
+        if let Some(pose) = input.glass {
+            self.glass.draw(pose, 1., fullbright);
+        }
+        for (i, book) in input.flying.iter().enumerate() {
+            self.flying[book.clip].draw_frame(
+                book.pose, if i == 3 { 4.2 } else { 4. }, fullbright, book.time, book.looping,
             );
         }
-        for i in 0..4 {
-            let (clip, time, looping) = match school.books[i] {
-                Book::Waiting => (0, 0., true),
-                Book::Flying if school.book_times[i] < 0.55 => (1, school.book_times[i], false),
-                Book::Flying | Book::Descending => (2, school.book_times[i], true),
-                _ => (3, school.clock, true),
-            };
-            let support = school.object(&format!("flyingsupport{}", i + 1));
-            self.flying[clip].draw_frame(
-                Transform {
-                    translation: support.pose.origin + school.book_offsets[i],
-                    rotation: Quat::from_rotation_z(school.book_yaws[i]),
-                },
-                if i == 3 { 4.2 } else { 4. },
-                fullbright,
-                time,
-                looping,
-            );
-        }
-        if let Some((pose, time)) = school.falling_book() {
+        if let Some((pose, time)) = input.falling {
             self.recipe[1].draw_frame(pose, 1., fullbright, time, false);
         }
-        if let Some((clip, pose, time)) = school.staged_book() {
-            self.recipe[clip].draw_frame(pose, 1., fullbright, time, matches!(clip, 0 | 2 | 3));
-            gl_use_default_material();
-            return;
-        }
-        let (clip, pos) = if !school.recipe {
-            (0, school.book_top)
-        } else if school.recipe_time < 3. {
-            (
-                1,
-                school
-                    .book_top
-                    .lerp(school.book_bottom, (school.recipe_time / 3.).powi(2)),
-            )
-        } else {
-            (2, school.book_bottom)
-        };
-        self.recipe[clip].draw_frame(
-            Transform {
-                translation: pos,
-                rotation: Quat::from_rotation_z(90_f32.to_radians()),
-            },
-            1.,
-            fullbright,
-            school.recipe_time,
-            clip != 1,
-        );
+        let book = &input.recipe_book;
+        self.recipe[book.clip].draw_frame(book.pose, 1., fullbright, book.time, book.looping);
         gl_use_default_material();
     }
+
 }
 
 /// Staged real-data regressions for the reported shelf crossing and tipping riders.
@@ -1690,7 +1742,7 @@ pub async fn check_render(assets: &mut Assets) -> Result<()> {
     if std::env::var_os("LOOKING_GLASS_SCHOOL_FLOOR_CHECK").is_some() { return Ok(()); }
     door_check::render(assets).await?;
     cinema_check::render(assets).await?;
-    let mut scene = crate::render::Scene::load(assets, "skool1")?;
+    let crate::render::Loaded { mut scene, mut world } = crate::render::Scene::load(assets, "skool1")?;
     let specs = texture::read_materials(assets)?;
     let mut art = Art::load(assets, &specs)?;
     let mut interactions = crate::interaction::Interactions::load(&scene.map)?;
@@ -1698,9 +1750,9 @@ pub async fn check_render(assets: &mut Assets) -> Result<()> {
     // The separate scene matrix above exercises cinematics. Stage these older
     // machinery-only views with their original instantaneous commitments.
     interactions.school.as_mut().unwrap().cinema_data = None;
-    interactions.sync(&mut scene.world);
+    interactions.sync(&mut world);
     let mut player =
-        Player::spawn(&scene.world, scene.map.spawn().0).context("School spawn blocked")?;
+        Player::spawn(&world, scene.map.spawn().0).context("School spawn blocked")?;
     for (stage, eye, target) in [
         (
             "waiting",
@@ -1732,10 +1784,10 @@ pub async fn check_render(assets: &mut Assets) -> Result<()> {
                 .event("book_cinematic");
         }
         for _ in 0..1250 {
-            interactions.advance_school(1. / 120., &scene.map, &mut scene.world, &mut player)?;
+            interactions.advance_school(1. / 120., &scene.map, &mut world, &mut player)?;
         }
         for frame in 0..90 {
-            interactions.advance_school(1. / 60., &scene.map, &mut scene.world, &mut player)?;
+            interactions.advance_school(1. / 60., &scene.map, &mut world, &mut player)?;
             clear_background(BLACK);
             set_camera(&Camera3D {
                 position: eye,

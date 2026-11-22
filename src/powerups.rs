@@ -258,13 +258,23 @@ fn check_watch_world(assets: &mut crate::assets::Assets) -> Result<()> {
 }
 
 /// Original item meshes share ordinary world depth and fog.
+mod snapshot;
+pub(crate) use snapshot::{CollectionEvent, Input as PickupInput};
+
+fn collection_models() -> impl Iterator<Item = &'static str> {
+    ["p_h1", "p_h2", "p_m1", "p_m2"].into_iter()
+        .chain(crate::loot_art::GRADES.iter().map(|grade| grade.model()))
+}
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use snapshot::test_pickup_capture;
 pub struct Art {
+    snapshot_visit: crate::render_snapshot::RenderVisit,
     props: Vec<crate::weapons::Prop>,
     resources: Vec<crate::weapons::Prop>,
     material: crate::character::SkinMaterial,
     essence: crate::loot_art::Art,
     collection_fx: std::collections::BTreeMap<String, crate::pickup_effects::Effect>,
-    collected: Vec<(String, macroquad::prelude::Vec3, f32, u64)>,
+    collected: Vec<CollectionEvent>,
     next_effect: u64,
     effect_visit: String,
     effect_clock: f32,
@@ -279,6 +289,7 @@ impl Art {
             )?);
         }
         Ok(Self {
+            snapshot_visit:Default::default(),
             props,
             resources: ["p_h1", "p_h2", "p_m1", "p_m2"]
                 .iter()
@@ -286,9 +297,7 @@ impl Art {
                 .collect::<Result<_>>()?,
             material: crate::character::skin_material()?,
             essence: crate::loot_art::Art::load(assets, &specs)?,
-            collection_fx: ["p_h1", "p_h2", "p_m1", "p_m2"]
-                .into_iter()
-                .chain(crate::loot_art::GRADES.iter().map(|g| g.model()))
+            collection_fx: collection_models()
                 .map(|name| {
                     Ok((
                         name.into(),
@@ -310,6 +319,7 @@ impl Art {
         }
     }
     pub fn clear_effects(&mut self) {
+        self.snapshot_visit=Default::default();
         self.collected.clear();
         self.essence.clear_effects();
         for e in self.collection_fx.values() { e.clear(); }
