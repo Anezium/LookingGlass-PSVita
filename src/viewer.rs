@@ -1357,6 +1357,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let mut post_game = false;
     #[cfg(feature = "vita_renderer")]
     let mut load_probe = Some(crate::restore_diagnostic::Probe::new("startup-entry"));
+    #[cfg(all(feature = "vita_renderer", feature = "sim_maps_probe", not(target_os = "vita")))]
+    let probe_visit_first_frame = std::env::var_os("LOOKING_GLASS_VISIT_FIRST_FRAME").is_some();
     let mut save_frame = crate::save_preview::Frame::default();
     let mut escape_preview_ready = false;
     let mut pending_menu_save = None;
@@ -1529,11 +1531,6 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     if save::bench_scene(validated) == save::BenchScene::ReuseValidated {
         // The restored scene's build and its install are one load window.
         let _share = crate::texture::load_scope();
-        #[cfg(feature = "vita_renderer")]
-        let _loading = if crate::render::vita_renderer::config().eager_level_gpu {
-            let destination = &prepared.as_ref().unwrap().game.level()?.map;
-            crate::loading_screen::begin("startup-restore", destination)
-        } else { None };
         let mut timing = crate::startup::Phase::new("restore_resources");
         power_art = crate::powerups::Art::load(&mut assets)?;
         timing.mark("power_art");
@@ -3857,6 +3854,10 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                     timing_ready!(crate::native_timing::Reason::Natural);
                     drop(outgoing);
                     memory.finish(true);
+                    #[cfg(all(feature = "vita_renderer", feature = "sim_maps_probe", not(target_os = "vita")))]
+                    if probe_visit_first_frame {
+                        load_probe = Some(crate::restore_diagnostic::Probe::new("natural-exit"));
+                    }
                 }
                 Err(e) => {
                     let _ = rollback_resources!(checkpoint, outgoing, particles, audio_checkpoint, false, step_guards);
@@ -4985,6 +4986,11 @@ interactions
         if !snapshot_world_free {crate::spike_log::world_last_read();}
         #[cfg(all(feature = "vita_renderer", feature = "sim_maps_probe", not(target_os = "vita")))]
         if frame == 0 && std::env::var_os("LOOKING_GLASS_FIRST_FRAME_DEPTH").is_some() {
+            crate::render::vita_renderer::probe_first_frame_depth()?;
+        }
+        #[cfg(all(feature = "vita_renderer", feature = "sim_maps_probe", not(target_os = "vita")))]
+        if probe_visit_first_frame && load_probe.is_some() {
+            println!("VISIT_FIRST_FRAME frame={} map={}", present_stamp.frame.frame, maps[current]);
             crate::render::vita_renderer::probe_first_frame_depth()?;
         }
         #[cfg(feature="vita_renderer")]
