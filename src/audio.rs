@@ -283,26 +283,26 @@ mod named_prefetch_tests {
 
     #[test]
     fn duplicate_reject_keeps_the_first_clip_and_counts_it_once() {
-        let mut named = NamedPrefetch::for_map("garden1", true, false);
-        let path = NOSEWIPE_CUES[0];
+        let mut named = NamedPrefetch::for_map("utemple", true, false);
+        let path = UTEMPLE_CUES[0];
         named.stage_reject(path, Some(clip(0.5, 20_000)));
         named.stage_reject(path, Some(clip(0.25, 20_000)));
         assert_eq!(named.staged_bytes, [80_000, 0]);
         let mut cache = BTreeMap::new();
         let mut samples = 0;
-        named.finish("garden1", &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
+        named.finish("utemple", &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
         assert_eq!(samples, 20_000);
         assert_eq!(cache[path].as_ref().unwrap().samples[0].to_bits(), 0.5f32.to_bits());
     }
 
     #[test]
     fn load_preserves_existing_entries_and_enforces_both_caps() {
-        let mut named = NamedPrefetch::for_map("garden1", true, true);
+        let mut named = NamedPrefetch::for_map("utemple", true, true);
         let existing = KNIFE_CUES[0].to_owned();
         let mut cache = BTreeMap::from([(existing.clone(), Some(clip(1., 1)))]);
         let mut samples = CACHE_SAMPLES - 2;
-        named.stage_reject(NOSEWIPE_CUES[0], Some(clip(0., 40_000)));
-        named.finish("garden1", &mut cache, &mut samples, |path| {
+        named.stage_reject(UTEMPLE_CUES[0], Some(clip(0., 25_000)));
+        named.finish("utemple", &mut cache, &mut samples, |path| {
             assert_eq!(path, KNIFE_CUES[1]);
             Some(clip(0., 3))
         });
@@ -324,6 +324,83 @@ mod named_prefetch_tests {
             );
         }
         assert_eq!(samples, 2);
+    }
+
+    #[test]
+    fn map_named_lists_and_allowances_cover_round_two_entries() {
+        let cases: &[(&str, &[(&str, usize)], usize)] = &[
+            ("potears1", &[
+                ("sound/character/walking_rock/small/walk.wav", 22_063),
+                ("sound/character/walking_rock/small/run.wav", 11_325),
+                ("sound/character/walking_rock/large/step1.wav", 11_008),
+                ("sound/character/walking_rock/large/step2.wav", 11_031),
+                ("sound/character/walking_rock/large/getting_down.wav", 11_743),
+                ("sound/character/walking_rock/small/getting_down.wav", 17_701),
+                ("sound/character/walking_rock/small/getting_up.wav", 7_727),
+                ("sound/character/walking_rock/large/getting_up.wav", 12_320),
+                ("sound/ambience/special/quake_step1.wav", 38_656),
+            ], 574_296),
+            ("garden1", &[
+                ("sound/character/mock_turtle/idle_nosewipe.wav", 33_471),
+                ("sound/character/mock_turtle/idle_horn.wav", 52_934),
+                ("sound/character/mock_turtle/jump.wav", 23_996),
+                ("sound/character/mock_turtle/swim.wav", 20_221),
+            ], 522_488),
+            ("utemple", &[
+                ("sound/character/mock_turtle/swim.wav", 20_221),
+            ], 80_884),
+            ("jlair2", &[
+                ("sound/character/jabberspawn/idle2.wav", 24_991),
+                ("sound/character/jabberwock/idle.wav", 33_089),
+                ("sound/character/jabberwock/attack4b.wav", 37_376),
+            ], 381_824),
+            ("skool1", &[
+                ("sound/character/cardguard/diamond/prj_hit_flesh1.wav", 16_230),
+                ("sound/world/mover/flapping_door_loop.wav", 45_757),
+            ], 247_948),
+        ];
+        for &(map, entries, limit) in cases {
+            let mut named = NamedPrefetch::for_map(map, true, false);
+            assert_eq!(named.cues[0].limit, limit, "{map}");
+            assert_eq!(named.cues[0].paths.len(), entries.len(), "{map}");
+            assert_eq!(
+                entries.iter().map(|&(_, len)| len * 4).sum::<usize>(),
+                limit,
+                "{map} allowance must match measured PCM bytes"
+            );
+            let mut seen = BTreeSet::new();
+            for &(path, len) in entries {
+                assert!(named.cues[0].paths.contains(&path), "{map} missing {path}");
+                assert!(seen.insert(path), "{map} duplicate {path}");
+                named.stage_reject(path, Some(clip(0.25, len)));
+            }
+            assert_eq!(named.staged_bytes, [limit, 0], "{map}");
+            let mut cache = BTreeMap::new();
+            let mut samples = 0;
+            named.finish(map, &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
+            assert_eq!(cache.len(), entries.len(), "{map}");
+            assert_eq!(samples * 4, limit, "{map}");
+
+            // One extra sample over the exact allowance rejects the last clip.
+            let over = NamedPrefetch::for_map(map, true, false);
+            let mut over_cache = BTreeMap::new();
+            let mut over_samples = 0;
+            let last = entries.last().unwrap().0;
+            over.finish(map, &mut over_cache, &mut over_samples, |path| {
+                let len = entries.iter().find(|&&(p, _)| p == path).unwrap().1;
+                Some(clip(0.25, len + usize::from(path == last)))
+            });
+            assert!(!over_cache.contains_key(last), "{map} admitted over-limit clip");
+            assert_eq!(over_cache.len(), entries.len() - 1, "{map}");
+
+            // Key off performs no decoding or admission on any targeted map.
+            let mut off_cache = BTreeMap::new();
+            let mut off_samples = 0;
+            NamedPrefetch::for_map(map, false, true).finish(
+                map, &mut off_cache, &mut off_samples, |_| panic!("key off decoded on {map}"),
+            );
+            assert!(off_cache.is_empty() && off_samples == 0);
+        }
     }
 }
 
@@ -427,9 +504,31 @@ const ROCK_CUES: &[&str] = &[
     "sound/character/walking_rock/large/step2.wav",
     "sound/character/walking_rock/large/getting_down.wav",
     "sound/character/walking_rock/small/getting_down.wav",
+    "sound/character/walking_rock/small/getting_up.wav",
+    "sound/character/walking_rock/large/getting_up.wav",
+    "sound/ambience/special/quake_step1.wav",
 ];
-const NOSEWIPE_CUES: &[&str] = &["sound/character/mock_turtle/idle_nosewipe.wav"];
+const GARDEN1_CUES: &[&str] = &[
+    "sound/character/mock_turtle/idle_nosewipe.wav",
+    "sound/character/mock_turtle/idle_horn.wav",
+    "sound/character/mock_turtle/jump.wav",
+    "sound/character/mock_turtle/swim.wav",
+];
+const UTEMPLE_CUES: &[&str] = &["sound/character/mock_turtle/swim.wav"];
+const JLAIR2_CUES: &[&str] = &[
+    "sound/character/jabberspawn/idle2.wav",
+    "sound/character/jabberwock/idle.wav",
+    "sound/character/jabberwock/attack4b.wav",
+];
+const SKOOL1_CUES: &[&str] = &[
+    "sound/character/cardguard/diamond/prj_hit_flesh1.wav",
+    "sound/world/mover/flapping_door_loop.wav",
+];
 const KNIFE_CUES: &[&str] = &[crate::weapons::KNIFE_SPIN, crate::weapons::WEAPON_REAPPEAR];
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+const ALL_NAMED_CUES: &[&[&str]] = &[
+    ROCK_CUES, GARDEN1_CUES, UTEMPLE_CUES, JLAIR2_CUES, SKOOL1_CUES, KNIFE_CUES,
+];
 
 #[derive(Clone, Copy, Default)]
 struct NamedCues {
@@ -449,8 +548,11 @@ impl NamedPrefetch {
             return Self::default();
         }
         let flavor = match name {
-            "potears1" => NamedCues { paths: ROCK_CUES, limit: 339_484 },
-            "garden1" => NamedCues { paths: NOSEWIPE_CUES, limit: 133_884 },
+            "potears1" => NamedCues { paths: ROCK_CUES, limit: 574_296 },
+            "garden1" => NamedCues { paths: GARDEN1_CUES, limit: 522_488 },
+            "utemple" => NamedCues { paths: UTEMPLE_CUES, limit: 80_884 },
+            "jlair2" => NamedCues { paths: JLAIR2_CUES, limit: 381_824 },
+            "skool1" => NamedCues { paths: SKOOL1_CUES, limit: 247_948 },
             _ => NamedCues::default(),
         };
         let knife = if knife_available {
