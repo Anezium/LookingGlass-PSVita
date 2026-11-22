@@ -146,6 +146,9 @@ pub(super) enum SaveAction {
     Retry,
     /// Kill the player and leave the death screen to the live Retry press.
     Die,
+    /// `scene=<thread>`: offer a level script thread to the level controllers, as its trigger
+    /// would, to start a scripted scene in a live arm.
+    Scene,
 }
 
 /// Host proof schedule of owner actions by frame (`LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS`).
@@ -178,9 +181,10 @@ impl SaveActions {
             };
             let frame: u64 = frame.parse()?;
             // `natural-exit=<map>` names the exit's destination; plain `natural-exit` keeps
-            // LOOKING_GLASS_TRANSITION_DESTINATION.
+            // LOOKING_GLASS_TRANSITION_DESTINATION. `scene=<thread>` names its script thread.
             let (kind, destination) = match kind.split_once('=') {
                 Some(("natural-exit", map)) if !map.is_empty() => ("natural-exit", Some(map.to_owned())),
+                Some(("scene", thread)) if !thread.is_empty() => ("scene", Some(thread.to_owned())),
                 Some(_) => anyhow::bail!("invalid lag save action {item:?}"),
                 None => (kind, None),
             };
@@ -191,6 +195,7 @@ impl SaveActions {
                 "natural-exit" => SaveAction::NaturalExit,
                 "retry" => SaveAction::Retry,
                 "die" => SaveAction::Die,
+                "scene" if destination.is_some() => SaveAction::Scene,
                 _ => anyhow::bail!("unknown lag save action {kind:?}"),
             };
             entries.push((frame, action, destination));
@@ -242,6 +247,10 @@ mod tests {
         assert!(std::env::var_os("LOOKING_GLASS_TRANSITION_DESTINATION").is_none(),
             "the destination must not reach the process environment");
         assert_eq!(SaveActions::parse("7:die").unwrap().take(7), Some((SaveAction::Die, None)));
+        assert_eq!(SaveActions::parse("9:scene=Centipede1_Ambush_Cinema1").unwrap().take(9),
+            Some((SaveAction::Scene, Some("Centipede1_Ambush_Cinema1".to_owned()))));
+        assert!(SaveActions::parse("9:scene").is_err());
+        assert!(SaveActions::parse("9:scene=").is_err());
         assert!(SaveActions::parse("5:natural-exit=").is_err());
         assert!(SaveActions::parse("5:retry=potears3").is_err());
         assert!(SaveActions::parse("30:unknown").is_err());

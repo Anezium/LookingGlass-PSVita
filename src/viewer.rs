@@ -2496,6 +2496,10 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             Some((action, destination)) => (Some(action), destination),
             None => (None, None),
         };
+        // A host-scheduled scene thread (`scene=<thread>`); never set on the Vita.
+        #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+        let host_scene = (lag_save_action == Some(lag_control::SaveAction::Scene))
+            .then(|| lag_exit_destination.clone()).flatten();
         // A host-scheduled natural exit and its destination; never set on the Vita.
         let host_natural_exit = (host_transition == "natural-exit"
             || lag_save_action == Some(lag_control::SaveAction::NaturalExit))
@@ -3281,6 +3285,12 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             || lag_save_action == Some(lag_control::SaveAction::Retry);
         // Host proof only: a real death, left on the death screen until a Retry press.
         if lag_save_action == Some(lag_control::SaveAction::Die) { stats.damage(10000.); }
+        // Host proof only: start a level's scene as its trigger would.
+        #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+        if let Some(thread) = &host_scene {
+            anyhow::ensure!(interactions.host_level_event(thread), "host scene {thread} was not taken");
+            eprintln!("[lg/host-scene] frame={frame} thread={thread}");
+        }
         if host_retry
             && new_campaign_memory.is_none() && pending_menu_newgame.is_none() { stats.damage(10000.); }
         let recover = host_retry || focused

@@ -24,6 +24,13 @@ mute: the PotEars2 tape with the game muted from the start, and with M pressed o
 (mute, then sound back), OFF against the normal layout. Every oracle channel, check and event
 line must be exact, and the muted lag run must retain as many frames as the unmuted one.
 
+scene: a scripted scene with lag one admitted in ordinary play. PotEars2 has no scene a host run
+can reach from its start (the Bill ending needs the guards dead), so the arm lists centipede1 in
+the test config only (inside the potears2/skool1/centipede1 ceiling; the shipped profile is not
+changed) and starts its ambush by the host action `scene=<thread>`, as the trigger would. A tape
+arm runs the scene watched and skipped (Enter held in the tape), OFF against lag, exact on every
+channel. A live arm with no tape runs it watched and skipped by held keys: the scene must run, the
+skip must hand back control, lag must retain again afterwards, with no panic.
 """
 import argparse
 from collections import Counter, defaultdict
@@ -98,10 +105,10 @@ def visits(stdout, stderr):
     return rows, counts
 
 
-def check_visits(rows, counts, label):
+def check_visits(rows, counts, label, listed_maps=LISTED):
     assert rows, f'{label}: no layout installs'
     for row in rows:
-        listed = row['map'] in LISTED
+        listed = row['map'] in listed_maps
         assert row['active_skin_workers'] == (1 if listed else 2), (label, row)
         if listed:
             assert row['dispatch'] > 0 and row['pending'] > 0, (label, row)
@@ -434,10 +441,10 @@ def run_ui(args, out):
     return dict(ui_states_live=summary)
 
 
-KEY_BITS = dict(M=1 << 30)
-# Binding row of "Mute sound" (preferences::BINDINGS). The Vita preset in the tapes leaves it
-# unbound: mute is a Start-menu setting there.
-MUTE_ROW = 23
+KEY_BITS = dict(E=1 << 22, M=1 << 30, Enter=1 << 51)
+# Binding rows (preferences::BINDINGS). The Vita preset in the tapes leaves "Mute sound" unbound
+# (mute is a Start-menu setting there) and binds "Retry / skip scene" to E (Triangle).
+MUTE_ROW, SKIP_ROW = 23, 19
 TAPE_TIME = dict(LOOKING_GLASS_SIM_MAPS_TAPE_TIME='1')
 MUTED = 'music=0.5\neffects=0.7\nmuted=true\n'
 MUTE_PRESSES = (700, 1500)
@@ -543,17 +550,104 @@ def run_mute(args, out):
     return dict(mute=report)
 
 
+SCENE_MAP = 'centipede1'
+SCENE_THREAD = 'Centipede1_Ambush_Cinema1'
+SCENE_FRAME = 300
+# Tape arm: Enter held through the skippable reveal. Live arm: seconds after the first capture.
+SCENE_TAPE_HOLD = (420, 520)
+SCENE_LIVE_SKIP = '9:Enter:3'
+# The watched live arm holds an unbound key late, only so the LIVE_UI head lines are printed.
+SCENE_LIVE_WATCH = '20:Num 9:0.1'
+
+
+def scene_summary(stdout, stderr, label):
+    film = [l for l in stderr if l.startswith('[lg/film-transaction]') and f'film={SCENE_THREAD}' in l]
+    host = [l for l in stderr if l.startswith('[lg/host-scene]')]
+    assert len(host) == 1 and f'thread={SCENE_THREAD}' in host[0], (label, host)
+    assert film and 'begin' in film[0], (label, film[:2])
+    outcomes = [l.split('handoff outcome=')[1] for l in film if 'handoff outcome=' in l]
+    events = [json.loads(line.split(' ', 1)[1]) for line in stdout if line.startswith('SIM_EVENT ')]
+    pending = sorted({e['frame'] for e in events if e['event'] == 'pending'})
+    return dict(film_lines=len(film), outcomes=outcomes,
+                terminal=[l.split('terminal end=')[1] for l in film if 'terminal end=' in l],
+                retained_before=len([f for f in pending if f < SCENE_FRAME]),
+                retained_after_scene=len([f for f in pending if f > SCENE_FRAME]),
+                pending=pending)
+
+
+def run_scene(args, out):
+    base = json.loads(Path(args.config).read_text())
+    # Test-only coverage: centipede1 is listed here, never in a shipped profile.
+    lag = dict(sim_overlap=True, sim_overlap_normal=True, sim_overlap_maps=[SCENE_MAP], skin_workers=2)
+    report = {}
+    action = dict(LOOKING_GLASS_SIM_AUDIT='1', LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS=f'{SCENE_FRAME}:scene={SCENE_THREAD}')
+    skipped_tape = out / 'centipede1-scene-skip.lgtape'
+    assert json.loads(Path(args.scene_tape).read_text().splitlines()[1][2:])['preferences']['bindings'][SKIP_ROW] == 'E'
+    edit_tape(args.scene_tape, skipped_tape, holds=[(*SCENE_TAPE_HOLD, KEY_BITS['E'])])
+    for label, tape in (('tape_watched', args.scene_tape), ('tape_skipped', skipped_tape)):
+        off = saves.run_viewer(args.binary, args.data, args.config, args.sim, out / f'{label}_off',
+                               tape_src=tape, extra_env=dict(action, **TAPE_TIME), timeout_s=900)
+        on = saves.run_viewer(args.binary, args.data, args.config, args.sim, out / f'{label}_lag',
+                              tape_src=tape, overrides=lag, extra_env=dict(action, **TAPE_TIME), timeout_s=900)
+        saves.compare_channels(off, on, f'scene:{label}')
+        assert off['checks'] == on['checks'], f'{label}: replay check lines differ'
+        assert off['events'] == on['events'], f'{label}: replay event lines differ'
+        summary = scene_summary(on['stdout_lines'], on['stderr_lines'], label)
+        assert summary['retained_before'] > 0 and summary['retained_after_scene'] > 0, (label, summary)
+        assert (summary['outcomes'] == ['skipped']) == (label == 'tape_skipped'), (label, summary['outcomes'])
+        summary.update(frames=on['frames'], dispatched=on['dispatched_frames'], retained=on['retained_frames'],
+                       channels_exact=True)
+        summary.pop('pending')
+        report[label] = summary
+        print('scene', label, json.dumps(summary), flush=True)
+        shutil.rmtree(out / f'{label}_off')
+        shutil.rmtree(out / f'{label}_lag')
+    config = dict(normal_config(base), sim_overlap_maps=[SCENE_MAP])
+    for label, keys in (('live_watched', SCENE_LIVE_WATCH), ('live_skipped', SCENE_LIVE_SKIP)):
+        env = dict(action, LOOKING_GLASS_LIVE_KEYS=keys)
+        stdout, stderr, elapsed = launch(args.binary, args.data, config, args.sim, out / label,
+                                         ['--map', SCENE_MAP, '--new-game', '--frames', '3000'], env, timeout_s=900)
+        assert not any('panicked' in line for line in stdout + stderr), f'panic in {label}'
+        heads = [(int(m[1]), m[3], m[9] == 'true') for line in stdout if (m := UI_LINE.match(line))]
+        # The scene: the first run of scripted heads on the listed map from the host action on.
+        first = next(f for f, name, scripted in heads if scripted and name == SCENE_MAP)
+        assert first >= SCENE_FRAME, (label, first)
+        last = first
+        for f, name, scripted in heads:
+            if f > last and name == SCENE_MAP and scripted and f == last + 1:
+                last = f
+        summary = scene_summary(stdout, stderr, label)
+        pending = summary.pop('pending')
+        events = [json.loads(line.split(' ', 1)[1]) for line in stdout if line.startswith('SIM_EVENT ')]
+        dispatch = {e['frame'] for e in events if e['event'] == 'dispatch'}
+        inside = [f for f in pending if first <= f <= last]
+        assert not inside, (label, 'retained inside the scene', inside[:5])
+        on_map = {f for f, name, scripted in heads if name == SCENE_MAP and not scripted and f > last}
+        after = [f for f in pending if f in on_map]
+        assert after, f'{label}: lag did not retain again after the scene'
+        assert (summary['outcomes'] == ['skipped']) == (label == 'live_skipped'), (label, summary['outcomes'])
+        rows, counts = visits(stdout, stderr)
+        check_visits(rows, counts, label, [SCENE_MAP])
+        summary.update(scene_heads=[first, last], dispatched_in_scene=len([f for f in dispatch if first <= f <= last]),
+                       retained_in_scene=0, retained_after_scene=len(after), maps=[r['map'] for r in rows],
+                       visits=rows, overlap=counts, elapsed_s=elapsed)
+        report[label] = summary
+        print('scene', label, json.dumps(summary), flush=True)
+    return dict(scene=report)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('live', 'replay', 'controls', 'ui', 'mute'))
+    parser.add_argument('mode', choices=('live', 'replay', 'controls', 'ui', 'mute', 'scene'))
     for name in ('binary', 'data', 'config', 'sim', 'out'):
         parser.add_argument(f'--{name}', required=True)
     parser.add_argument('--tape')
+    parser.add_argument('--scene-tape', help='scene mode: a centipede1 tape (fp-centipede1-01)')
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    report = dict(live=run_live, replay=run_replay, controls=run_controls, ui=run_ui,
-                  mute=run_mute)[args.mode](args, out)
+    report = dict(live=run_live, replay=run_replay, controls=run_controls, ui=run_ui, mute=run_mute,
+                  scene=run_scene)[args.mode](args, out)
     report.update(binary=str(args.binary),
                   binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest())
     (out / f'{args.mode}-proof.json').write_text(json.dumps(report, indent=2) + '\n')
