@@ -136,26 +136,28 @@ pub(super) enum SaveAction {
     Retry,
 }
 
+/// Host proof schedule of owner actions by frame (`LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS`).
+/// Only probe builds read it; release and Vita builds schedule nothing.
 #[derive(Default)]
 pub(super) struct SaveActions {
-    #[cfg(not(target_os = "vita"))]
+    #[cfg(any(test, all(feature = "sim_maps_probe", not(target_os = "vita"))))]
     entries: Vec<(u64, SaveAction, Option<String>)>,
 }
 
 impl SaveActions {
     pub(super) fn read() -> anyhow::Result<Self> {
-        #[cfg(not(target_os = "vita"))]
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         {
             let Ok(raw) = std::env::var("LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS") else {
                 return Ok(Self::default());
             };
             Self::parse(&raw)
         }
-        #[cfg(target_os = "vita")]
+        #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
         Ok(Self::default())
     }
 
-    #[cfg(not(target_os = "vita"))]
+    #[cfg(any(test, all(feature = "sim_maps_probe", not(target_os = "vita"))))]
     fn parse(raw: &str) -> anyhow::Result<Self> {
         let mut entries = Vec::new();
         for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -183,17 +185,16 @@ impl SaveActions {
         Ok(Self { entries })
     }
 
-    pub(super) fn take(&mut self, frame: u64) -> Option<SaveAction> {
-        #[cfg(not(target_os = "vita"))]
+    /// The action scheduled for this frame and, for `natural-exit=<map>`, its destination.
+    /// The destination travels with the action; nothing writes the process environment.
+    pub(super) fn take(&mut self, frame: u64) -> Option<(SaveAction, Option<String>)> {
+        #[cfg(any(test, all(feature = "sim_maps_probe", not(target_os = "vita"))))]
         {
             let index = self.entries.iter().position(|(scheduled, _, _)| *scheduled == frame)?;
             let (_, action, destination) = self.entries.remove(index);
-            if let Some(map) = destination {
-                std::env::set_var("LOOKING_GLASS_TRANSITION_DESTINATION", map);
-            }
-            Some(action)
+            Some((action, destination))
         }
-        #[cfg(target_os = "vita")]
+        #[cfg(not(any(test, all(feature = "sim_maps_probe", not(target_os = "vita")))))]
         {
             let _ = frame;
             None
@@ -209,15 +210,16 @@ mod tests {
     fn parse_save_actions_schedule() {
         let mut actions = SaveActions::parse("30:menu-save, 31:resume, 45:retry, 50:natural-exit").unwrap();
         assert_eq!(actions.take(29), None);
-        assert_eq!(actions.take(30), Some(SaveAction::MenuSave));
+        assert_eq!(actions.take(30), Some((SaveAction::MenuSave, None)));
         assert_eq!(actions.take(30), None);
-        assert_eq!(actions.take(31), Some(SaveAction::Resume));
-        assert_eq!(actions.take(45), Some(SaveAction::Retry));
-        assert_eq!(actions.take(50), Some(SaveAction::NaturalExit));
+        assert_eq!(actions.take(31), Some((SaveAction::Resume, None)));
+        assert_eq!(actions.take(45), Some((SaveAction::Retry, None)));
+        assert_eq!(actions.take(50), Some((SaveAction::NaturalExit, None)));
         assert!(SaveActions::parse("bad").is_err());
         let mut exits = SaveActions::parse("5:natural-exit=potears3").unwrap();
-        assert_eq!(exits.take(5), Some(SaveAction::NaturalExit));
-        assert_eq!(std::env::var("LOOKING_GLASS_TRANSITION_DESTINATION").as_deref(), Ok("potears3"));
+        assert_eq!(exits.take(5), Some((SaveAction::NaturalExit, Some("potears3".to_owned()))));
+        assert!(std::env::var_os("LOOKING_GLASS_TRANSITION_DESTINATION").is_none(),
+            "the destination must not reach the process environment");
         assert!(SaveActions::parse("5:natural-exit=").is_err());
         assert!(SaveActions::parse("5:retry=potears3").is_err());
         assert!(SaveActions::parse("30:unknown").is_err());

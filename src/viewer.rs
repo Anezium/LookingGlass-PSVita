@@ -2475,7 +2475,14 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         timing.with(|r| {if r.schedule.is_some(){r.schedule_input(input.diagnostic_activity());}});
         preview_throttle.advance_frame();
         let host_transition = crate::transition_memory::host_action(frame);
-        let lag_save_action = lag_save_actions.take(frame);
+        let (lag_save_action, lag_exit_destination) = match lag_save_actions.take(frame) {
+            Some((action, destination)) => (Some(action), destination),
+            None => (None, None),
+        };
+        // A host-scheduled natural exit and its destination; never set on the Vita.
+        let host_natural_exit = (host_transition == "natural-exit"
+            || lag_save_action == Some(lag_control::SaveAction::NaturalExit))
+            .then(|| lag_exit_destination.unwrap_or_else(crate::transition_memory::host_destination));
         let lag_modal_action = matches!(
             lag_save_action,
             Some(
@@ -3718,8 +3725,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             map: scene.map.clone(),
             preferences: preferences.clone(),
             saves_writable: saves_writable && pending_checkpoint.is_none(),
-            host_natural_exit: host_transition == "natural-exit"
-                || lag_save_action == Some(lag_control::SaveAction::NaturalExit),
+            host_natural_exit: host_natural_exit.clone(),
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
             force_checkpoint: force_checkpoint_frames.contains(&frame),
         };
@@ -3806,8 +3812,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             }
             due = step_due(false, story_active, post_game, &mut interactions, &mut story,
                 &mut step_locals.pending_transition,
-                host_transition == "natural-exit"
-                    || lag_save_action == Some(lag_control::SaveAction::NaturalExit));
+                host_natural_exit.clone());
         }
         if matches!(due, Due::Ending) {
             post_game = true;

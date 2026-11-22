@@ -594,7 +594,7 @@ fn saved_at_now() -> Result<u64> {
     if let Some(at) = TEST_SAVED_AT.with(std::cell::Cell::get) {
         return Ok(at);
     }
-    #[cfg(not(target_os = "vita"))]
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     if let Some(raw) = std::env::var_os("LOOKING_GLASS_SAVE_FIXED_AT") {
         let text = raw.to_string_lossy();
         return text
