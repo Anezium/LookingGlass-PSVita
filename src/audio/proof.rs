@@ -88,8 +88,7 @@ pub(super) fn named_enqueue(
     gain: f32,
     loop_id: Option<usize>,
 ) {
-    if !enabled() || ![super::ROCK_CUES, super::NOSEWIPE_CUES, super::KNIFE_CUES]
-        .iter().any(|paths| paths.contains(&path))
+    if !enabled() || !super::ALL_NAMED_CUES.iter().any(|paths| paths.contains(&path))
     {
         return;
     }
