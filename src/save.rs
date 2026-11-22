@@ -594,6 +594,14 @@ fn saved_at_now() -> Result<u64> {
     if let Some(at) = TEST_SAVED_AT.with(std::cell::Cell::get) {
         return Ok(at);
     }
+    #[cfg(not(target_os = "vita"))]
+    if let Some(raw) = std::env::var_os("LOOKING_GLASS_SAVE_FIXED_AT") {
+        let text = raw.to_string_lossy();
+        return text
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("Invalid LOOKING_GLASS_SAVE_FIXED_AT={text:?}"));
+    }
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
 }
 #[cfg(test)]
@@ -635,18 +643,71 @@ impl CheckpointSubmitTiming {
     }
 }
 
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+struct WriterTestGate {
+    state: std::sync::Mutex<(u64, bool)>,
+    cv: std::sync::Condvar,
+    fail: bool,
+}
+
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+impl WriterTestGate {
+    fn parse_env() -> Option<(u64, bool)> {
+        let raw = std::env::var("LOOKING_GLASS_CHECKPOINT_WRITER_TEST").ok()?;
+        let (kind, count) = raw.trim().split_once(':')?;
+        let polls: u64 = count.parse().ok()?;
+        let fail = match kind {
+            "delay" => false,
+            "fail" => true,
+            _ => return None,
+        };
+        Some((polls, fail))
+    }
+
+    fn new(polls: u64, fail: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: std::sync::Mutex::new((polls, false)),
+            cv: std::sync::Condvar::new(),
+            fail,
+        })
+    }
+
+    fn wait_for_release(&self) {
+        let guard = self.state.lock().unwrap();
+        let _guard = self.cv.wait_while(guard, |state| !state.1).unwrap();
+    }
+
+    /// Returns true once the writer is released and the caller should collect its result.
+    fn poll_or_release(&self, wait: bool) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        if wait || guard.0 <= 1 {
+            guard.0 = 0;
+            guard.1 = true;
+            self.cv.notify_all();
+            true
+        } else {
+            guard.0 -= 1;
+            false
+        }
+    }
+}
+
 /// The frame captures both envelope timestamps before handing the checkpoint to the writer.
 struct CheckpointJob {
     game: Box<Game>,
     readback: Option<Readback>,
     saved_at: [u64; 2],
     completed: SyncSender<Result<()>>,
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    test_gate: Option<std::sync::Arc<WriterTestGate>>,
 }
 
 pub struct PendingCheckpoint {
     completed: Receiver<Result<()>>,
     retry_snapshot: Box<Game>,
     requesters: Vec<&'static str>,
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    test_gate: Option<std::sync::Arc<WriterTestGate>>,
 }
 impl PendingCheckpoint {
     /// A committed pair installs its request-frame retry point. A failure restores
@@ -658,12 +719,26 @@ impl PendingCheckpoint {
         retry: &mut crate::recovery::RetryPoint,
     ) -> Option<Result<()>> {
         let job = pending.as_ref()?;
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        let gate_ready = if let Some(gate) = &job.test_gate {
+            if !gate.poll_or_release(wait) {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
+        let gate_ready = false;
         let result = match job.completed.try_recv() {
             Err(TryRecvError::Empty) if wait => {
                 let start = std::time::Instant::now();
                 let result = job.completed.recv().context("The save writer stopped");
                 eprintln!("[lg/checkpoint] barrier_wait_ms={:.3}", start.elapsed().as_secs_f64() * 1000.);
                 result
+            }
+            Err(TryRecvError::Empty) if gate_ready => {
+                job.completed.recv().context("The save writer stopped")
             }
             Err(TryRecvError::Empty) => return None,
             result => result.context("The save writer stopped"),
@@ -687,6 +762,8 @@ pub struct CheckpointWriter {
     submit: Option<SyncSender<CheckpointJob>>,
     idle: Receiver<()>,
     thread: Option<JoinHandle<()>>,
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    test_config: Option<(u64, bool)>,
 }
 impl CheckpointWriter {
     pub fn start(store: &Store) -> std::io::Result<Self> {
@@ -695,14 +772,29 @@ impl CheckpointWriter {
             fingerprint: store.fingerprint.clone(),
             discard_writes: store.discard_writes,
         };
-        Self::spawn(move |job, preview| {
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        let test_config = WriterTestGate::parse_env();
+        #[allow(unused_mut)]
+        let mut writer = Self::spawn(move |job, preview| {
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            if let Some(gate) = &job.test_gate {
+                gate.wait_for_release();
+                if gate.fail {
+                    anyhow::bail!("injected checkpoint writer failure");
+                }
+            }
             store.write_checkpoint_pair(|destination, index| {
                 destination.write_with_preview_saved_at(
                     Slot::Auto, &job.game, preview, SavedAt::At(job.saved_at[index]),
                     SaveWriter::Background,
                 )
             })
-        })
+        })?;
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        {
+            writer.test_config = test_config;
+        }
+        Ok(writer)
     }
 
     fn spawn(
@@ -734,7 +826,13 @@ impl CheckpointWriter {
                     }
                 }
             })?;
-        Ok(Self { submit: Some(submit), idle, thread: Some(thread) })
+        Ok(Self {
+            submit: Some(submit),
+            idle,
+            thread: Some(thread),
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            test_config: None,
+        })
     }
 
     #[cfg(test)]
@@ -763,11 +861,15 @@ impl CheckpointWriter {
             Ok::<_, anyhow::Error>((saved_at, completed, result))
         })?;
         Timing::measure(&mut timing.permit_ms, || self.idle.recv()).context("The save writer stopped")?;
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        let test_gate = self.test_config.map(|(polls, fail)| WriterTestGate::new(polls, fail));
         let job = Timing::measure(&mut timing.job_ms, || CheckpointJob {
             game: Box::new(game),
             readback,
             saved_at,
             completed,
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            test_gate: test_gate.clone(),
         });
         Timing::measure(&mut timing.send_ms, || self.submit.as_ref().unwrap().send(job))
             .map_err(|_| anyhow::anyhow!("The save writer stopped"))?;
@@ -780,7 +882,13 @@ impl CheckpointWriter {
             requesters
         });
         let retry_snapshot = Timing::measure(&mut timing.retry_ms, || Box::new(snapshot(interactions)));
-        Ok(PendingCheckpoint { completed: result, retry_snapshot, requesters })
+        Ok(PendingCheckpoint {
+            completed: result,
+            retry_snapshot,
+            requesters,
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            test_gate,
+        })
     }
 }
 impl Drop for CheckpointWriter {
@@ -1770,5 +1878,24 @@ mod native_isolation_tests {
         assert!(store.write(Slot::Auto,&game).is_err());
         assert_eq!(crate::native_timing::operations::snapshot().0,before+1);
         assert!(!store.directory.exists());
+    }
+}
+
+#[cfg(all(test, feature = "sim_maps_probe", not(target_os = "vita")))]
+mod writer_test_gate_tests {
+    use super::*;
+
+    #[test]
+    fn writer_test_gate_holds_for_configured_polls_and_releases_on_barrier() {
+        let gate = WriterTestGate::new(3, false);
+        assert!(!gate.poll_or_release(false));
+        assert!(!gate.poll_or_release(false));
+        assert!(gate.poll_or_release(false));
+        gate.wait_for_release();
+
+        let barrier_gate = WriterTestGate::new(5, true);
+        assert!(!barrier_gate.poll_or_release(false));
+        assert!(barrier_gate.poll_or_release(true));
+        barrier_gate.wait_for_release();
     }
 }

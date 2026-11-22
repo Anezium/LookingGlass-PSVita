@@ -1211,7 +1211,12 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let mut pending_checkpoint = None;
     // Settle frame-tail jobs before the next host replay frame to match its HUD timing.
     // Live play still polls, with waits only at save and transition barriers.
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    let checkpoint_writer_test = std::env::var_os("LOOKING_GLASS_CHECKPOINT_WRITER_TEST").is_some();
+    #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
+    let checkpoint_writer_test = false;
     let wait_for_replay_checkpoint = !cfg!(target_os = "vita")
+        && !checkpoint_writer_test
         && replay.as_ref().is_some_and(|r| r.replaying());
     let mut replay_end: Option<&'static str> = None;
     eprintln!("[lg/startup] save store ready elapsed_ms={:.3} store_construct_ms={:.3} viewer_elapsed_ms={:.3}",save_store_start.elapsed().as_secs_f64()*1000.,store_start.elapsed().as_secs_f64()*1000.,startup.elapsed().as_secs_f64()*1000.);
@@ -1369,8 +1374,16 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let mut retained_frames = 0u64;
     let mut sim_trace = sim_timing::Trace::new();
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-    let force_checkpoint_frame = std::env::var("LOOKING_GLASS_SIM_FORCE_CHECKPOINT")
-        .ok().map(|value| value.parse::<u64>()).transpose()?;
+    let force_checkpoint_frames: Vec<u64> = match std::env::var("LOOKING_GLASS_SIM_FORCE_CHECKPOINT") {
+        Ok(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
     let mut menu = false;
     let mut inventory_menu = false;
     let mut help_until = 0.0;
@@ -2025,6 +2038,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let mut last_present: Option<u64> = None;
     let mut forced_flush;
     let lag_control = lag_control::Controls::read()?;
+    let mut lag_save_actions = lag_control::SaveActions::read()?;
     let mut render_peer: Option<lag_control::Peer> = None;
 
     // An owner transaction can flush at its original call site. The tape
@@ -2437,7 +2451,16 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         timing.with(|r| {if r.schedule.is_some(){r.schedule_input(input.diagnostic_activity());}});
         preview_throttle.advance_frame();
         let host_transition = crate::transition_memory::host_action(frame);
-        if !host_transition.is_empty() {
+        let lag_save_action = lag_save_actions.take(frame);
+        let lag_modal_action = matches!(
+            lag_save_action,
+            Some(
+                lag_control::SaveAction::MenuSave
+                    | lag_control::SaveAction::Resume
+                    | lag_control::SaveAction::NewGame
+            )
+        );
+        if !host_transition.is_empty() || lag_modal_action {
             flush_pending!(frame, step_guards, step_input);
         }
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
@@ -2511,7 +2534,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         // before entering it, so thumbnails never capture the menu or old play.
         let opening_escape_menu = throttle_normal && escape_menu.page.is_some() && !escape_preview_ready;
         if opening_escape_menu { paused = true; clock.pause(); }
-        if (escape_menu.page.is_some() && (!throttle_normal || escape_preview_ready)) || matches!(host_transition.as_str(), "native-load" | "new-game" | "new-game+retry" | "new-game+quick-load") {
+        if (escape_menu.page.is_some() && (!throttle_normal || escape_preview_ready)) || lag_modal_action || matches!(host_transition.as_str(), "native-load" | "new-game" | "new-game+retry" | "new-game+quick-load") {
             #[cfg(feature = "native_timing")]
             timing.with(|r| {
                 r.discontinuity(crate::native_timing::Milestone::ModalEnter, crate::native_timing::MODAL | crate::native_timing::PAUSED);
@@ -2533,7 +2556,9 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             census_block=crate::phase_census::span(crate::phase_census::Region::Other);
             finish_checkpoint!(true);
             let action = if host_transition == "native-load" { crate::menu::Action::Load(Slot::Auto) }
-                else if host_transition.starts_with("new-game") { crate::menu::Action::NewGame(options.difficulty) } else {
+                else if host_transition.starts_with("new-game") || lag_save_action == Some(lag_control::SaveAction::NewGame) { crate::menu::Action::NewGame(options.difficulty) }
+                else if lag_save_action == Some(lag_control::SaveAction::MenuSave) { crate::menu::Action::Save(Slot::One) }
+                else if lag_save_action == Some(lag_control::SaveAction::Resume) { crate::menu::Action::Resume } else {
                 owner_yield!(step_guards, escape_menu.run(std::sync::Arc::make_mut(&mut preferences), &mut audio, &store, pos, yaw, &mut input))
             };
             #[cfg(feature = "native_timing")]
@@ -3201,9 +3226,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         if inventory_menu && input.ui(KeyCode::Enter) {
             inventory_menu = false;
         }
-        if matches!(host_transition.as_str(), "retry" | "new-game+retry")
+        let host_retry = matches!(host_transition.as_str(), "retry" | "new-game+retry")
+            || lag_save_action == Some(lag_control::SaveAction::Retry);
+        if host_retry
             && new_campaign_memory.is_none() && pending_menu_newgame.is_none() { stats.damage(10000.); }
-        let recover = matches!(host_transition.as_str(), "retry" | "new-game+retry") || focused
+        let recover = host_retry || focused
             && !menu
             && !inventory_menu
             && !console_input
@@ -3664,9 +3691,10 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             map: scene.map.clone(),
             preferences: preferences.clone(),
             saves_writable: saves_writable && pending_checkpoint.is_none(),
-            host_natural_exit: host_transition == "natural-exit",
+            host_natural_exit: host_transition == "natural-exit"
+                || lag_save_action == Some(lag_control::SaveAction::NaturalExit),
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-            force_checkpoint: force_checkpoint_frame == Some(frame),
+            force_checkpoint: force_checkpoint_frames.contains(&frame),
         };
         let mut joined_b = None;
         let (step_a_result, console_ops) = if lag_dispatch {
@@ -3750,7 +3778,9 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 }
             }
             due = step_due(false, story_active, post_game, &mut interactions, &mut story,
-                &mut step_locals.pending_transition, host_transition == "natural-exit");
+                &mut step_locals.pending_transition,
+                host_transition == "natural-exit"
+                    || lag_save_action == Some(lag_control::SaveAction::NaturalExit));
         }
         if matches!(due, Due::Ending) {
             post_game = true;

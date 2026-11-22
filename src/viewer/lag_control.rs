@@ -126,3 +126,84 @@ impl Peer {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SaveAction {
+    MenuSave,
+    Resume,
+    NewGame,
+    NaturalExit,
+    Retry,
+}
+
+#[derive(Default)]
+pub(super) struct SaveActions {
+    #[cfg(not(target_os = "vita"))]
+    entries: Vec<(u64, SaveAction)>,
+}
+
+impl SaveActions {
+    pub(super) fn read() -> anyhow::Result<Self> {
+        #[cfg(not(target_os = "vita"))]
+        {
+            let Ok(raw) = std::env::var("LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS") else {
+                return Ok(Self::default());
+            };
+            Self::parse(&raw)
+        }
+        #[cfg(target_os = "vita")]
+        Ok(Self::default())
+    }
+
+    #[cfg(not(target_os = "vita"))]
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        let mut entries = Vec::new();
+        for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some((frame, kind)) = item.split_once(':') else {
+                anyhow::bail!("invalid lag save action {item:?}");
+            };
+            let frame: u64 = frame.parse()?;
+            let action = match kind {
+                "menu-save" => SaveAction::MenuSave,
+                "resume" => SaveAction::Resume,
+                "new-game" => SaveAction::NewGame,
+                "natural-exit" => SaveAction::NaturalExit,
+                "retry" => SaveAction::Retry,
+                _ => anyhow::bail!("unknown lag save action {kind:?}"),
+            };
+            entries.push((frame, action));
+        }
+        Ok(Self { entries })
+    }
+
+    pub(super) fn take(&mut self, frame: u64) -> Option<SaveAction> {
+        #[cfg(not(target_os = "vita"))]
+        {
+            let index = self.entries.iter().position(|&(scheduled, _)| scheduled == frame)?;
+            Some(self.entries.remove(index).1)
+        }
+        #[cfg(target_os = "vita")]
+        {
+            let _ = frame;
+            None
+        }
+    }
+}
+
+#[cfg(all(test, not(target_os = "vita")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_save_actions_schedule() {
+        let mut actions = SaveActions::parse("30:menu-save, 31:resume, 45:retry, 50:natural-exit").unwrap();
+        assert_eq!(actions.take(29), None);
+        assert_eq!(actions.take(30), Some(SaveAction::MenuSave));
+        assert_eq!(actions.take(30), None);
+        assert_eq!(actions.take(31), Some(SaveAction::Resume));
+        assert_eq!(actions.take(45), Some(SaveAction::Retry));
+        assert_eq!(actions.take(50), Some(SaveAction::NaturalExit));
+        assert!(SaveActions::parse("bad").is_err());
+        assert!(SaveActions::parse("30:unknown").is_err());
+    }
+}
