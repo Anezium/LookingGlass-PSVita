@@ -128,22 +128,52 @@ impl Hierarchy {
         for &id in &path[..len] {cache[id as usize&(CERT_CACHE-1)]=id|if accepted{0}else{LEAF};}
         accepted
     }
-    pub fn trace(&self,g:&StaticGeometry,a:Vec3,b:Vec3,h:Vec3,q:&SweepBounds,c:&mut Counts)->Option<Trace> {
+    fn supports_trace(&self, a: Vec3, b: Vec3, h: Vec3, q: &SweepBounds) -> bool {
         // Non-finite inverse includes tiny nonzero delta whose reciprocal overflows.
         // Delta overflow can produce inverse zero; require finite endpoints/delta too.
-        if !self.finite||!a.is_finite()||!b.is_finite()||!h.is_finite()||h.cmplt(Vec3::ZERO).any()||!(b-a).is_finite()||
-            !q.inverse.is_finite()||!q.padding.is_finite()||!q.bounds.min.is_finite()||!q.bounds.max.is_finite(){return None;}
+        self.finite && a.is_finite() && b.is_finite() && h.is_finite() && h.cmpge(Vec3::ZERO).all()
+            && (b-a).is_finite() && q.inverse.is_finite() && q.padding.is_finite()
+            && q.bounds.min.is_finite() && q.bounds.max.is_finite()
+    }
+    pub fn trace(&self,g:&StaticGeometry,a:Vec3,b:Vec3,h:Vec3,q:&SweepBounds,c:&mut Counts)->Option<Trace> {
+        if !self.supports_trace(a, b, h, q) { return None; }
         let mut candidates=[0u32;CANDIDATES];let mut len=0;
         if !self.gather(0,g,q,&mut candidates,&mut len,c){return None;}
         candidates[..len].sort_unstable();
+        Some(self.trace_ordered(g, a, b, h, q, c, candidates[..len].iter().copied()))
+    }
+    pub(super) fn trace_in_window(
+        &self, g: &StaticGeometry, a: Vec3, b: Vec3, h: Vec3, q: &SweepBounds,
+        window: &mut super::nav_sweep::Window, c: &mut Counts,
+    ) -> Option<Trace> {
+        if !self.supports_trace(a, b, h, q) { return None; }
+        let ranks = window.ranks(q, |region, ranks| {
+            let mut candidates = [0; CANDIDATES];
+            let mut len = 0;
+            if !self.gather(0, g, region, &mut candidates, &mut len, c) { return false; }
+            ranks.extend_from_slice(&candidates[..len]);
+            true
+        })?;
+        // A hit on a hull's bounds implies a hit on each enclosing SAH node.
+        // Keep the original slab check, rank order and legacy admission test.
+        let candidates = ranks.iter().copied().filter(|&rank| {
+            q.overlaps(g.hulls[self.order[rank as usize].hull as usize].bounds)
+        });
+        c.tested += ranks.len() as u64;
+        Some(self.trace_ordered(g, a, b, h, q, c, candidates))
+    }
+    fn trace_ordered(
+        &self, g: &StaticGeometry, a: Vec3, b: Vec3, h: Vec3, q: &SweepBounds,
+        c: &mut Counts, ranks: impl Iterator<Item = u32>,
+    ) -> Trace {
         let mut cache=[NONE;CERT_CACHE];let mut result=Trace::default();
-        for &rank in &candidates[..len] {
+        for rank in ranks {
             let original=self.order[rank as usize];let hull=&g.hulls[original.hull as usize];
             c.clipped+=1;let mut proposed=result;
             clip_hull_counted(hull,a,b,h,&mut proposed,c);
             if bits(proposed)!=bits(result)&&self.admitted(original.leaf,q,&mut cache,c){result=proposed;}
         }
-        Some(result)
+        result
     }
 }
 impl Hierarchy {

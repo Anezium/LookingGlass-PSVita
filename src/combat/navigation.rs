@@ -1,5 +1,6 @@
 //! Small, persistent ground detours. Every edge uses the actor's real supported hull.
 use super::*;
+use crate::collision::NavSweepCache;
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Detour {
@@ -67,13 +68,15 @@ impl Detour {
     }
 }
 
-fn edge(world: &World, from: Vec3, goal: Vec3, half: Vec3) -> Option<Vec3> {
+fn edge(
+    world: &World, from: Vec3, goal: Vec3, half: Vec3, mut nav: Option<&mut NavSweepCache>,
+) -> Option<Vec3> {
     let delta = (goal - from).with_z(0.);
     let steps = (delta.length() / 12.).ceil().max(1.) as usize;
     let step = delta / steps as f32;
     let mut p = from;
     for _ in 0..steps {
-        let q = walk_body(world, p, step, half);
+        let q = walk_body_with_navigation(world, p, step, half, 0, nav.as_deref_mut());
         if q.truncate().distance_squared((p + step).truncate()) > 0.1 {
             return None;
         }
@@ -85,7 +88,14 @@ fn edge(world: &World, from: Vec3, goal: Vec3, half: Vec3) -> Option<Vec3> {
 fn plan(world: &World, feet: Vec3, goal: Vec3, half: Vec3) -> Vec<Vec3> {
     let timer = crate::spike_log::on().then(std::time::Instant::now);
     let mut tests = 0u32;
-    let mut edge = |from: Vec3, aim: Vec3| { tests += 1; edge(world, from, aim, half) };
+    #[cfg(feature = "vita_renderer")]
+    let mut nav = crate::render::vita_renderer::config().nav_sweep_cache.then(NavSweepCache::default);
+    #[cfg(not(feature = "vita_renderer"))]
+    let mut nav = None;
+    let mut edge = |from: Vec3, aim: Vec3| {
+        tests += 1;
+        edge(world, from, aim, half, nav.as_mut())
+    };
     let (path, expanded) = search(feet, goal, &mut edge);
     if let Some(t) = timer {
         crate::spike_log::planner(crate::spike_log::NAV_PLAN, t.elapsed().as_secs_f64() * 1000., expanded, tests);
@@ -202,6 +212,53 @@ fn search(feet: Vec3, goal: Vec3, edge: &mut impl FnMut(Vec3, Vec3) -> Option<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_walks_match_recorded_detour_inputs_bit_for_bit() {
+        use crate::collision::{set_sah_enabled_for_test, Collider};
+        // a2-04 at step 1334. The first plan node expands in this order.
+        let feet = Vec3::from_array([3310205121, 1141932048, 3266748818].map(f32::from_bits));
+        let half = Vec3::splat(36.);
+        let deltas = [
+            vec3(12., 0., 0.), vec3(0., 12., 0.), vec3(-12., 0., 0.), vec3(0., -12., 0.),
+            vec3(8., 8., 0.), vec3(-8., 8., 0.), vec3(-8., -8., 0.), vec3(8., -8., 0.),
+        ];
+        // Box fixtures use the recorded inputs without carrying map geometry.
+        let floor = (
+            feet + vec3(-200., -200., -20.),
+            feet + vec3(200., 200., -0.1),
+        );
+        let step = (
+            feet + vec3(-80., 43., -2.),
+            feet + vec3(40., 120., 6.),
+        );
+        set_sah_enabled_for_test(Some(true));
+        let mut world = World::fixture(&[floor, step]);
+        set_sah_enabled_for_test(None);
+        let blocker = Collider::fixture(
+            feet + vec3(40., -35., 0.), feet + vec3(60., 35., 120.),
+        );
+        let mut previous = None;
+        for dynamic in [vec![], vec![blocker], vec![]] {
+            world.set_dynamic(dynamic);
+            let mut nav = NavSweepCache::default();
+            for &delta in &deltas {
+                let mut at = feet;
+                for _ in 0..4 {
+                    let expected = walk_body(&world, at, delta, half);
+                    let cached = walk_body_with_navigation(&world, at, delta, half, 0, Some(&mut nav));
+                    assert_eq!(expected.to_array().map(f32::to_bits), cached.to_array().map(f32::to_bits));
+                    at = expected;
+                }
+            }
+            assert!(nav.has_candidates());
+            let east = walk_body(&world, feet, deltas[0], half);
+            if let Some(old) = previous {
+                assert_ne!(old, east, "fixture must exercise publication changes");
+            }
+            previous = Some(east);
+        }
+    }
+
     #[test]
     fn detours_around_a_pillar_and_restores_midway() {
         let world = World::fixture(&[

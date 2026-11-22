@@ -82,6 +82,8 @@ pub struct Config {
     pub sim_sweep_any: bool,
     /// Map-load empty-space certificates, re-tested flight blockers and compact route nodes. Default off.
     pub sim_flight_memo: bool,
+    /// Reuse nearby static sweep candidates inside one ground detour when collision SAH is active.
+    pub nav_sweep_cache: bool,
     /// Draw omission diagnostics only; these never belong in a release config.
     pub diag_skip_ant_corpses: bool,
     /// Reject dead Ant triangles strictly outside the homogeneous view before GPU submission.
@@ -635,6 +637,7 @@ impl Default for Config {
             diag_skip_water: false,
             diag_skip_sky: false,
             sim_flight_memo: false,
+            nav_sweep_cache: false,
             spike_log_first_frame: 0,
             spike_log_last_frame: 0,
             actor_near_cull: 0.,
