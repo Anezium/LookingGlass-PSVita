@@ -89,11 +89,11 @@ pub(super) fn admitted_lit(p: &Pass, u: &[f32; UNIFORM_FLOATS], culled_to_zero: 
     p.lit && (culled_to_zero || has_lights(u, 0)) && !has_lights(u, 2) && lean_material(p, u)
 }
 
-fn has_lights(u: &[f32; UNIFORM_FLOATS], first: usize) -> bool {
+pub(super) fn has_lights(u: &[f32; UNIFORM_FLOATS], first: usize) -> bool {
     u[LIGHTS + first * 8..LIGHTS + 64].chunks_exact(8).any(|slot| slot[7] > 0.5)
 }
 
-fn lean_material(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
+pub(super) fn lean_material(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
     let a = &u[APPEARANCE..APPEARANCE + 4];
     !p.effect
         && !(a[0] > 0.) && !(a[1] > 0.5) && !(a[2] > 0.5) && !(a[3] > 0.) && !(a[3] < 0.)

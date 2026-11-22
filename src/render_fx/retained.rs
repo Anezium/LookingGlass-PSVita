@@ -489,6 +489,12 @@ pub(crate) struct Gpu {
     merge_meshes: [BTreeMap<usize, super::prepared::Geometry>; 2],
     puff_batches: [world_puffs::Bank; 2],
     bounds: packet_cull::Bounds,
+    /// Frozen after prewarm: for each pipeline key (blend, depth-equal) the
+    /// availability of the four actor-lean banks, `[unlit, unlit-opaque, lit,
+    /// lit-opaque]`, read per draw instead of walking the pipeline maps.
+    lean_routes: Box<[[bool; 4]]>,
+    /// GPU-skin support of the two lit variants, read per draw.
+    lit_skin: [bool; 2],
 }
 /// Credit omitted geometry separately from the logical packet transcript and
 /// preserve the state binding that subsequent packets already account for.
@@ -641,6 +647,8 @@ impl Gpu {
             merge_meshes: Default::default(),
             puff_batches: Default::default(),
             bounds: Default::default(),
+            lean_routes: Vec::new().into_boxed_slice(),
+            lit_skin: [false; 2],
         };
         // Pipeline objects share the one compiled program. Prewarm every LG blend
         // and depth key so first use of the held Blade does not create one later.
@@ -649,6 +657,21 @@ impl Gpu {
                 gpu.prepare_pipeline((blend, equal));
             }
         }
+        // Every pipeline key is prewarmed once, so the bank maps are frozen
+        // from here: snapshot each key's actor-lean availability, and the
+        // GPU-skin support of the two lit variants, for the per-draw checks.
+        let mut lean_routes = vec![[false; 4]; crate::render::BLEND_COUNT * 2];
+        for blend in 0..crate::render::BLEND_COUNT {
+            for equal in [false, true] {
+                let key = (blend, equal);
+                lean_routes[blend * 2 + usize::from(equal)] =
+                    std::array::from_fn(|bank| gpu.actor_lean[bank].as_ref()
+                        .is_some_and(|l| l.pipelines.contains_key(&key)));
+            }
+        }
+        gpu.lean_routes = lean_routes.into_boxed_slice();
+        gpu.lit_skin = [4, 5].map(|variant|
+            gpu.skin.as_ref().is_some_and(|skin| skin.supports(variant)));
         println!(
             "[lg/vita-renderer] actor pipeline objects prewarmed={} programs={}",
             gpu.pipelines.len() + gpu.lite.as_ref().map_or(0, |l| l.pipelines.len()) + gpu.corpse_opaque.as_ref().map_or(0,|l|l.pipelines.len())
@@ -657,6 +680,11 @@ impl Gpu {
                 + gpu.fx_add.iter().chain(&gpu.actor_lean).flatten().count()
         );
         Ok(gpu)
+    }
+    /// Bank availability for one draw key. An authored factor blend outside the
+    /// table stays on the full route exactly as a missing pipeline did.
+    fn lean_routes(&self, key: (usize, bool)) -> [bool; 4] {
+        self.lean_routes.get(key.0 * 2 + usize::from(key.1)).copied().unwrap_or([false; 4])
     }
     fn upload(&mut self, slot: usize, p: &Pass, leaves: &mut crate::phase_census::FinishLeaves) -> Result<usize> {
         crate::game_thread::assert_current();
@@ -832,16 +860,27 @@ impl Gpu {
 
         let program = add_route(p, [self.fx_add[0].is_some(), self.fx_add[1].is_some()], || add_program::fog_free(p, u))
             .unwrap_or_else(|| route(p, opaque, self.lite.is_some()));
-        let program = actor_lean_route(program,
-            [0, 1].map(|i| self.actor_lean[i].as_ref().is_some_and(|l| l.pipelines.contains_key(&key))),
-            false, || !culled_to_zero && actor_lean::admitted(p, u));
+        let lean = self.lean_routes(key);
+        // Both admission guards below are pure in (p, u); the two facts they
+        // share are evaluated at most once per draw, by whichever guard runs.
+        let memo = std::cell::Cell::new(None);
+        let admission = || -> (bool, bool) {
+            memo.get().unwrap_or_else(|| {
+                let facts = (actor_lean::has_lights(u, 0), actor_lean::lean_material(p, u));
+                memo.set(Some(facts));
+                facts
+            })
+        };
+        let program = actor_lean_route(program, [lean[0], lean[1]],
+            false, || !culled_to_zero && { let facts = admission(); !facts.0 && facts.1 });
         // Keep the RGB light-add expression after a cull to zero. Omitting it
         // changed native GL rounding on a replay even with a zero light sum.
         let program = if c.actor_lean_lights || culled_to_zero && c.actor_lean_shader {
-            actor_lean_route(program, [2, 3].map(|i| {
-                self.actor_lean[i].as_ref().is_some_and(|l| l.pipelines.contains_key(&key))
-                    && (p.gpu_skin.is_none() || self.skin.as_ref().is_some_and(|skin| skin.supports(i + 2)))
-            }), true, || actor_lean::admitted_lit(p, u, culled_to_zero))
+            let skinned = p.gpu_skin.is_some();
+            actor_lean_route(program, [lean[2] && (!skinned || self.lit_skin[0]),
+                lean[3] && (!skinned || self.lit_skin[1])],
+                true, || { let facts = admission(); p.lit && (culled_to_zero || facts.0)
+                    && !actor_lean::has_lights(u, 2) && facts.1 })
         } else { program };
         let variant = match program {
             Route::CorpseOpaque => 1, Route::ActorLean => 2, Route::ActorLeanOpaque => 3,
