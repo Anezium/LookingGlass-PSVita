@@ -67,6 +67,8 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/character/skinning/identity.rs:7` | `NEXT` | counter | Process-wide atomic actor counter. A host owner allocation during a step panics. |
 | `src/character/skinning/identity.rs:8` | `NEXT_INSTANCE` | counter | Process-wide atomic owner-only counter for skin instances and NPC snapshot generations. |
 | `src/character/skinning/identity.rs:11` | `thread_local!` | state | Owner in-flight guard and current render identity are scoped to their respective threads. |
+| `src/character/skinning/identity.rs:62` | `thread_local!` | state | Console release builds allocate art instances from an owner-thread cell; the sim worker never allocates. |
+| `src/character/skinning/identity.rs:63` | `NEXT` | counter | Owner-thread art-instance counter for console release builds, with the same id sequence as the process-wide atomic it replaces. |
 | `src/character/skinning/identity.rs:14` | `SIM_WORKER` | state | Worker-local marker set at thread startup. Rejects skin instance and NPC publication ID allocation on the simulation lane. |
 | `src/character/skinning/identity.rs:15` | `CURRENT` | state | Draw installs ActorId scope on its thread. |
 | `src/character/skinning/identity.rs:13` | `OWNER_STEP_IN_FLIGHT` | state | Host owner guard. Held over dispatch and receive. |
