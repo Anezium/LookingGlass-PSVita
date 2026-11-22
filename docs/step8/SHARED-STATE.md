@@ -59,8 +59,11 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/character/skinning/census.rs:16` | `CURRENT` | cache | Actor draw enters skin gather, prepare and collect. Keep scratch, workers and draw scopes with the gather owner. See line 20. |
 | `src/character/skinning/census.rs:17` | `NEXT` | cache | Actor draw enters skin gather, prepare and collect. Keep scratch, workers and draw scopes with the gather owner. See line 30. |
 | `src/character/skinning/census.rs:18` | `GROUPS` | cache | Actor draw enters skin gather, prepare and collect. Keep scratch, workers and draw scopes with the gather owner. See line 21. |
+| `src/character/skinning/census.rs:15` | `WINDOW` | diagnostic | Immutable actor-census frame window, initialized once before use. |
 | `src/character/skinning/cull_tests.rs:26` | `KEEP` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 58. |
 | `src/character/skinning/cull_tests.rs:26` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
+| `src/character/skinning/experiment.rs:4` | `FRAME` | cache | Opt-in numeric skin cache. The frame stamp is atomic and the cache is mutex-protected, with keys owning the source surface. |
+| `src/character/skinning/experiment.rs:21` | `CACHE` | cache | Opt-in numeric skin cache. The frame stamp is atomic and the cache is mutex-protected, with keys owning the source surface. |
 | `src/character/skinning/identity.rs:7` | `NEXT` | counter | Process-wide atomic actor counter. A host owner allocation during a step panics. |
 | `src/character/skinning/identity.rs:8` | `NEXT_INSTANCE` | counter | Process-wide atomic owner-only counter for skin instances and NPC snapshot generations. |
 | `src/character/skinning/identity.rs:11` | `thread_local!` | state | Owner in-flight guard and current render identity are scoped to their respective threads. |
@@ -94,6 +97,11 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/character/skinning.rs:458` | `thread_local!` | cache | TLS block. Actor draw enters skin gather, prepare and collect. Keep scratch, workers and draw scopes with the gather owner. |
 | `src/character.rs:2100` | `thread_local!` | cache | TLS block. Level art load, draw or HUD lookup uses graphics resources. Keep creation, upload and release on the owner. |
 | `src/character.rs:2104` | `SKIN_MATERIAL` | cache | Level art load, draw or HUD lookup uses graphics resources. Keep creation, upload and release on the owner. See line 2107. |
+| `src/character/skinning/timing.rs:5` | `ROWS` | diagnostic | Skin timing rows and family registry use mutexes. The active kind is scoped to the calling thread. |
+| `src/character/skinning/timing.rs:6` | `KINDS` | diagnostic | Skin timing rows and family registry use mutexes. The active kind is scoped to the calling thread. |
+| `src/character/skinning/timing.rs:7` | `LEAVES` | diagnostic | Skin timing rows and family registry use mutexes. The active kind is scoped to the calling thread. |
+| `src/character/skinning/timing.rs:8` | `thread_local!` | diagnostic | Skin timing rows and family registry use mutexes. The active kind is scoped to the calling thread. |
+| `src/character/skinning/timing.rs:8` | `KIND` | diagnostic | Skin timing rows and family registry use mutexes. The active kind is scoped to the calling thread. |
 | `src/cinematic.rs:179` | `NEXT` | counter | Film entry constructs FilmTransaction. Serialize transaction IDs in the fenced cinematic path. See line 180. |
 | `src/collision/model_shape.rs:288` | `thread_local!` | diagnostic | Host lazy shape profiling scopes stay local to the thread executing the audio or simulation cut. |
 | `src/collision/model_shape.rs:289` | `LANE` | diagnostic | Tags per-frame cold build time as audio, sim worker or other owner work. W0 returns worker times in its existing probe rows. |
@@ -290,7 +298,7 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/phase_census.rs:183` | `thread_local!` | diagnostic | TLS block. Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. |
 | `src/phase_census.rs:184` | `ACTIVE` | diagnostic | Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. See line 194. |
 | `src/phase_census.rs:185` | `STATE` | diagnostic | Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. See line 203. |
-| `src/phase_census.rs:191` | `EVER_ARMED` | diagnostic | Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. See line 194. |
+| `src/phase_census.rs:201` | `ARMED` | diagnostic | Atomic arming uses one legacy bit and counts active replay-frame guards. Samples remain thread-local. |
 | `src/r13_survey.rs:3` | `CENSUS` | diagnostic | Survey census reads the armed switch. Force the survey path serial. See line 4. |
 | `src/registry_check.rs:211` | `SKIPS` | diagnostic | No. Offline registry-check probe is absent from runtime registrations. Keep in checker. See line 224. |
 | `src/registry_check.rs:238` | `PROBE` | diagnostic | No. Offline registry-check probe is absent from runtime registrations. Keep in checker. See line 253. |
@@ -410,6 +418,22 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/render_fx.rs:1191` | `thread_local!` | cache | TLS block. Actor gather, publish or submit enters render-fx storage. Keep graphics cache lifetimes and publication on owner. |
 | `src/render_fx.rs:1192` | `ACTOR_MAX_LAYERS` | cache | Actor gather, publish or submit enters render-fx storage. Keep graphics cache lifetimes and publication on owner. See line 1197. |
 | `src/render_fx.rs:1193` | `SURFACES` | cache | Actor gather, publish or submit enters render-fx storage. Keep graphics cache lifetimes and publication on owner. See line 1202. |
+| `src/render_fx/retained/gpu_skin.rs:19` | `thread_local!` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:20` | `AVAILABLE` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:21` | `INPUTS` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:23` | `REFUSED` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:346` | `thread_local!` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:346` | `CENSUS` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:362` | `thread_local!` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:363` | `FAMILY` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:364` | `ROWS` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:367` | `ON` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:381` | `thread_local!` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/gpu_skin.rs:381` | `REFUSED` | cache | Retained GPU skin input, refusal and census buffers stay on the graphics owner in TLS. The diagnostic configuration is cached once. |
+| `src/render_fx/retained/zero_glow.rs:16` | `thread_local!` | cache | Texture proofs and the CPU-bounded scope are owner-thread local, scoped around retained actor draws. |
+| `src/render_fx/retained/zero_glow.rs:17` | `TEXTURES` | cache | Texture proofs and the CPU-bounded scope are owner-thread local, scoped around retained actor draws. |
+| `src/render_fx/retained/zero_glow.rs:89` | `thread_local!` | cache | Texture proofs and the CPU-bounded scope are owner-thread local, scoped around retained actor draws. |
+| `src/render_fx/retained/zero_glow.rs:90` | `CPU_BOUNDED` | cache | Texture proofs and the CPU-bounded scope are owner-thread local, scoped around retained actor draws. |
 | `src/render_fx_routing_controls.rs:6` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/render_fx_routing_controls.rs:7` | `ENABLED` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 17. |
 | `src/render_fx_routing_controls.rs:8` | `IMMEDIATE` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 19. |
@@ -501,6 +525,8 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/replay/input.rs:375` | `CROSS` | cache | Owner begins the tape pulse and captures input. Pass latched data to worker, enter the frame clock on each consuming thread. See line 376. |
 | `src/replay_capture.rs:19` | `PLAN` | cache | Owner replay capture reads the shot plan. Keep frame selection and screenshots with presentation. See line 20. |
 | `src/route.rs:30` | `ON` | cache | Route/combat tracing reads its enable switch. Route mode stays serial. See line 31. |
+| `src/save.rs:600` | `thread_local!` | state | Test-only saved-at override is scoped to the test thread. |
+| `src/save.rs:601` | `TEST_SAVED_AT` | state | Test-only saved-at override is scoped to the test thread. |
 | `src/shader_cache/mock.rs:9` | `MOCK` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 12. |
 | `src/shader_cache/mock.rs:9` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/shader_cache/mock.rs:11` | `glsl_sema_mode` | state | No. Test fixture or override. Keep scoped to its test thread or harness. |
@@ -571,6 +597,14 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/sim_maps/probe.rs:589` | `thread_local!` | cache | TLS block. GPU resource and program labels attach to submissions. Keep lookup with graphics owner. |
 | `src/sim_maps/probe.rs:590` | `LABELS` | cache | GPU resource and program labels attach to submissions. Keep lookup with graphics owner. See line 598. |
 | `src/sim_maps/probe.rs:591` | `PROP_SCOPE` | diagnostic | Host probe tracks sim and render per frame. Return stamped worker rows/deltas and keep GL labels and packet order with owner. See line 597. |
+| `src/sim_maps/probe.rs:326` | `MOVER_INPUTS` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:522` | `RGBA` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:524` | `RGBA_PATH` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:629` | `thread_local!` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:690` | `thread_local!` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:927` | `thread_local!` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:927` | `BEST` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:928` | `KEEP` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
 | `src/sim_maps.rs:63` | `TEST_SWITCHES` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 68. |
 | `src/sim_maps.rs:63` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/sim_maps.rs:69` | `DEFAULTS` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 70. |
@@ -599,6 +633,8 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/sim_maps.rs:405` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/sim_maps.rs:434` | `THINK_TEST` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 437. |
 | `src/sim_maps.rs:434` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
+| `src/sim_maps.rs:217` | `MOVER_SHAPE_REUSE_TEST` | state | Test-only simulation switches are scoped to the test thread. |
+| `src/sim_maps.rs:475` | `thread_local!` | state | Test-only simulation switches are scoped to the test thread. |
 | `src/skin_worker.rs:145` | `SPIN_US` | state | Existing skin worker reads its spin policy. Keep with skin dispatch and worker configuration. See line 146. |
 | `src/skin_worker.rs:501` | `REPORTED` | diagnostic | No. Audio callback startup reports the CPU1 layout once (N1, Vita only). Audio callback thread; never reached from the step. |
 | `src/skin_worker.rs:477` | `APPLIED` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 478. |
