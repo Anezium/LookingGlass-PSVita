@@ -1804,14 +1804,21 @@ pub(crate) fn finish_world(
                         let skin_clock = (!p.effect).then(|| crate::character::skinning::timing::leaf("uniform_build"));
                         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
                         let actor_leaf = (!p.effect).then(|| crate::character::skinning::census::leaf("uniform_build",p.mesh.texture.as_ref().map(Texture2D::raw_miniquad_id)));
-                        let mut u = if c.fx_prepare_cache { prepared_uniforms(p, &mut uniform_templates) }
+                        let u = if c.fx_prepare_cache { prepared_uniforms(p, &mut uniform_templates) }
                             else { FRAME.with(|f| uniforms(p, &f.borrow())) };
                         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
                         drop(actor_leaf);
         drop(skin_clock);
                         leaves.add(1,uniform_leaf);
-                        let culled_to_zero = c.actor_light_cull && actor_lean::cull_lights(p, &mut u);
-                        packets.push((group_id, pass_id, b, u, culled_to_zero));
+                        // Store the packet before culling: culling the stored
+                        // uniform slot keeps the fresh block out of the spill
+                        // a non-inlined cull otherwise forces around it, and the
+                        // cull still runs exactly when its key is on.
+                        packets.push((group_id, pass_id, b, u, false));
+                        if c.actor_light_cull {
+                            let (_, _, _, u, culled) = packets.last_mut().unwrap();
+                            *culled = actor_lean::cull_lights(p, u);
+                        }
                     }
                     Err(e) => {
                         eprintln!("[lg/vita-renderer] rejected actor packet: {e:#}");
