@@ -526,6 +526,10 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/replay/input.rs:120` | `CLOCK_VIEW` | state | StepGuard/ClockView guard in-step replay reads. Enter and suspend per consuming thread. See line 162. |
 | `src/replay/input.rs:121` | `IN_STEP` | state | StepGuard/ClockView guard in-step replay reads. Enter and suspend per consuming thread. See line 132. |
 | `src/replay/input.rs:375` | `CROSS` | cache | Owner begins the tape pulse and captures input. Pass latched data to worker, enter the frame clock on each consuming thread. See line 376. |
+| `src/replay/input.rs:304` | `SCRIPT` | cache | Host-only live key script (`LOOKING_GLASS_LIVE_KEYS`) parsed once by the owner's live capture; absent from Vita builds. |
+| `src/replay/input.rs:326` | `STATE` | diagnostic | Host-only live key script state. Only the owner's live capture locks it, once per framework frame; absent from Vita builds. |
+| `src/replay/input.rs:358` | `EPOCH` | diagnostic | Host-only live epoch taps. The owner advances it after each gameplay present and reads it at capture; absent from Vita builds. |
+| `src/replay/input.rs:361` | `ENABLED` | cache | Host-only live epoch taps read their enable switch once; absent from Vita builds. |
 | `src/replay_capture.rs:19` | `PLAN` | cache | Owner replay capture reads the shot plan. Keep frame selection and screenshots with presentation. See line 20. |
 | `src/route.rs:30` | `ON` | cache | Route/combat tracing reads its enable switch. Route mode stays serial. See line 31. |
 | `src/save.rs:600` | `thread_local!` | state | Test-only saved-at override is scoped to the test thread. |

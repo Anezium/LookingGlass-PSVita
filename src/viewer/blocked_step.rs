@@ -98,6 +98,29 @@ impl Drop for StackReport {
 }
 
 impl Worker {
+    #[cfg(feature = "vita_renderer")]
+    pub(super) fn idle(&self) -> bool {
+        self.flight.is_none()
+    }
+
+    #[cfg(all(test, feature = "vita_renderer"))]
+    pub(super) fn set_test_flight(&mut self, busy: bool) {
+        self.flight = busy.then(|| Flight {
+            stamp: Stamp {
+                frame: crate::sim_pipeline::Frame {
+                    frame: 0,
+                    tape_step: 0,
+                    visit_id: 0,
+                },
+                slot_generation: 1,
+            },
+            cut: Cut::Lag,
+            timing: None,
+            #[cfg(not(target_os = "vita"))]
+            _owner: crate::character::skinning::identity::OwnerStep::begin(),
+        });
+    }
+
     pub(super) fn new(audit: &Audit) -> Result<Self> {
         // The V2 24 MiB budget covers both slots' retained bytes, skin-held
         // backing and this sim stack. The other thread stacks are separate.

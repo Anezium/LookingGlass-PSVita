@@ -8,10 +8,8 @@ pub(crate) mod step;
 mod queue;
 pub mod sink;
 mod output;
-/// The producer pattern's Vita thread policy (priority, then affinity), shared with the
-/// save writer (`save.rs`), which applies it the same way at its worker's entry.
 #[cfg(target_os = "vita")]
-pub(crate) use output::thread_policy;
+pub(crate) use output::background_service_policy;
 mod block;
 mod music;
 pub mod events;

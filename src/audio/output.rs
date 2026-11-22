@@ -483,6 +483,15 @@ impl ThreadPolicy {
         }
     }
 }
+/// Background services stay on CPU2 throughout a per-map overlap session.
+pub(crate) fn background_service_policy() -> ThreadPolicy {
+    #[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+    let affinity = if crate::render::vita_renderer::config().sim_overlap_normal { 0x40000 } else { 0 };
+    #[cfg(not(all(target_os = "vita", feature = "vita_renderer")))]
+    let affinity = 0;
+    thread_policy(191, affinity)
+}
+
 /// Applies priority and, when given, CPU affinity to the calling thread.
 pub fn thread_policy(priority: i32, affinity: i32) -> ThreadPolicy {
     #[cfg(all(target_os="vita",feature="vita_renderer"))]
@@ -665,8 +674,12 @@ fn buffered_body_jobs<S: PcmSource, #[cfg(feature = "native_timing")] C: crate::
             let mut exit=diagnostic::ReporterExit{bootstrap:reporter_bootstrap,normal:false};
             #[cfg(test)]
             if hooks.reporter_panic {panic!("injected reporter panic");}
-            // Lowest application priority on any core: it may run late, never early.
-            let _ = thread_policy(191, 0);
+            let policy = background_service_policy();
+            #[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+            if crate::render::vita_renderer::config().sim_overlap_normal {
+                eprintln!("[lg/worker-probe] role=audio-report {}", policy.describe());
+            }
+            let _ = policy;
             #[cfg(test)]
             if let Some(gate)=reporter_gate { let _=gate.recv_timeout(Duration::from_secs(5)); }
             #[cfg(test)]

@@ -126,3 +126,133 @@ impl Peer {
         }
     }
 }
+
+/// Whether mute keeps a step from retaining its frame. Mute only scales the owner's sink
+/// volumes. The owner applies a step's audio requests before it decides to retain that step's
+/// frame, a retained presentation touches no audio, and both mute writes (M and the Start menu's
+/// Audio page) flush the retained frame first, so a muted lag step hears and shows exactly what the
+/// serial step would. With `sim_overlap_normal` mute therefore fences nothing; without the key it
+/// fences as before, so the key-off build and the legacy diagnostics are unchanged.
+pub(super) fn mute_fences_lag(sim_overlap_normal: bool, muted: bool) -> bool {
+    muted && !sim_overlap_normal
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SaveAction {
+    MenuSave,
+    Resume,
+    NewGame,
+    NaturalExit,
+    Retry,
+    /// Kill the player and leave the death screen to the live Retry press.
+    Die,
+    /// `scene=<thread>`: offer a level script thread to the level controllers, as its trigger
+    /// would, to start a scripted scene in a live arm.
+    Scene,
+}
+
+/// Host proof schedule of owner actions by frame (`LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS`).
+/// Only probe builds read it; release and Vita builds schedule nothing.
+#[derive(Default)]
+pub(super) struct SaveActions {
+    #[cfg(any(test, all(feature = "sim_maps_probe", not(target_os = "vita"))))]
+    entries: Vec<(u64, SaveAction, Option<String>)>,
+}
+
+impl SaveActions {
+    pub(super) fn read() -> anyhow::Result<Self> {
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        {
+            let Ok(raw) = std::env::var("LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS") else {
+                return Ok(Self::default());
+            };
+            Self::parse(&raw)
+        }
+        #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
+        Ok(Self::default())
+    }
+
+    #[cfg(any(test, all(feature = "sim_maps_probe", not(target_os = "vita"))))]
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        let mut entries = Vec::new();
+        for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some((frame, kind)) = item.split_once(':') else {
+                anyhow::bail!("invalid lag save action {item:?}");
+            };
+            let frame: u64 = frame.parse()?;
+            // `natural-exit=<map>` names the exit's destination; plain `natural-exit` keeps
+            // LOOKING_GLASS_TRANSITION_DESTINATION. `scene=<thread>` names its script thread.
+            let (kind, destination) = match kind.split_once('=') {
+                Some(("natural-exit", map)) if !map.is_empty() => ("natural-exit", Some(map.to_owned())),
+                Some(("scene", thread)) if !thread.is_empty() => ("scene", Some(thread.to_owned())),
+                Some(_) => anyhow::bail!("invalid lag save action {item:?}"),
+                None => (kind, None),
+            };
+            let action = match kind {
+                "menu-save" => SaveAction::MenuSave,
+                "resume" => SaveAction::Resume,
+                "new-game" => SaveAction::NewGame,
+                "natural-exit" => SaveAction::NaturalExit,
+                "retry" => SaveAction::Retry,
+                "die" => SaveAction::Die,
+                "scene" if destination.is_some() => SaveAction::Scene,
+                _ => anyhow::bail!("unknown lag save action {kind:?}"),
+            };
+            entries.push((frame, action, destination));
+        }
+        Ok(Self { entries })
+    }
+
+    /// The action scheduled for this frame and, for `natural-exit=<map>`, its destination.
+    /// The destination travels with the action; nothing writes the process environment.
+    pub(super) fn take(&mut self, frame: u64) -> Option<(SaveAction, Option<String>)> {
+        #[cfg(any(test, all(feature = "sim_maps_probe", not(target_os = "vita"))))]
+        {
+            let index = self.entries.iter().position(|(scheduled, _, _)| *scheduled == frame)?;
+            let (_, action, destination) = self.entries.remove(index);
+            Some((action, destination))
+        }
+        #[cfg(not(any(test, all(feature = "sim_maps_probe", not(target_os = "vita")))))]
+        {
+            let _ = frame;
+            None
+        }
+    }
+}
+
+#[cfg(all(test, not(target_os = "vita")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mute_fences_lag_only_without_the_normal_key() {
+        assert!(!mute_fences_lag(false, false));
+        assert!(mute_fences_lag(false, true), "key off: mute keeps fencing lag, as before");
+        assert!(!mute_fences_lag(true, false));
+        assert!(!mute_fences_lag(true, true), "sim_overlap_normal: a muted player keeps lag one");
+    }
+
+    #[test]
+    fn parse_save_actions_schedule() {
+        let mut actions = SaveActions::parse("30:menu-save, 31:resume, 45:retry, 50:natural-exit").unwrap();
+        assert_eq!(actions.take(29), None);
+        assert_eq!(actions.take(30), Some((SaveAction::MenuSave, None)));
+        assert_eq!(actions.take(30), None);
+        assert_eq!(actions.take(31), Some((SaveAction::Resume, None)));
+        assert_eq!(actions.take(45), Some((SaveAction::Retry, None)));
+        assert_eq!(actions.take(50), Some((SaveAction::NaturalExit, None)));
+        assert!(SaveActions::parse("bad").is_err());
+        let mut exits = SaveActions::parse("5:natural-exit=potears3").unwrap();
+        assert_eq!(exits.take(5), Some((SaveAction::NaturalExit, Some("potears3".to_owned()))));
+        assert!(std::env::var_os("LOOKING_GLASS_TRANSITION_DESTINATION").is_none(),
+            "the destination must not reach the process environment");
+        assert_eq!(SaveActions::parse("7:die").unwrap().take(7), Some((SaveAction::Die, None)));
+        assert_eq!(SaveActions::parse("9:scene=Centipede1_Ambush_Cinema1").unwrap().take(9),
+            Some((SaveAction::Scene, Some("Centipede1_Ambush_Cinema1".to_owned()))));
+        assert!(SaveActions::parse("9:scene").is_err());
+        assert!(SaveActions::parse("9:scene=").is_err());
+        assert!(SaveActions::parse("5:natural-exit=").is_err());
+        assert!(SaveActions::parse("5:retry=potears3").is_err());
+        assert!(SaveActions::parse("30:unknown").is_err());
+    }
+}

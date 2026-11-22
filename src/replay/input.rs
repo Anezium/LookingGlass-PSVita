@@ -275,7 +275,135 @@ fn capture_live_controls() -> Frame {
     f.mouse = mq::mouse_position();
     f.wheel = mq::mouse_wheel();
     f.quit = mq::is_quit_requested();
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    epoch_taps::inject(&mut f);
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    live_keys::inject(&mut f);
     f
+}
+
+/// Host only, for the live UI-state proof: `LOOKING_GLASS_LIVE_KEYS="seconds:Key:hold,..."`
+/// holds a key (an `input::key_code` name such as `Escape`, `Tab`, `I`, `P` or `Enter`) from
+/// `seconds` after the first live capture for `hold` seconds, at the framework capture, as a
+/// physical key would arrive. Every read sees it, including the Start/Escape path and modal menus,
+/// unlike `LOOKING_GLASS_SCRIPT_KEYS`, which stands in for gameplay bindings only. A framework frame
+/// is recognised by its frame time, so the press and release edges belong to one frame each.
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+pub(crate) mod live_keys {
+    use super::{key_bit, Frame, KeyCode};
+    use std::sync::{Mutex, OnceLock};
+
+    struct State {
+        origin: f64,
+        frame: Option<u32>,
+        down: u128,
+        previous: u128,
+    }
+
+    fn script() -> &'static [(f64, u32, f64)] {
+        static SCRIPT: OnceLock<Vec<(f64, u32, f64)>> = OnceLock::new();
+        SCRIPT.get_or_init(|| std::env::var("LOOKING_GLASS_LIVE_KEYS").map_or_else(|_| Vec::new(), |text| {
+            text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|entry| {
+                let parts: Vec<&str> = entry.split(':').collect();
+                assert!(parts.len() == 3, "LOOKING_GLASS_LIVE_KEYS entry {entry:?}");
+                // Binding names, plus Escape, the fixed menu key (Start on the Vita).
+                let key = match parts[1].trim() {
+                    "Escape" => Some(KeyCode::Escape),
+                    name => crate::input::key_code(name),
+                }.expect("LOOKING_GLASS_LIVE_KEYS key");
+                (parts[0].trim().parse().expect("LOOKING_GLASS_LIVE_KEYS seconds"),
+                 key_bit(key).expect("LOOKING_GLASS_LIVE_KEYS key bit"),
+                 parts[2].trim().parse().expect("LOOKING_GLASS_LIVE_KEYS hold"))
+            }).collect()
+        }))
+    }
+
+    pub(crate) fn enabled() -> bool {
+        !script().is_empty()
+    }
+
+    pub(super) fn inject(frame: &mut Frame) {
+        let script = script();
+        if script.is_empty() {
+            return;
+        }
+        static STATE: Mutex<Option<State>> = Mutex::new(None);
+        let mut guard = STATE.lock().unwrap_or_else(|p| p.into_inner());
+        let now = macroquad::time::get_time();
+        let state = guard.get_or_insert(State { origin: now, frame: None, down: 0, previous: 0 });
+        let id = macroquad::time::get_frame_time().to_bits();
+        if state.frame != Some(id) {
+            // A new framework frame: the held set moves on once per frame.
+            state.frame = Some(id);
+            state.previous = state.down;
+            let t = now - state.origin;
+            state.down = script.iter().filter(|(start, _, hold)| (*start..start + hold).contains(&t))
+                .fold(0u128, |mask, (_, bit, _)| mask | 1u128 << bit);
+        }
+        frame.keys_down |= state.down;
+        frame.keys_pressed |= state.down & !state.previous;
+        frame.keys_released |= state.previous & !state.down;
+    }
+}
+
+/// Host only, for the live lag-one input proof: `LOOKING_GLASS_LIVE_EPOCH_TAPS` presses one key
+/// of F13..F24 in every framework epoch of the gameplay loop, as a real tap would arrive, and
+/// logs what each head sample received. The viewer advances the epoch after each gameplay
+/// `next_frame` (a retained present or the serial tail).
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+pub(crate) mod epoch_taps {
+    use super::{key_bit, Frame, KeyCode};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    const POOL: [KeyCode; 12] = {
+        use KeyCode::*;
+        [F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24]
+    };
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("LOOKING_GLASS_LIVE_EPOCH_TAPS").is_some())
+    }
+
+    pub(crate) fn advance() {
+        if enabled() {
+            EPOCH.fetch_add(1, Relaxed);
+        }
+    }
+
+    pub(super) fn inject(frame: &mut Frame) {
+        if enabled() {
+            let key = POOL[(EPOCH.load(Relaxed) % POOL.len() as u64) as usize];
+            frame.keys_pressed |= 1u128 << key_bit(key).unwrap();
+        }
+    }
+
+    pub(crate) fn log_head(frame_index: u64, frame: &Frame, clock_bits: u64, latched: bool) {
+        if !enabled() {
+            return;
+        }
+        let taps = POOL.iter().enumerate()
+            .filter(|(_, key)| frame.keys_pressed >> key_bit(**key).unwrap() & 1 != 0)
+            .fold(0u32, |mask, (i, _)| mask | 1 << i);
+        println!("LIVE_EPOCH_HEAD frame={frame_index} epoch={} taps={taps:x} clock={clock_bits} latched={latched}",
+                 EPOCH.load(Relaxed));
+    }
+
+    /// The head yielded to owner work (loading, a menu, a movie): its presented epoch, if any,
+    /// belongs to the owner. Printed between this head's line and the next head's.
+    pub(crate) fn log_yield() {
+        if enabled() {
+            println!("LIVE_EPOCH_YIELD");
+        }
+    }
+
+    /// The clock the step runs with, after the head's refresh or latch.
+    pub(crate) fn log_clock(frame_index: u64, clock_bits: u64, latched: bool) {
+        if enabled() {
+            println!("LIVE_EPOCH_CLOCK frame={frame_index} clock={clock_bits} latched={latched}");
+        }
+    }
 }
 
 /// Owner-side gameplay sample. Character input remains queued for the modal UI or console.

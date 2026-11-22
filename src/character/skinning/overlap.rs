@@ -427,6 +427,9 @@ unsafe fn skin_draw(draw: &Draw, pose: &[Transform], scales: &[f32], palette: &[
 struct Store {
     // Workers drain before storage is released, also on TLS shutdown.
     workers: Vec<crate::skin_worker::Worker>,
+    // The CPU2 worker is first in the per-map layout. Collection uses pending
+    // so it always joins the prefix dispatched for that frame.
+    active_workers: usize,
     tasks: [UnsafeCell<Task>; 2],
     input: Box<UnsafeCell<Inputs>>,
     stream: Box<Stream>,
@@ -467,6 +470,7 @@ impl Store {
             workers: (0..workers)
                 .map(|i| crate::skin_worker::Worker::new(i, probe))
                 .collect(),
+            active_workers: workers,
             tasks: std::array::from_fn(|_| {
                 UnsafeCell::new(Task {
                     input: 0,
@@ -719,12 +723,12 @@ impl Store {
     /// happens before the store, and a worker's load of it acquires them.
     fn publish(&mut self) {
         let i = unsafe { &*self.input.get() };
-        // Before any start: whatever happens next, drain waits for every worker.
-        self.pending = self.workers.len();
+        // Before any start: drain waits for each worker allowed to claim a draw.
+        self.pending = self.active_workers;
         self.stream.published.store(i.draws.len(), Ordering::Release);
         let want = if self.stream.unclaimed() >= STREAM_SECOND_WORKER { 2 } else { 1 };
         let mut started = 0;
-        for index in 0..self.workers.len() {
+        for index in 0..self.active_workers {
             if started == want { break; }
             if !self.workers[index].idle() { started += 1; continue; }
             // An idle worker's last job may have panicked. Its next result would lose that.
@@ -760,7 +764,7 @@ impl Store {
         assert_eq!(self.pending, 0);
         let i = unsafe { &*self.input.get() };
         let draws = i.draws.len();
-        let mid = if self.workers.len() == 1 {
+        let mid = if self.active_workers == 1 {
             draws
         } else {
             let half = self.output_len.div_ceil(2);
@@ -777,7 +781,7 @@ impl Store {
         let input = self.input.get() as usize;
         for (index, range) in [0..mid, mid..draws]
             .into_iter()
-            .take(self.workers.len())
+            .take(self.active_workers)
             .enumerate()
         {
             unsafe {
@@ -952,6 +956,20 @@ pub(crate) fn reset_publications() {
     }});
     crate::render_fx::actor_publication::reset();
 }
+/// Commit an installed map's eligible worker prefix while every skin arena is idle.
+#[cfg(feature = "vita_renderer")]
+pub(crate) fn park_cpu1(park: bool) {
+    assert!(PHASE.with(|phase| phase.get() == Phase::Idle));
+    STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let store = store.as_mut().expect("overlap startup");
+        assert_eq!(store.pending, 0);
+        assert_eq!(store.workers.len(), 2);
+        assert!(store.workers.iter().all(crate::skin_worker::Worker::idle));
+        store.active_workers = if park { 1 } else { 2 };
+    });
+}
+
 pub(crate) fn startup(workers: usize, probe: bool) {
     // J13's game thread was sampled on CPU2: reserve CPU0, never contend with worker2.
     crate::skin_worker::pin_game(probe);
@@ -965,7 +983,7 @@ pub(crate) fn cpu_pair(first: impl FnOnce() + Send, second: impl FnOnce() + Send
     let service = STORE.with(|store| {
         let mut store = store.borrow_mut();
         if let Some(store) = store.as_mut().filter(|s| s.pending == 0) {
-            if store.workers.len() == 2 {
+            if store.active_workers == 2 {
                 let (a, b) = store.workers.split_at_mut(1);
                 let times = crate::skin_worker::Worker::pair(&mut a[0], &mut b[0], first, second);
                 return Some(times.iter().map(|m| m.ns / 1000).max().unwrap_or(0));
@@ -1488,6 +1506,53 @@ mod tests {
         let (s, _, pose) = fixture();
         assert_eq!(check_skeleton(&s, &[pose]).unwrap(), 32);
     }
+    #[test]
+    #[cfg(feature = "vita_renderer")]
+    fn changing_the_active_overlap_workers_preserves_serial_vertices() {
+        let (skeleton, mut meshes, pose) = fixture();
+        let input = params(&pose);
+        let mut reference = meshes[0].as_ref().unwrap().vertices.clone();
+        super::super::kernel(&mut super::super::Job {
+            input: &skeleton.surfaces[0].vertices,
+            vertices: &mut reference,
+            indices: &skeleton.surfaces[0].indices,
+        }, input);
+        startup(2, false);
+        for (park, streaming) in [
+            (false, false), (true, false), (true, true), (false, true), (false, false),
+        ] {
+            park_cpu1(park);
+            let mut first_on_worker_zero = false;
+            let mut second_on_worker_one = false;
+            cpu_pair(
+                || first_on_worker_zero = std::thread::current().name() == Some("skin-persistent-0"),
+                || second_on_worker_one = std::thread::current().name() == Some("skin-persistent-1"),
+            );
+            assert!(first_on_worker_zero);
+            assert_eq!(second_on_worker_one, !park);
+            STORE.with(|pool| {
+                let mut pool = pool.borrow_mut();
+                let store = pool.as_mut().unwrap();
+                assert_eq!(store.workers.len(), 2);
+                store.reset();
+                if streaming { store.begin_stream(); }
+                store.capture(&skeleton, &meshes, input, true);
+                store.capture(&skeleton, &meshes, input, true);
+                store.dispatch();
+                assert_eq!(store.pending, if park { 1 } else { 2 });
+                if park {
+                    assert!(store.workers[1].idle());
+                    assert!(!store.stream_ran[1]);
+                }
+                assert!(store.drain().is_none());
+                for _ in 0..2 {
+                    assert_eq!(store.consume(&skeleton, &mut meshes, input), Some(true));
+                    assert!(same_vertices(&reference, &meshes[0].as_ref().unwrap().vertices));
+                }
+            });
+        }
+    }
+
     #[test]
     fn load_handles_outlive_skeleton_and_live_mesh_while_workers_run() {
         let (s, meshes, pose) = fixture();

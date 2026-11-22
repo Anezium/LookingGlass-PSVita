@@ -51,6 +51,12 @@ pub(super) fn event(levels: &mut [Slot], thread: &str) -> Option<Events> {
 }
 
 impl Interactions {
+    /// Host proof only (`scene=<thread>` in `LOOKING_GLASS_SIM_LAG_SAVE_ACTIONS`): offer a level
+    /// script thread as if its trigger had fired, so a live arm can start a registered scene.
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    pub fn host_level_event(&mut self, thread: &str) -> bool {
+        event(&mut self.levels, thread).is_some()
+    }
     pub fn companions_for_movers(&mut self, actors: &[crate::level::CompanionContact]) {
         for slot in &mut self.levels { slot.ctl.companion_contacts(actors); }
     }

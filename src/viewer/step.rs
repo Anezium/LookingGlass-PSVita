@@ -231,7 +231,8 @@ pub(super) struct StepAInput<Map = Arc<crate::bsp::Bsp>, Prefs = Arc<crate::pref
     pub(super) map: Map,
     pub(super) preferences: Prefs,
     pub(super) saves_writable: bool,
-    pub(super) host_natural_exit: bool,
+    /// A host-scheduled natural exit and its destination map (never set on the Vita).
+    pub(super) host_natural_exit: Option<String>,
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     pub(super) force_checkpoint: bool,
 }
@@ -287,7 +288,7 @@ pub(super) fn step_due(
     interactions: &mut Interactions,
     story: &mut crate::story::Story,
     pending_transition: &mut Option<LevelExit>,
-    host_natural_exit: bool,
+    host_natural_exit: Option<String>,
 ) -> Due {
     if checkpoint_allowed
         && story_active
@@ -307,8 +308,8 @@ pub(super) fn step_due(
     if story_active {
         *pending_transition = interactions.take_story_exit(story);
     }
-    if host_natural_exit {
-        *pending_transition = Some((crate::transition_memory::host_destination(), None));
+    if let Some(destination) = host_natural_exit {
+        *pending_transition = Some((destination, None));
     }
     match pending_transition.take() {
         Some(exit) => Due::Exit(exit),
@@ -2014,7 +2015,7 @@ mod tests {
                 &mut interactions,
                 &mut story,
                 &mut pending,
-                false
+                None
             ),
             Due::Checkpoint
         ));
@@ -2028,13 +2029,13 @@ mod tests {
                 &mut interactions,
                 &mut story,
                 &mut pending,
-                false
+                None
             ),
             Due::Ending
         ));
         assert_eq!(story.pending_exit_map(), Some("song"));
         assert!(
-            matches!(step_due(false, true, true, &mut interactions, &mut story, &mut pending, false), Due::Exit(out) if out == exit)
+            matches!(step_due(false, true, true, &mut interactions, &mut story, &mut pending, None), Due::Exit(out) if out == exit)
         );
         assert!(story.pending_exit_map().is_none());
     }
@@ -2059,13 +2060,13 @@ mod tests {
                 &mut interactions,
                 &mut story,
                 &mut pending,
-                false
+                None
             ),
             Due::Checkpoint
         ));
         assert!(
-            matches!(step_due(false, true, false, &mut interactions, &mut story, &mut pending, true),
-            Due::Exit((map, None)) if map == crate::transition_memory::host_destination())
+            matches!(step_due(false, true, false, &mut interactions, &mut story, &mut pending,
+                Some("potears3".to_owned())), Due::Exit((map, None)) if map == "potears3")
         );
         assert!(story.pending_exit_map().is_none());
         assert!(interactions.levels[0].ctl.checkpoint_requested());

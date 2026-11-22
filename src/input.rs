@@ -383,7 +383,6 @@ pub(crate) struct StepInput {
 impl StepInput {
     /// Second live pulse of the same physical sample. Repeating the absolute
     /// pointer position yields zero motion in MouseLook.
-    #[allow(dead_code)]
     pub(crate) fn derived_sample(&self, step: u64) -> Self {
         let mut next = self.clone();
         next.step = step;
@@ -402,6 +401,20 @@ impl StepInput {
             }
         }
         next
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sample(step: u64, frame: Frame, clock_bits: u64) -> Self {
+        Self {
+            step, focused: true,
+            clock: Some(ClockView { dt: frame.dt, clock_bits, instant: std::time::Instant::now() }),
+            frame,
+            pointer: PointerFrame::default(),
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            scripted_keys: Vec::new(),
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            recovery_key: None,
+        }
     }
 
     #[cfg(test)]
