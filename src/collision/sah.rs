@@ -5,7 +5,7 @@ static BUILDS: AtomicU64 = AtomicU64::new(0);
 pub(super) fn builds() -> u64 { BUILDS.load(Ordering::Relaxed) }
 const LEAF: u32 = 1 << 31;
 const NONE: u32 = u32::MAX;
-const CANDIDATES: usize = 256;
+pub(super) const CANDIDATES: usize = 256;
 const CERT_CACHE: usize = 128;
 #[derive(Default,Clone,Copy,Debug,serde::Serialize)]
 pub(super) struct Counts {
@@ -147,13 +147,7 @@ impl Hierarchy {
         window: &mut super::nav_sweep::Window, c: &mut Counts,
     ) -> Option<Trace> {
         if !self.supports_trace(a, b, h, q) { return None; }
-        let ranks = window.ranks(q, |region, ranks| {
-            let mut candidates = [0; CANDIDATES];
-            let mut len = 0;
-            if !self.gather(0, g, region, &mut candidates, &mut len, c) { return false; }
-            ranks.extend_from_slice(&candidates[..len]);
-            true
-        })?;
+        let ranks = window.ranks(q, |region, ranks, len| self.gather(0, g, region, ranks, len, c))?;
         // A hit on a hull's bounds implies a hit on each enclosing SAH node.
         // Keep the original slab check, rank order and legacy admission test.
         let candidates = ranks.iter().copied().filter(|&rank| {

@@ -103,6 +103,7 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/character/skinning/timing.rs:8` | `thread_local!` | diagnostic | Skin timing rows and family registry use mutexes. The active kind is scoped to the calling thread. |
 | `src/character/skinning/timing.rs:8` | `KIND` | diagnostic | Skin timing rows and family registry use mutexes. The active kind is scoped to the calling thread. |
 | `src/cinematic.rs:179` | `NEXT` | counter | Film entry constructs FilmTransaction. Serialize transaction IDs in the fenced cinematic path. See line 180. |
+| `src/collision/nav_sweep.rs:59` | `VERIFY` | diagnostic | Host probe only. Shared immutable environment decision, initialized once. Sweep verification keeps all trace state local to the caller. |
 | `src/collision/model_shape.rs:288` | `thread_local!` | diagnostic | Host lazy shape profiling scopes stay local to the thread executing the audio or simulation cut. |
 | `src/collision/model_shape.rs:289` | `LANE` | diagnostic | Tags per-frame cold build time as audio, sim worker or other owner work. W0 returns worker times in its existing probe rows. |
 | `src/collision/model_shape.rs:315` | `SAMPLES` | diagnostic | Host-only atomic totals for cold shape builds and cold callers that reused a published value. Printed at viewer exit. |
