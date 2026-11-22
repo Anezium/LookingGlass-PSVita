@@ -130,6 +130,7 @@ mod tests {
 
     #[test]
     fn randomized_windows_refill_and_fall_back_when_dense() {
+        set_sah_enabled_for_test(Some(true));
         let mut boxes: Vec<_> = (0..320).map(|i| {
             let min = vec3((i % 20) as f32 * 2., (i / 20) as f32 * 2., -2.);
             (min, min + vec3(1., 1., 4.))
@@ -160,11 +161,13 @@ mod tests {
                 assert_eq!(check(g, &mut window, a, b, half), (true, 0));
             }
         }
+        set_sah_enabled_for_test(None);
     }
 
     #[test]
     #[ignore = "requires local licensed map data"]
     fn windows_match_real_map_hulls() {
+        set_sah_enabled_for_test(Some(true));
         let data = std::env::var_os("LOOKING_GLASS_TEST_DATA").expect("local data path");
         let mut assets = crate::assets::Assets::open(std::path::Path::new(&data)).unwrap();
         let mut dense = 0;
@@ -176,6 +179,14 @@ mod tests {
             let world = World::from_bsp(&map).unwrap();
             let g = &world.static_geometry;
             let mut window = Window::default();
+            let bounds = g.hulls.iter().map(|hull| hull.bounds).reduce(Bounds::union).unwrap();
+            let middle = (bounds.min + bounds.max) * 0.5;
+            let half = (bounds.max - bounds.min) * 0.5;
+            assert!(matches!(check(g, &mut window, middle, middle, half),
+                             (false, nodes) if nodes > 1));
+            assert_eq!(check(g, &mut window, middle, middle, half), (false, 0));
+            dense += 1;
+            window = Window::default();
             for hull in g.hulls.iter().step_by(7) {
                 let center = (hull.bounds.min + hull.bounds.max) * 0.5;
                 let half = vec3(8., 8., 12.);
@@ -190,6 +201,7 @@ mod tests {
             }
         }
         println!("real SAH windows sparse={sparse} dense={dense} refill={refilled} reuse={reused}");
-        assert!(sparse > 256 && dense > 0 && refilled > 128 && reused > 128);
+        assert!(sparse > 256 && dense >= 3 && refilled > 128 && reused > 128);
+        set_sah_enabled_for_test(None);
     }
 }
