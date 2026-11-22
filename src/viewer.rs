@@ -1091,6 +1091,213 @@ use step::{
     StepView,
 };
 
+/// The snapshot-only inputs one handoff frame extracts for the renderer. The
+/// direct path (snapshots off) holds the all-absent default.
+#[derive(Default)]
+struct SnapshotInputs {
+    lights: Option<crate::lighting::Selection>,
+    dispatch: Option<LevelDispatch>,
+    aim: Option<crate::targeting::Input>,
+    first_person: Option<bool>,
+    shadow: Option<Option<crate::lighting::ShadowInput>>,
+    empty_level_effects: bool,
+    wave_overflow: bool,
+}
+
+/// Shared transform/view input, resident light selection and every family input
+/// of one handoff frame, out of line so the direct per-frame path keeps its own
+/// instruction stream. Every statement is the one the inline block ran, in the
+/// same order, with the same guards and prints.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn snapshot_inputs(
+    level_art: &mut LevelArt, npcs: &mut crate::npc::Npcs, alice: &mut Character,
+    steam: &mut crate::particles::Steam, power_art: &mut crate::powerups::Art,
+    pickup_input: &mut crate::powerups::PickupInput, aim_pointer: &mut crate::targeting::Pointer,
+    dynamic_input: &mut crate::render_snapshot::DynamicInput,
+    wave_input: &mut Vec<crate::render_snapshot::WaveInput>,
+    handoff_return: &mut crate::render_snapshot::HandoffReturn, handoff_minimum_frame: &mut u64,
+    snapshot_frames: &mut u64, rejected: &mut bool, interactions: &Interactions,
+    story: &crate::story::Story, hints: &crate::cheshire::Hints,
+    atmosphere: &crate::environment::Atmosphere, world_camera: &Camera3D, camera: Vec3,
+    target: Vec3, direction: Vec3, world: &World, targets: &[crate::combat::Target],
+    player: &Player, stats: &Stats, pickups: &[crate::inventory::Pickup], maps: &[String],
+    current: usize, entry_spawn: Option<&str>, frame: u64, snapshot_log: bool, steam_visit: u64,
+    world_only: bool, third_person: bool, flying: bool, pand_cinematic: bool,
+    scripted_camera_none: bool, menu: bool, inventory_menu: bool, console_open: bool,
+    pickup_clock: f32,
+) -> SnapshotInputs {
+    // Shared transform/view input. Particle and pickup consumers now own
+    // their dedicated arenas; do not duplicate their old census payloads.
+    {
+        use macroquad::camera::Camera;
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        dynamic_input.finish_view(world_camera.matrix(), atmosphere);
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-dynamic] frame={} bytes={} capacity_bytes={} extraction_us={:.3} allocations={} transforms={} particles={} pickups={}",
+                frame, dynamic_input.bytes(), dynamic_input.capacity_bytes(), us, allocations,
+                dynamic_input.transforms.len(), 0, 0);
+        }
+    }
+    // Resolve dynamic lights at the simulation boundary. Resident lighting
+    // textures and the selected-light TLS stay owned by the renderer.
+    let lights = {
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        let mut lights = steam.lights();
+        lights.extend(alice.lights());
+        lights.extend(npcs.lights());
+        for slot in &interactions.levels { lights.extend(slot.ctl.lights()); }
+        let selection = crate::lighting::resolve(lights, camera, world);
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-lights] frame={} bytes={} capacity_bytes={} extraction_us={:.3} allocations={}",
+                frame, selection.bytes(), selection.capacity_bytes(), us, allocations);
+        }
+        selection
+    };
+    let dispatch = {
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        let input = level_art.extract_dispatch(interactions, hints, story);
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-dispatch] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",
+                frame, std::mem::size_of::<LevelDispatch>() + input.registered.capacity()
+                    + level_art.levels.iter().flatten().map(|a|a.snapshot_bytes()).sum::<usize>()
+                    + input.cheshire.as_ref().map_or(0, |i| i.bytes())
+                    + level_art.encounters.as_ref().map_or(0,|a| a.snapshot_bytes()),
+                us, allocations, u8::from(input.overflow));
+        }
+        input
+    };
+    {
+        // Script state is resolved before cinematic pose extraction; materials
+        // and lazy mesh/effect publication remain on the renderer thread.
+        if let (Some(art), Some(pool)) = (&mut level_art.pool, &interactions.pool) {
+            art.cinema.story_pose(story);
+            let timing = snapshot_log.then(SnapshotTiming::start);
+            let (bytes, overflow) = art.extract(pool);
+            if let Some(timing) = timing {
+                let (us, allocations) = timing.finish();
+                println!("[lg/snapshot-pool] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",
+                    frame, bytes, us, allocations, u8::from(overflow));
+            }
+            if overflow { *rejected=true; handoff_return.retire(); *handoff_minimum_frame = frame as u64; }
+        }
+    }
+    {
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        let (bytes, ants, overflow) = npcs.extract_ants(camera, (target-camera).normalize_or_zero());
+        let measurement = timing.map(SnapshotTiming::finish);
+        if overflow { *rejected=true; handoff_return.retire(); *handoff_minimum_frame=frame as u64; }
+        *snapshot_frames += 1;
+        if let Some((us, allocations)) = measurement {
+            println!("[lg/snapshot-actors] frame={} bytes={} extraction_us={:.3} allocations={} ants={} overflow={}",
+                frame, bytes, us, allocations, ants, u8::from(overflow));
+        }
+    }
+    {
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        let (bytes,overflow)=alice.extract_body(dynamic_input.alice_feet);
+        if overflow { *rejected=true;handoff_return.retire();*handoff_minimum_frame=frame as u64;}
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-alice] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",frame,bytes,us,allocations,u8::from(overflow));
+        }
+    }
+    {
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        #[cfg(target_os="vita")] let will_draw=!crate::frame_profile::mode().no_world() && !world_only;
+        #[cfg(not(target_os="vita"))] let will_draw=!world_only;
+        let visit = save::visit_key(&maps[current], entry_spawn);
+        power_art.prepare_visit(pickup_input, &visit);
+        let (generation, history) = power_art.capture_history();
+        pickup_input.capture(generation, pickups, stats, &visit, camera, pickup_clock, will_draw, history);
+        power_art.publish_input(pickup_input, will_draw);
+        if pickup_input.overflow() {*rejected=true;handoff_return.retire();*handoff_minimum_frame=frame as u64;}
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-pickups] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",frame,pickup_input.bytes(),us,allocations,u8::from(pickup_input.overflow()));
+        }
+    }
+    {
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        let (bytes,overflow)=steam.extract_render_input(steam_visit);
+        if overflow { *rejected=true;handoff_return.retire();*handoff_minimum_frame=frame as u64;}
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-particles] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",frame,bytes,us,allocations,u8::from(overflow));
+        }
+    }
+    let empty_level_effects=interactions.pandemonium.is_none() && interactions.duchess.is_none()
+        && level_art.levels.iter().flatten().all(|a|a.snapshot_effects_empty());
+    let wave_overflow={
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        wave_input.clear();
+        if let Some(s)=&interactions.encounters{s.extract_waves(wave_input);}
+        if let Some(s)=&interactions.school2{for b in &s.boojums{b.extract_waves(wave_input);}}
+        let overflow=wave_input.len()>16384;if overflow { *rejected=true;wave_input.clear();handoff_return.retire();*handoff_minimum_frame=frame as u64;}
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-waves] frame={} bytes={} extraction_us={:.3} allocations={} overflow={} level_effects_complete={}",frame,std::mem::size_of_val(&*wave_input)+wave_input.len()*std::mem::size_of::<crate::render_snapshot::WaveInput>(),us,allocations,u8::from(overflow),u8::from(empty_level_effects));
+        }
+        overflow
+    };
+    let aim={
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        let can_aim = !interactions.level_blocks_weapons() && !flying
+            && !pand_cinematic
+            && scripted_camera_none
+            && !story.busy()
+            && !menu
+            && !inventory_menu
+            && !console_open
+            && stats.alive()
+            && player.script_motion == 0
+            && player.ledge.is_none()
+            && !player.climbing();
+        let (generation, rules) = aim_pointer.capture_rules();
+        let input = crate::targeting::Input::capture(
+            &rules, &crate::combat::Context { world, targets },
+            crate::targeting::Sight { eye: player.eye(), direction, weapon: can_aim.then(|| stats.equipped()).flatten() },
+            generation, level_art.snapshot_visit.id(),
+        );
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-aim] frame={} bytes={} extraction_us={:.3} allocations={} overflow=0",frame,std::mem::size_of_val(&input),us,allocations);
+        }
+        Some(input)
+    };
+    let first_person=Some(!world_only && !third_person && !pand_cinematic && !flying && stats.alive()
+        && player.script_motion==0 && !interactions.school.as_ref().is_some_and(|s|s.cinematic()));
+    let shadow={
+        let timing = snapshot_log.then(SnapshotTiming::start);
+        let will_draw=!world_only && dynamic_input.alice_shadow;
+        #[cfg(target_os="vita")] let will_draw=will_draw && !crate::frame_profile::mode().no_world();
+        let (input,queries)=if will_draw {crate::lighting::resolve_shadow(world,dynamic_input.alice_feet,22.)}else{(None,0)};
+        if let Some(timing) = timing {
+            let (us, allocations) = timing.finish();
+            println!("[lg/snapshot-shadow] frame={} bytes={} extraction_us={:.3} allocations={} queries={} overflow=0",frame,std::mem::size_of_val(&input),us,allocations,queries);
+        }
+        input
+    };
+    SnapshotInputs { lights: Some(lights), dispatch: Some(dispatch), aim, first_person, shadow: Some(shadow), empty_level_effects, wave_overflow }
+}
+
+/// Retire the stored snapshot inputs once, on the on-to-off transition: the
+/// extraction arenas return to their owners and the visit-checked inputs read
+/// as absent to the direct path, exactly as the per-frame clears did.
+#[inline(never)]
+fn snapshot_retire_inputs(level_art: &mut LevelArt, npcs: &mut crate::npc::Npcs,
+    alice: &mut Character, steam: &mut crate::particles::Steam) {
+    for art in level_art.levels.iter_mut().flatten() {art.clear_snapshot();}
+    if let Some(a)=&mut level_art.encounters {a.clear_snapshot();}
+    if let Some(art)=&mut level_art.pool { art.clear_input(); }
+    npcs.clear_actor_inputs();
+    alice.clear_body_input();
+    steam.clear_render_input();
+}
+
 fn acknowledge_checkpoint(result: Result<()>, levels: &mut [crate::level::Slot]) -> Result<()> {
     result?;
     for slot in levels {
@@ -1327,6 +1534,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     let mut wave_input=Vec::new();
     let mut pickup_input=crate::powerups::PickupInput::default();
     let mut snapshot_fenced_frames = 0u64;
+    let mut snapshots_were_enabled = false;
     let mut acoustic_view = None;
     #[cfg(feature = "vita_renderer")]
     let sim_overlap = crate::render::vita_renderer::config().sim_overlap;
@@ -4135,7 +4343,10 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         interactions.place_level_particles(steam.sim_mut());
         drop(census_block);
         let census_render = crate::phase_census::span(crate::phase_census::Region::Render);
-        census_block = crate::phase_census::span(crate::phase_census::Region::RenderSetup);
+        // The extraction span only exists while the snapshot handoff is on:
+        // the direct path bills its setup to the inclusive render region.
+        let snapshot_setup = snapshot_handoff
+            .then(|| crate::phase_census::span(crate::phase_census::Region::RenderSetup));
         // All resolvers execute without issuing graphics calls. The opt-in runs
         // them before submission; the control preserves the original HUD phase.
         macro_rules! resolve_prompt { () => {{
@@ -4335,35 +4546,9 @@ interactions
             println!("[lg/snapshot] frame={} hud_bytes={} extraction_us={:.3} allocations={} save={}",
                 frame, snapshot.bytes(), us, allocations, captured_save.is_some());
         }
-        // Shared transform/view input. Particle and pickup consumers now own
-        // their dedicated arenas; do not duplicate their old census payloads.
-        if snapshot_enabled {
-            use macroquad::camera::Camera;
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            dynamic_input.finish_view(world_camera.matrix(), &scene.atmosphere);
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-dynamic] frame={} bytes={} capacity_bytes={} extraction_us={:.3} allocations={} transforms={} particles={} pickups={}",
-                    frame, dynamic_input.bytes(), dynamic_input.capacity_bytes(), us, allocations,
-                    dynamic_input.transforms.len(), 0, 0);
-            }
-        }
-        // Resolve dynamic lights at the simulation boundary. Resident lighting
-        // textures and the selected-light TLS stay owned by the renderer.
-        let extracted_lights = snapshot_enabled.then(|| {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            let mut lights = steam.lights();
-            lights.extend(alice.lights());
-            lights.extend(npcs.lights());
-            for slot in &interactions.levels { lights.extend(slot.ctl.lights()); }
-            let selection = crate::lighting::resolve(lights, camera, &world);
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-lights] frame={} bytes={} capacity_bytes={} extraction_us={:.3} allocations={}",
-                    frame, selection.bytes(), selection.capacity_bytes(), us, allocations);
-            }
-            selection
-        });
+        // Shared transform/view input, resident light selection and every
+        // family input below are snapshot-only: the out-of-line helper runs
+        // them while the handoff is on, and the direct path skips them.
         let preview_capture = if saves_writable {
             #[cfg(feature = "vita_renderer")]
             let throttled = crate::render::vita_renderer::config().save_preview == "throttled";
@@ -4392,135 +4577,31 @@ interactions
         let tail_terminal_fence = quit_after_frame || options.frames.is_some_and(|n| frame+1>=n);
         let snapshot_tail_fenced = !snapshot_enabled || hud_snapshot.is_none() || tail_save_fence
             || tail_survey_fence || tail_diagnostic_fence || tail_terminal_fence;
-        if !snapshot_enabled {for art in level_art.levels.iter_mut().flatten() {art.clear_snapshot();}
-            if let Some(a)=&mut level_art.encounters {a.clear_snapshot();}}
         let mut snapshot_rejected=false;
-        let level_dispatch = snapshot_enabled.then(|| {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            let input = level_art.extract_dispatch(&interactions, &hints, &story);
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-dispatch] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",
-                    frame, std::mem::size_of::<LevelDispatch>() + input.registered.capacity()
-                        + level_art.levels.iter().flatten().map(|a|a.snapshot_bytes()).sum::<usize>()
-                        + input.cheshire.as_ref().map_or(0, |i| i.bytes())
-                        + level_art.encounters.as_ref().map_or(0,|a|a.snapshot_bytes()),
-                    us, allocations, u8::from(input.overflow));
-            }
-            input
-        });
-        if snapshot_enabled {
-            // Script state is resolved before cinematic pose extraction; materials
-            // and lazy mesh/effect publication remain on the renderer thread.
-            if let (Some(art), Some(pool)) = (&mut level_art.pool, &interactions.pool) {
-                art.cinema.story_pose(&story);
-                let timing = snapshot_log.then(SnapshotTiming::start);
-                let (bytes, overflow) = art.extract(pool);
-                if let Some(timing) = timing {
-                    let (us, allocations) = timing.finish();
-                    println!("[lg/snapshot-pool] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",
-                        frame, bytes, us, allocations, u8::from(overflow));
-                }
-                if overflow { snapshot_rejected=true; handoff_return.retire(); handoff_minimum_frame = frame as u64; }
-            }
-        } else if let Some(art) = &mut level_art.pool { art.clear_input(); }
-        if snapshot_enabled {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            let (bytes, ants, overflow) = npcs.extract_ants(camera, (target-camera).normalize_or_zero());
-            let measurement = timing.map(SnapshotTiming::finish);
-            if overflow { snapshot_rejected=true; handoff_return.retire(); handoff_minimum_frame = frame as u64; }
-            snapshot_frames += 1;
-            if let Some((us, allocations)) = measurement {
-                println!("[lg/snapshot-actors] frame={} bytes={} extraction_us={:.3} allocations={} ants={} overflow={}",
-                    frame, bytes, us, allocations, ants, u8::from(overflow));
-            }
-        } else { npcs.clear_actor_inputs(); }
-        if snapshot_enabled {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            let (bytes,overflow)=alice.extract_body(dynamic_input.alice_feet);
-            if overflow { snapshot_rejected=true;handoff_return.retire();handoff_minimum_frame=frame as u64;}
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-alice] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",frame,bytes,us,allocations,u8::from(overflow));
-            }
-        } else { alice.clear_body_input(); }
-        if snapshot_enabled {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            #[cfg(target_os="vita")] let will_draw=!crate::frame_profile::mode().no_world() && !world_only;
-            #[cfg(not(target_os="vita"))] let will_draw=!world_only;
-            let visit = save::visit_key(&maps[current], entry_spawn.as_deref());
-            power_art.prepare_visit(&pickup_input, &visit);
-            let (generation, history) = power_art.capture_history();
-            pickup_input.capture(generation, &pickups, &stats, &visit, camera, pickup_clock, will_draw, history);
-            power_art.publish_input(&pickup_input, will_draw);
-            if pickup_input.overflow() {snapshot_rejected=true;handoff_return.retire();handoff_minimum_frame=frame as u64;}
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-pickups] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",frame,pickup_input.bytes(),us,allocations,u8::from(pickup_input.overflow()));
-            }
-        }
+        // Snapshot-only extraction, out of line and gated on the handoff.
+        // Off, the stored inputs are retired once, on the on-to-off
+        // transition, instead of clearing them every frame.
         let steam_visit = level_art.snapshot_visit.id();
-        if snapshot_enabled {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            let (bytes,overflow)=steam.extract_render_input(steam_visit);
-            if overflow { snapshot_rejected=true;handoff_return.retire();handoff_minimum_frame=frame as u64;}
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-particles] frame={} bytes={} extraction_us={:.3} allocations={} overflow={}",frame,bytes,us,allocations,u8::from(overflow));
+        let snapshot_input = if snapshot_enabled {
+            snapshot_inputs(
+                &mut level_art, &mut npcs, &mut alice, &mut steam, &mut power_art, &mut pickup_input,
+                &mut aim_pointer, &mut dynamic_input, &mut wave_input, &mut handoff_return,
+                &mut handoff_minimum_frame, &mut snapshot_frames, &mut snapshot_rejected,
+                &interactions, &story, &hints, &scene.atmosphere, &world_camera, camera, target, direction,
+                &world, &targets, &player, &stats, &pickups, &maps, current, entry_spawn.as_deref(),
+                frame, snapshot_log, steam_visit, world_only, third_person, flying, pand_cinematic,
+                scripted_camera.is_none(), menu, inventory_menu, console.open, pickup_clock,
+            )
+        } else {
+            if snapshots_were_enabled {
+                snapshot_retire_inputs(&mut level_art, &mut npcs, &mut alice, &mut steam);
             }
-        } else {steam.clear_render_input();}
-        let empty_level_effects=snapshot_enabled && interactions.pandemonium.is_none() && interactions.duchess.is_none()
-            && level_art.levels.iter().flatten().all(|a|a.snapshot_effects_empty());
-        let wave_overflow=if snapshot_enabled {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            wave_input.clear();
-            if let Some(s)=&interactions.encounters{s.extract_waves(&mut wave_input);}
-            if let Some(s)=&interactions.school2{for b in &s.boojums{b.extract_waves(&mut wave_input);}}
-            let overflow=wave_input.len()>16384;if overflow { snapshot_rejected=true;wave_input.clear();handoff_return.retire();handoff_minimum_frame=frame as u64;}
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-waves] frame={} bytes={} extraction_us={:.3} allocations={} overflow={} level_effects_complete={}",frame,std::mem::size_of_val(&wave_input)+wave_input.len()*std::mem::size_of::<crate::render_snapshot::WaveInput>(),us,allocations,u8::from(overflow),u8::from(empty_level_effects));
-            }
-            overflow
-        } else {false};
-        let aim_input=if snapshot_enabled {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            let can_aim = !interactions.level_blocks_weapons() && !flying
-                && !pand_cinematic
-                && scripted_camera.is_none()
-                && !story.busy()
-                && !menu
-                && !inventory_menu
-                && !console.open
-                && stats.alive()
-                && player.script_motion == 0
-                && player.ledge.is_none()
-                && !player.climbing();
-            let (generation, rules) = aim_pointer.capture_rules();
-            let input = crate::targeting::Input::capture(
-                &rules, &crate::combat::Context { world: &world, targets: &targets },
-                crate::targeting::Sight { eye: player.eye(), direction, weapon: can_aim.then(|| stats.equipped()).flatten() },
-                generation, level_art.snapshot_visit.id(),
-            );
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-aim] frame={} bytes={} extraction_us={:.3} allocations={} overflow=0",frame,std::mem::size_of_val(&input),us,allocations);
-            }
-            Some(input)
-        } else {None};
-        let first_person_input=snapshot_enabled.then(|| !world_only && !third_person && !pand_cinematic && !flying && stats.alive()
-            && player.script_motion==0 && !interactions.school.as_ref().is_some_and(|s|s.cinematic()));
-        let shadow_input=if snapshot_enabled {
-            let timing = snapshot_log.then(SnapshotTiming::start);
-            let will_draw=!world_only && dynamic_input.alice_shadow;
-            #[cfg(target_os="vita")] let will_draw=will_draw && !crate::frame_profile::mode().no_world();
-            let (input,queries)=if will_draw {crate::lighting::resolve_shadow(&world,dynamic_input.alice_feet,22.)}else{(None,0)};
-            if let Some(timing) = timing {
-                let (us, allocations) = timing.finish();
-                println!("[lg/snapshot-shadow] frame={} bytes={} extraction_us={:.3} allocations={} queries={} overflow=0",frame,std::mem::size_of_val(&input),us,allocations,queries);
-            }
-            Some(input)
-        } else {None};
+            SnapshotInputs::default()
+        };
+        snapshots_were_enabled = snapshot_enabled;
+        let SnapshotInputs { lights: extracted_lights, dispatch: level_dispatch, aim: aim_input,
+            first_person: first_person_input, shadow: shadow_input, empty_level_effects,
+            wave_overflow } = snapshot_input;
         // Canonical audited blocker set, resolved before rendering. The same
         // set controls the real last-read boundary and the host census.
         let snapshot_blockers = if snapshot_enabled {
@@ -4671,7 +4752,8 @@ interactions
         else { sim_audit.event("fallback", present_stamp); }
         let render_started = sim_trace.mark(present_stamp.frame.frame);
         let transforms = dynamic_input.transforms.as_slice();
-        drop(census_block); census_block=crate::phase_census::span(crate::phase_census::Region::RenderSetup);
+        drop(snapshot_setup);
+        census_block=crate::phase_census::span(crate::phase_census::Region::RenderSetup);
         if snapshot_world_free {
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
             let saved_steam = (steam_poison_frame == Some(frame)).then(|| {
