@@ -73,7 +73,10 @@ pub(crate) fn resolve(lights: Vec<Light>, eye: Vec3, world: &World) -> Selection
 }
 /// Called at the original selection site, after portal rendering has restored
 /// its own light state. No collision or simulation access is possible here.
+/// Census accounting only: the publication bills to the light selection
+/// region, as the inline selection path always did.
 pub(crate) fn publish(selection: Selection) {
+    let _census = crate::phase_census::span(crate::phase_census::Region::Lights);
     let Selection { lights, candidates, sweeps, reused,
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         elapsed_ms,

@@ -1909,8 +1909,13 @@ pub(super) fn step_b_in_place(
             })
             .unwrap_or(75.0f32.to_radians()),
     };
+    // Restore the pre-overlap census boundary: the transform capture keeps
+    // billing to camera_transforms_ropes, under camera_scene, as it did
+    // before the step owned it. Accounting only.
+    let census_leaf = crate::phase_census::span(crate::phase_census::Region::CameraTransforms);
     let mut transforms = sim.interactions.transforms();
     transforms.extend(sim.world.traversal.transforms(&sim.player));
+    drop(census_leaf);
     let dynamic = crate::render_snapshot::DynamicInput {
         alice_feet: sim.player.feet,
         alice_visible: show_alice
