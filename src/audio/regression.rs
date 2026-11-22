@@ -121,7 +121,7 @@ pub fn output(assets: &mut Assets) -> Result<()> {
             audio.player_state(assets, 0., false, false, false);
         }
         if tick == 230 {
-            audio.load(assets, "gvillage", &map);
+            audio.load(assets, "gvillage", &map, false);
             audio.scene_presented();
             ensure!(
                 audio.reaction.is_none(),

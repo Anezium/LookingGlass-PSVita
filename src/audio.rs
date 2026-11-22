@@ -273,6 +273,60 @@ fn audio_memory(event: &str, cache_samples: usize) {
     eprintln!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used=unavailable heap_free_arena=unavailable",
         cache_samples * 4, CACHE_SAMPLES * 4);
 }
+#[cfg(test)]
+mod named_prefetch_tests {
+    use super::*;
+
+    fn clip(value: f32, len: usize) -> Clip {
+        Clip { samples: vec![value; len].into(), rate: 22_050 }
+    }
+
+    #[test]
+    fn duplicate_reject_keeps_the_first_clip_and_counts_it_once() {
+        let mut named = NamedPrefetch::for_map("garden1", true, false);
+        let path = NOSEWIPE_CUES[0];
+        named.stage_reject(path, Some(clip(0.5, 20_000)));
+        named.stage_reject(path, Some(clip(0.25, 20_000)));
+        assert_eq!(named.staged_bytes, [80_000, 0]);
+        let mut cache = BTreeMap::new();
+        let mut samples = 0;
+        named.finish("garden1", &mut cache, &mut samples, |_| panic!("staged clip decoded again"));
+        assert_eq!(samples, 20_000);
+        assert_eq!(cache[path].as_ref().unwrap().samples[0].to_bits(), 0.5f32.to_bits());
+    }
+
+    #[test]
+    fn load_preserves_existing_entries_and_enforces_both_caps() {
+        let mut named = NamedPrefetch::for_map("garden1", true, true);
+        let existing = KNIFE_CUES[0].to_owned();
+        let mut cache = BTreeMap::from([(existing.clone(), Some(clip(1., 1)))]);
+        let mut samples = CACHE_SAMPLES - 2;
+        named.stage_reject(NOSEWIPE_CUES[0], Some(clip(0., 40_000)));
+        named.finish("garden1", &mut cache, &mut samples, |path| {
+            assert_eq!(path, KNIFE_CUES[1]);
+            Some(clip(0., 3))
+        });
+        assert_eq!(samples, CACHE_SAMPLES - 2);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[&existing].as_ref().unwrap().samples[0].to_bits(), 1.0f32.to_bits());
+
+        let mut cache = BTreeMap::new();
+        let mut samples = 0;
+        NamedPrefetch::for_map("wchess1", true, true).finish("wchess1", &mut cache, &mut samples, |path| {
+            Some(clip(0., if path == KNIFE_CUES[0] { 60_050 } else { 2 }))
+        });
+        assert_eq!(samples, 2);
+        assert!(!cache.contains_key(KNIFE_CUES[0]));
+        assert!(cache.contains_key(KNIFE_CUES[1]));
+        for (enabled, has_knife) in [(false, true), (true, false)] {
+            NamedPrefetch::for_map("wchess1", enabled, has_knife).finish(
+                "wchess1", &mut cache, &mut samples, |_| panic!("inactive path decoded"),
+            );
+        }
+        assert_eq!(samples, 2);
+    }
+}
+
 /// `audio_cue_prefetch`: sounds a level's own code can emit that no authored
 /// speaker list or actor animation names. Extend only when a measured window
 /// reads one of these on its first play. `audio_level_cues_extra` adds each
@@ -377,70 +431,91 @@ const ROCK_CUES: &[&str] = &[
 const NOSEWIPE_CUES: &[&str] = &["sound/character/mock_turtle/idle_nosewipe.wav"];
 const KNIFE_CUES: &[&str] = &[crate::weapons::KNIFE_SPIN, crate::weapons::WEAPON_REAPPEAR];
 
-#[derive(Default)]
-struct NamedPrefetch {
+#[derive(Clone, Copy, Default)]
+struct NamedCues {
     paths: &'static [&'static str],
     limit: usize,
-    staged_bytes: usize,
+}
+
+#[derive(Default)]
+struct NamedPrefetch {
+    cues: [NamedCues; 2],
+    staged_bytes: [usize; 2],
     rejected: BTreeMap<&'static str, Option<Clip>>,
 }
 impl NamedPrefetch {
-    fn for_map(name: &str, enabled: bool) -> Self {
-        let (paths, limit) = match (name, enabled) {
-            ("potears1", true) => (ROCK_CUES, 339_484),
-            ("garden1", true) => (NOSEWIPE_CUES, 133_884),
-            ("potears2", true) => (KNIFE_CUES, 240_196),
-            _ => return Self::default(),
+    fn for_map(name: &str, enabled: bool, knife_available: bool) -> Self {
+        if !enabled {
+            return Self::default();
+        }
+        let flavor = match name {
+            "potears1" => NamedCues { paths: ROCK_CUES, limit: 339_484 },
+            "garden1" => NamedCues { paths: NOSEWIPE_CUES, limit: 133_884 },
+            _ => NamedCues::default(),
         };
-        Self { paths, limit, ..Self::default() }
+        let knife = if knife_available {
+            NamedCues { paths: KNIFE_CUES, limit: 240_196 }
+        } else {
+            NamedCues::default()
+        };
+        Self { cues: [flavor, knife], ..Self::default() }
     }
 
     fn stage_reject(&mut self, path: &str, clip: Option<Clip>) {
-        let Some(&path) = self.paths.iter().find(|&&named| named == path) else { return };
-        let clip = clip.filter(|clip| {
-            let bytes = clip.samples.len() * std::mem::size_of::<f32>();
-            if self.staged_bytes + bytes > self.limit {
-                return false;
-            }
-            self.staged_bytes += bytes;
-            true
+        let Some((group, named)) = self.cues.iter().enumerate()
+            .find_map(|(group, cues)| cues.paths.iter().copied().find(|&cue| cue == path)
+                .map(|named| (group, named))) else { return };
+        self.rejected.entry(named).or_insert_with(|| {
+            clip.filter(|clip| {
+                let bytes = std::mem::size_of_val(&*clip.samples);
+                if self.staged_bytes[group] + bytes > self.cues[group].limit {
+                    return false;
+                }
+                self.staged_bytes[group] += bytes;
+                true
+            })
         });
-        self.rejected.insert(path, clip);
     }
 
     fn finish(
         mut self,
-        assets: &mut Assets,
         name: &str,
         cache: &mut BTreeMap<String, Option<Clip>>,
         cache_samples: &mut usize,
+        mut decode: impl FnMut(&str) -> Option<Clip>,
     ) {
-        if self.paths.is_empty() {
+        if self.cues.iter().all(|cues| cues.paths.is_empty()) {
             return;
         }
-        // The legacy passes have committed all their admissions. Only now may
-        // the named clips consume room under the shared cap.
-        let (mut clips, mut bytes) = (0, 0);
-        for &path in self.paths {
-            if cache.contains_key(path) {
-                continue;
+        // Give each group its own allowance after both legacy passes. They still
+        // share the same level PCM cap and keep the map's original cue priority.
+        let mut clips = [0; 2];
+        let mut bytes = [0; 2];
+        for (group, cues) in self.cues.iter().enumerate() {
+            for &path in cues.paths {
+                if cache.contains_key(path) {
+                    continue;
+                }
+                let clip = self.rejected.remove(path).unwrap_or_else(|| decode(path));
+                let Some(clip) = clip else { continue };
+                let size = std::mem::size_of_val(&*clip.samples);
+                if bytes[group] + size > cues.limit || *cache_samples + clip.samples.len() > CACHE_SAMPLES {
+                    continue;
+                }
+                clips[group] += 1;
+                bytes[group] += size;
+                *cache_samples += clip.samples.len();
+                #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                proof::decode("named", path, &clip.samples);
+                cache.insert(path.to_owned(), Some(clip));
+                audio_memory(&format!("named:{path}"), *cache_samples);
             }
-            let clip = self.rejected.remove(path)
-                .unwrap_or_else(|| assets.read(path).and_then(decode_clip).ok());
-            let Some(clip) = clip else { continue };
-            let size = clip.samples.len() * std::mem::size_of::<f32>();
-            if bytes + size > self.limit || *cache_samples + clip.samples.len() > CACHE_SAMPLES {
-                continue;
-            }
-            clips += 1;
-            bytes += size;
-            *cache_samples += clip.samples.len();
-            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-            proof::decode("named", path, &clip.samples);
-            cache.insert(path.to_owned(), Some(clip));
-            audio_memory(&format!("named:{path}"), *cache_samples);
         }
-        println!("[lg/audio-named-prefetch] map={name} clips={clips} bytes={bytes} allowance={}", self.limit);
+        let allowance: usize = self.cues.iter().map(|cues| cues.limit).sum();
+        println!(
+            "[lg/audio-named-prefetch] map={name} clips={} bytes={} allowance={allowance} knife_clips={} knife_bytes={}",
+            clips.iter().sum::<usize>(), bytes.iter().sum::<usize>(), clips[1], bytes[1],
+        );
     }
 }
 /// `audio_cue_prefetch`: decode the level's own cue clips on the load path, before
@@ -1226,11 +1301,11 @@ impl Audio {
             checkpoint.music_position.map(|p|p.as_nanos()), self.music.as_ref().map(|(s,_)|s.get_pos().as_nanos()));
         let _ = checkpoint.music_position;
     }
-    pub(crate) fn reload_failed_transition(&mut self, assets: &mut Assets, name: &str, map: &Bsp) {
+    pub(crate) fn reload_failed_transition(&mut self, assets: &mut Assets, name: &str, map: &Bsp, knife_available: bool) {
         let music = self.music.take();
         let retiring = std::mem::take(&mut self.retiring);
         let cues = std::mem::take(&mut self.cues);
-        self.load(assets, name, map);
+        self.load(assets, name, map, knife_available);
         self.music = music;
         self.retiring = retiring;
         self.cues = cues;
@@ -1327,7 +1402,7 @@ impl Audio {
             landings: 0,
         }
     }
-    pub fn load(&mut self, assets: &mut Assets, name: &str, map: &Bsp) {
+    pub fn load(&mut self, assets: &mut Assets, name: &str, map: &Bsp, knife_available: bool) {
         let _r13_memory = crate::allocation_census::Scope::new(6);
         self.release_level();
         let started = std::time::Instant::now();
@@ -1335,7 +1410,7 @@ impl Audio {
             audio_memory(&format!("level:{name}:disabled"), self.cache_samples);
             return;
         }
-        if let Err(e) = self.load_inner(assets, name, map) {
+        if let Err(e) = self.load_inner(assets, name, map, knife_available) {
             eprintln!("Audio level error in {name}: {e:#}");
             self.status = "Some level audio could not be loaded".into();
         }
@@ -1377,7 +1452,7 @@ impl Audio {
         self.fade_elapsed = 0.;
         self.swim_clock = 0.;
     }
-    fn load_inner(&mut self, assets: &mut Assets, name: &str, map: &Bsp) -> Result<()> {
+    fn load_inner(&mut self, assets: &mut Assets, name: &str, map: &Bsp, knife_available: bool) -> Result<()> {
         let spec = level_spec(assets, name, map)?;
         let mut failures = 0;
         self.cues = spec.music;
@@ -1432,7 +1507,7 @@ impl Audio {
                 }
             }
         }
-        let mut named = NamedPrefetch::for_map(name, block::settings().named_prefetch);
+        let mut named = NamedPrefetch::for_map(name, block::settings().named_prefetch, knife_available);
         if block::settings().cue_prefetch {
             let (clips, bytes) = prefetch_level_clips(
                 assets, name, map, &mut cache, &mut cache_samples, PREFETCH_BYTES,
@@ -1445,7 +1520,9 @@ impl Audio {
                 cache_samples * std::mem::size_of::<f32>()
             );
         }
-        named.finish(assets, name, &mut cache, &mut cache_samples);
+        named.finish(name, &mut cache, &mut cache_samples, |path| {
+            assets.read(path).and_then(decode_clip).ok()
+        });
         self.cache_samples = cache_samples;
         self.world_clips = cache
             .iter()
@@ -2309,7 +2386,7 @@ pub fn test_output(assets: &mut Assets, name: &str) -> Result<()> {
         "This session has no usable audio output device"
     );
     audio.settings = Settings::default(); // Does not save/alter the user's preferences.
-    audio.load(assets, name, &map);
+    audio.load(assets, name, &map, false);
     audio.scene_presented();
     let (eye, yaw) = map.spawn();
     let world = World::from_bsp(&map)?;
@@ -2469,7 +2546,7 @@ pub fn test_output(assets: &mut Assets, name: &str) -> Result<()> {
         }
         if tick == 160 && name == "skool1" {
             let next = Bsp::parse(&assets.read("maps/skool2.bsp")?)?;
-            audio.load(assets, "skool2", &next);
+            audio.load(assets, "skool2", &next, false);
             audio.scene_presented();
         }
         audio.prepare(assets, &world, eye, (200..240).contains(&tick), 0.05);
@@ -2569,7 +2646,7 @@ mod tests {
                 }
                 durations
             });
-            audio.load(&mut assets, "gvillage", &map);
+            audio.load(&mut assets, "gvillage", &map, false);
             audio.update(0.1, Vec3::ZERO, 0., false, false);
             assert!(!audio.scene_presented);
             assert!(audio.music.as_ref().unwrap().0.is_paused());
@@ -2619,7 +2696,7 @@ mod tests {
             }
             rows
         });
-        audio.load(&mut assets,"gvillage",&map);
+        audio.load(&mut assets,"gvillage",&map, false);
         assert_eq!(audio.emitters.len(),20);
         std::thread::sleep(Duration::from_millis(1100));
         audio.scene_presented();let eye=vec3(-4144.,6120.,280.);
@@ -2663,7 +2740,7 @@ mod tests {
         let (mixer,source)=output::mixer();
         audio.playback=Some(Playback{_stream:None,mixer,_worker:None});
         let mut monitor=Monitor{source,data:audio.monitor.clone(),block:Vec::with_capacity(1024),record:false};
-        audio.load(&mut assets,"gvillage",&map);
+        audio.load(&mut assets,"gvillage",&map, false);
         assert_eq!(audio.emitters.len(),20);
         audio.scene_presented();
         let eye=vec3(-4144.,6120.,280.);
@@ -2724,7 +2801,7 @@ mod tests {
             let mut audio = Audio::new(true, None);
             let (mixer, _source) = output::mixer();
             audio.playback = Some(Playback { _stream: None, mixer, _worker: None });
-            audio.load(&mut assets, name, &map);
+            audio.load(&mut assets, name, &map, false);
             for &path in PICKUP_EFFECTS {
                 ensure!(audio.world_clips.contains_key(path), "pickup cue was not preloaded: {name} {path}");
                 audio.queue(path, Some(Vec3::ZERO), 1.);
@@ -3122,7 +3199,7 @@ mod tests {
                 let mut audio = Audio::new(true, None);
                 let (mixer, _source) = output::mixer();
                 audio.playback = Some(Playback { _stream: None, mixer, _worker: None });
-                audio.load(&mut assets, map, &bsp);
+                audio.load(&mut assets, map, &bsp, false);
                 println!("AUDIO_ARM_PREFETCH map={map} clips={} bytes={} cache_bytes={} transient={}",
                     audio.prefetch_clips, audio.prefetch_bytes,
                     audio.cache_samples * std::mem::size_of::<f32>(), audio.transient_decodes);

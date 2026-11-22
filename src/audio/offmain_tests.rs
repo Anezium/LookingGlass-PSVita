@@ -256,7 +256,7 @@ fn paced_pcm_producer_preserves_audio_health() -> Result<()> {
             mixer,
             _worker: Some(worker),
         });
-        audio.load(&mut assets, name, &map);
+        audio.load(&mut assets, name, &map, false);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done = stop.clone();
         let reader = std::thread::spawn(move || {

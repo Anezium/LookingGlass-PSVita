@@ -981,6 +981,13 @@ pub async fn check_level_entry(assets: &mut Assets, options: &Options) -> Result
     Ok(())
 }
 
+/// Include Blade pickups so the first acquisition on an unarmed visit also
+/// has both code cues ready. A restored or earned Blade uses the same slot.
+fn knife_audio_available(stats: &Stats, pickups: &[inventory::Pickup]) -> bool {
+    stats.copies(0) > 0
+        || pickups.iter().any(|pickup| matches!(pickup.kind, inventory::PickupKind::Weapon(0)))
+}
+
 fn starting_stats(options: &Options, map: &str, entry: Option<&str>) -> Stats {
     let mut stats = if options.weapon_preview {
         Stats::weapon_preview()
@@ -1476,7 +1483,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             install_timing.mark("level_art_models_textures");
             restore_install_yield!($($guards)?);
             skip_scene = crate::cinematic::Skip::default();
-            audio.load(&mut assets, &maps[current], &scene.map);
+            audio.load(&mut assets, &maps[current], &scene.map, knife_audio_available(&stats, &pickups));
             audio.install_story_voices(&mut story, &maps[current]);
             install_timing.mark("audio_load");
             scene.prepare_level_gpu();
@@ -1621,7 +1628,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             inventory::pickups_for_visit(&scene.map, &maps[current], entry_spawn.as_deref(), &catalog);
         pickup_clock = 0.;
         environment_clock = 0.;
-        audio.load(&mut assets, &maps[current], &scene.map);
+        audio.load(&mut assets, &maps[current], &scene.map, knife_audio_available(&stats, &pickups));
         {
             let _timing = crate::startup::Phase::new("startup_story_load");
             story = crate::story::Story::load_with_voices(&mut assets, &maps[current], true);
@@ -1870,7 +1877,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 particles.restore_runtime($particles);
                 level_art = art; npcs = cast; steam = particles;
                 Loaded { scene, world } = level;
-                audio.reload_failed_transition(&mut assets, &maps[current], &scene.map);
+                audio.reload_failed_transition(&mut assets, &maps[current], &scene.map, knife_audio_available(&stats, &pickups));
                 audio.reload_story_voices(&mut assets, &maps[current]);
                 audio.restore_transition($audio);
                 scene.prepare_level_gpu();
@@ -3479,7 +3486,13 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                         );
                         interactions.sync(&mut world);
                         environment_clock = 0.;
-                        audio.load(&mut assets, &maps[selected], &scene.map);
+                        pickups = inventory::pickups_for_visit(
+                            &scene.map,
+                            &maps[selected],
+                            entry_spawn.as_deref(),
+                            &catalog,
+                        );
+                        audio.load(&mut assets, &maps[selected], &scene.map, knife_audio_available(&stats, &pickups));
                         audio.install_story_voices(&mut story, &maps[selected]);
                         scene.prepare_level_gpu();
                         current = selected;
@@ -3487,12 +3500,6 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                         played = true;
                         pickup_clock = 0.;
                         power_art.clear_effects();
-                        pickups = inventory::pickups_for_visit(
-                            &scene.map,
-                            &maps[current],
-                            entry_spawn.as_deref(),
-                            &catalog,
-                        );
                         (pos, yaw) = interaction::spawn_with_static(&scene.map, entry_spawn.as_deref(), Some(world.audio_geometry()));
                         let spawn = Player::spawn(&world, pos);
                         flying = options.fly || spawn.is_none();
@@ -3820,7 +3827,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                         entry_spawn.as_deref(),
                         &catalog,
                     );
-                    audio.load(&mut assets, &name, &scene.map);
+                    audio.load(&mut assets, &name, &scene.map, knife_audio_available(&stats, &pickups));
                     audio.install_story_voices(&mut story, &name);
                     scene.prepare_level_gpu();
                     eprintln!("[lg/transition] destination={name} resources_audio_ms={:.3}", transition_started.elapsed().as_secs_f64()*1000.);
