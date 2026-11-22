@@ -727,18 +727,27 @@ pub(crate) fn walk_body_liquids(
     half: Vec3,
     allowed: i32,
 ) -> Vec3 {
+    walk_body_with_navigation(world, feet, delta, half, allowed, None)
+}
+
+fn walk_body_with_navigation(
+    world: &World, feet: Vec3, delta: Vec3, half: Vec3, allowed: i32,
+    mut nav: Option<&mut crate::collision::NavSweepCache>,
+) -> Vec3 {
     let _npc_work = crate::npc::profile::work(crate::npc::profile::Phase::Movement);
     let lift = Vec3::Z * 16.;
     let center = feet + Vec3::Z * (half.z + 0.1);
-    let up = world.sweep(center, center + lift, half);
+    let up = world.sweep_with_navigation(center, center + lift, half, nav.as_deref_mut());
     if up.start_solid {
         return feet;
     }
     let raised = center.lerp(center + lift, up.fraction);
-    if world.sweep_blocked(raised, raised + delta, half) {
+    if world.sweep_blocked_with_navigation(raised, raised + delta, half, nav.as_deref_mut()) {
         return feet;
     }
-    let down = world.sweep(raised + delta, raised + delta - Vec3::Z * 34., half);
+    let down = world.sweep_with_navigation(
+        raised + delta, raised + delta - Vec3::Z * 34., half, nav.as_deref_mut(),
+    );
     if down.start_solid || down.fraction >= 1. || down.normal.z < 0.65 {
         return feet;
     }
@@ -748,7 +757,9 @@ pub(crate) fn walk_body_liquids(
         for y in [-half.y + 1., half.y - 1.] {
             let p = next + vec3(x, y, 2.);
             // A hull straddling a legal step still needs support on its lower side.
-            let support = world.sweep(p, p - Vec3::Z * 18., Vec3::ZERO);
+            let support = world.sweep_with_navigation(
+                p, p - Vec3::Z * 18., Vec3::ZERO, nav.as_deref_mut(),
+            );
             if support.start_solid || support.fraction >= 1. || support.normal.z < 0.65 {
                 return feet;
             }

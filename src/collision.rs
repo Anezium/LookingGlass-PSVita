@@ -7,6 +7,8 @@ mod sah;
 #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
 pub(crate) mod sah_probe;
 mod flight_grid;
+mod nav_sweep;
+pub(crate) use nav_sweep::NavSweepCache;
 use crate::bsp::{Bsp, Plane};
 #[cfg(target_os = "vita")]
 use crate::frame_profile::{add_counter, Counter};
@@ -1055,7 +1057,9 @@ impl World {
         if memo.generation == 0 { memo.slots.clear(); memo.generation = 1; }
         SweepMemoScope(Some(self))
     }
-    fn sweep_memoized(&self, start: Vec3, end: Vec3, half: Vec3) -> Trace {
+    fn sweep_memoized(
+        &self, start: Vec3, end: Vec3, half: Vec3, nav: Option<&mut NavSweepCache>,
+    ) -> Trace {
         #[cfg_attr(not(all(feature="sim_maps_probe",not(target_os="vita"))), allow(unused_mut))]
         let mut key = Self::query_key(start, end, half);
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
@@ -1083,7 +1087,7 @@ impl World {
             }
         }
         crate::sim_maps::count("sweep_memo_misses", 1);
-        let trace = self.sweep_except(start, end, half, None);
+        let trace = self.sweep_except_with_navigation(start, end, half, None, nav);
         let mut memo = self.sweep_memo.borrow_mut();
         #[cfg(test)]
         { memo.misses += 1; }
@@ -1435,13 +1439,19 @@ impl World {
 
     /// Trace a box centre from start to end. Zero extents give a point trace.
     pub fn sweep(&self, start: Vec3, end: Vec3, half: Vec3) -> Trace {
+        self.sweep_with_navigation(start, end, half, None)
+    }
+
+    pub(crate) fn sweep_with_navigation(
+        &self, start: Vec3, end: Vec3, half: Vec3, nav: Option<&mut NavSweepCache>,
+    ) -> Trace {
         let _census = crate::phase_census::query_sweep(self,start,end,half,1,None);
         #[cfg(target_os = "vita")]
         {
             add_counter(Counter::SweepCalls, 1);
         }
-        if self.sweep_memo.borrow().active { return self.sweep_memoized(start, end, half); }
-        self.sweep_except(start, end, half, None)
+        if self.sweep_memo.borrow().active { return self.sweep_memoized(start, end, half, nav); }
+        self.sweep_except_with_navigation(start, end, half, None, nav)
     }
     /// True exactly when `sweep(start, end, half)` would start in solid or stop short (fraction below 1).
     /// With `sim_sweep_blocked` it stops at the first hull that blocks, where `sweep` keeps clipping to
@@ -1452,18 +1462,26 @@ impl World {
     /// fraction is never NaN (`clip_hull` stores only finite values), so `fraction < 1` and
     /// `!(fraction >= 1)` are the same test.
     pub(crate) fn sweep_blocked(&self, start: Vec3, end: Vec3, half: Vec3) -> bool {
-        self.sweep_blocked_with(start, end, half, false)
+        self.sweep_blocked_with(start, end, half, false, None)
+    }
+    pub(crate) fn sweep_blocked_with_navigation(
+        &self, start: Vec3, end: Vec3, half: Vec3, nav: Option<&mut NavSweepCache>,
+    ) -> bool {
+        self.sweep_blocked_with(start, end, half, false, nav)
     }
     /// The same predicate for a call site that reads only this boolean, selectable on
     /// its own switch. Used by the Snark sight arm, so that arm does not widen any
     /// other caller's path.
     pub(crate) fn sight_blocked(&self, start: Vec3, end: Vec3, half: Vec3) -> bool {
-        self.sweep_blocked_with(start, end, half, true)
+        self.sweep_blocked_with(start, end, half, true, None)
     }
-    fn sweep_blocked_with(&self, start: Vec3, end: Vec3, half: Vec3, force: bool) -> bool {
+    fn sweep_blocked_with(
+        &self, start: Vec3, end: Vec3, half: Vec3, force: bool,
+        nav: Option<&mut NavSweepCache>,
+    ) -> bool {
         let full = |t: Trace| t.start_solid || t.fraction < 1.;
         if !force && !crate::sim_maps::sweep_blocked() && !crate::sim_maps::sweep_any() {
-            return full(self.sweep(start, end, half));
+            return full(self.sweep_with_navigation(start, end, half, nav));
         }
         let _census = crate::phase_census::query_sweep(self,start,end,half,1,None);
         if self.sweep_memo.borrow().active {
@@ -1603,12 +1621,18 @@ impl World {
     /// Damage traces may contact a destructible obstacle itself, but must still
     /// respect every other obstacle. Movement never supplies an exception.
     pub fn sweep_except(&self, start: Vec3, end: Vec3, half: Vec3, ignore: Option<usize>) -> Trace {
+        self.sweep_except_with_navigation(start, end, half, ignore, None)
+    }
+    fn sweep_except_with_navigation(
+        &self, start: Vec3, end: Vec3, half: Vec3, ignore: Option<usize>,
+        nav: Option<&mut NavSweepCache>,
+    ) -> Trace {
         let _census = crate::phase_census::query_sweep(self,start,end,half,1,ignore);
         #[cfg(target_os = "vita")]
         {
             add_counter(Counter::SweepExceptCalls, 1);
         }
-        let mut result = self.sweep_geometry(start, end, half);
+        let mut result = self.sweep_geometry_with_navigation(start, end, half, nav);
         for (id, collider) in &self.weapon_obstacles {
             if Some(*id) == ignore {
                 continue;
@@ -1658,6 +1682,11 @@ impl World {
             .collect();
     }
     pub fn sweep_geometry(&self, start: Vec3, end: Vec3, half: Vec3) -> Trace {
+        self.sweep_geometry_with_navigation(start, end, half, None)
+    }
+    fn sweep_geometry_with_navigation(
+        &self, start: Vec3, end: Vec3, half: Vec3, nav: Option<&mut NavSweepCache>,
+    ) -> Trace {
         #[cfg(any(target_os = "vita", feature = "sim_maps_probe"))]
         crate::viewer::sim_audit::sample_stack("sweep_geometry");
         let _census = crate::phase_census::query_sweep(self,start,end,half,2,None);
@@ -1671,7 +1700,7 @@ impl World {
         {
             add_counter(Counter::SweepGeometryCalls, 1);
         }
-        self.sweep_dynamic(self.ledge_trace(start, end, half), start, end, half)
+        self.sweep_dynamic(self.ledge_trace_with_navigation(start, end, half, nav), start, end, half)
     }
     fn sweep_dynamic(&self, result: Trace, start: Vec3, end: Vec3, half: Vec3) -> Trace {
         let dynamic = DynamicSweep {
@@ -1715,6 +1744,11 @@ impl World {
     }
     /// Static support probes for hanging; moving/rotating entities are excluded.
     pub fn ledge_trace(&self, start: Vec3, end: Vec3, half: Vec3) -> Trace {
+        self.ledge_trace_with_navigation(start, end, half, None)
+    }
+    fn ledge_trace_with_navigation(
+        &self, start: Vec3, end: Vec3, half: Vec3, nav: Option<&mut NavSweepCache>,
+    ) -> Trace {
         let key = Self::query_key(start, end, half);
         if let Some(hit) = self.query_cache.borrow().get(&key).copied() {
             crate::sim_maps::count("static_query_hits", 1);
@@ -1728,7 +1762,9 @@ impl World {
         #[cfg(target_os = "vita")]
         let mut support_hulls = 0u32;
         let query = SweepBounds::new(start, end, half);
-        let (mut result,tested,_clipped) = self.static_geometry.trace(start,end,half,&query);
+        let (mut result,tested,_clipped) = nav
+            .and_then(|cache| cache.trace(&self.static_geometry, start, end, half, &query))
+            .unwrap_or_else(|| self.static_geometry.trace(start, end, half, &query));
         for c in &self.settled_supports {
             // Match dynamic collision's conservative broad phase, including SKIN.
             // Test the placement before asking a lazy template for its hulls.
