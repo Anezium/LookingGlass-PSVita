@@ -2754,7 +2754,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 escape={} alive={} scripted={} muted={}", macroquad::time::get_time(), maps[current],
                 escape_menu.page.is_some(), stats.alive(), interactions.scripted(), audio.settings.muted);
         }
-        // Quit, Escape, F3 and the console key read the head sample, which apply_step consumes.
+        // Quit, Escape, F3 and the console key read the head sample, which apply_step consumes. With
+        // live epochs off the console test reads the key late again, as before step 10.
         let head_quit = step_input.frame.quit;
         let head_escape = step_input.frame.key(KeyCode::Escape, true);
         let head_f3 = step_input.frame.key(KeyCode::F3, true);
@@ -3046,7 +3047,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let mut chars = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
         chars.reverse();
         let toggle_console = physical_input && focused && !bench
-            && (head_console_key
+            && (lag_epochs.console_key(head_console_key, || is_key_pressed(KeyCode::GraveAccent))
                 || chars.iter().any(|c| matches!(c, '`' | '~' | '\u{00ac}')));
         let console_input = console.open || toggle_console;
         let mut console_map = if let Some(choice) = chapter_requested.take() {

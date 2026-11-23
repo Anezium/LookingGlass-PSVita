@@ -34,6 +34,15 @@ impl Epochs {
         self.enabled
     }
 
+    /// The console key at the console test, after any modal the head ran. With live epochs on it
+    /// is the head sample's edge: a retained head loops back without a framework frame, so a live
+    /// read would see one press twice. With them off it is the late live read of the serial path
+    /// before step 10 (`3ecb3589`): a modal that yields and then falls through (menu save, New
+    /// Game or quit after the frame) ends on a newer framework epoch, where the head edge is stale.
+    pub(super) fn console_key(&self, head: bool, live: impl FnOnce() -> bool) -> bool {
+        if self.enabled { head } else { live() }
+    }
+
     /// The head sample. The bool is true when the sample repeats the previous epoch, whose
     /// clock stays latched for this step.
     pub(super) fn head(&mut self, step: u64, capture: impl FnOnce() -> StepInput) -> (StepInput, bool) {
@@ -299,6 +308,31 @@ mod tests {
         let (serial, clocks) = run(true, &[Serial, Serial, Serial]);
         assert_eq!(serial, vec![1, 2, 4]);
         assert!(clocks.iter().all(|(_, latched)| !latched));
+    }
+
+    /// REVIEW-S finding 3: with epochs off, a press on the head epoch and a modal that yields and
+    /// falls through. `3ecb3589` read the key live after the modal, on the newer epoch; the head
+    /// edge is stale there. Without a yield both reads agree.
+    #[test]
+    fn console_key_after_a_falling_through_modal_matches_the_serial_path() {
+        const GRAVE: u32 = 0;
+        for yields in [0, 1, 2] {
+            let mut framework = Framework { epoch: 0 };
+            let mut epochs = Epochs::new(false);
+            let (sample, _) = epochs.head(0, || framework.capture(0));
+            let head = sample.frame.keys_pressed & 1 << GRAVE != 0;
+            assert!(head, "the head epoch carries the press");
+            for _ in 0..yields {
+                framework.next_frame();
+            }
+            let live = || framework.edges().keys_pressed & 1 << GRAVE != 0;
+            assert_eq!(epochs.console_key(head, live), live(), "epochs off: the late read of 3ecb3589");
+            assert_eq!(head == live(), yields == 0, "the head edge differs only after a yield");
+        }
+        // Epochs on keep the head edge, which the epoch rules give to exactly one step.
+        let epochs = Epochs::new(true);
+        assert!(epochs.console_key(true, || false));
+        assert!(!epochs.console_key(false, || true));
     }
 
     #[test]
