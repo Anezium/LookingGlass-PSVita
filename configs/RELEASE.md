@@ -157,6 +157,17 @@ surfaces. The owner accepted the resulting picture on 2026-11-19.
 `PL-rc23-release-play.json` is the RC23 fallback plus the two measurement
 keys. `PL-rc22-release-play.json` preserves the RC22 package for comparison.
 
+v1.1 ships `PL-v11-4-cand.json` as the fallback, with `log_frame_time_every`
+at 0 as in every fallback since RC3. Against RC23 it adds the fourteen v1.1
+keys: the `PL-v11-2c-ship.json` keys (GPU-skinned actors on wchess1 and skool1,
+mover shape reuse, the jlair2 glow subset, lean actor lights, voice, named and
+player-cue prefetch, eager level GPU setup and the navigation sweep cache) and
+lag one on potears2 only (`sim_overlap`, `sim_overlap_normal`,
+`sim_overlap_maps: ["potears2"]`). `sim_overlap_live`, `sim_overlap_cap_30` and
+`diag_sim_timing` stay off, so the display queue keeps its RC23 interval and no
+30 fps cap applies. `PL-rc23-release.json` keeps the RC23 fallback bytes for
+comparison, and the RC23 tests now read it. The profile files are unchanged.
+
 The 20 renderer keys added after the played RC3 input are explicit neutral
 values: `world_adjacent_batch`, `exact_blends`, `sky_cube_finish`, `fog_sky`,
 `low_fog`, `sky_cube_clear_only`, `sim_sweep_blocked`, `sky_cube_retain`,

@@ -205,5 +205,26 @@
   "fx_add_fog_free": true,
   "sky_live": true,
   "actor_lean_shader": true,
-  "audio_level_cues_extra": true
+  "audio_level_cues_extra": true,
+  "gpu_skin_actors": true,
+  "mover_shape_reuse": true,
+  "gpu_skin_actor_maps": [
+    "wchess1",
+    "skool1"
+  ],
+  "actor_glow_subset": true,
+  "actor_glow_subset_maps": [
+    "jlair2"
+  ],
+  "actor_lean_lights": true,
+  "audio_voice_prefetch": true,
+  "audio_named_prefetch": true,
+  "eager_level_gpu": true,
+  "nav_sweep_cache": true,
+  "audio_player_prefetch": true,
+  "sim_overlap": true,
+  "sim_overlap_normal": true,
+  "sim_overlap_maps": [
+    "potears2"
+  ]
 }

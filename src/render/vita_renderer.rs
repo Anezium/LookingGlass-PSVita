@@ -3907,7 +3907,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let played_bytes = include_bytes!("../../configs/PL-played-rc3.json");
         assert_eq!(format!("{:x}", Sha256::digest(played_bytes)), "def605c0bd92a38281cb86fd9c20e36a794946999569e3a1f4131e1d0bba7c33");
-        let bytes = include_bytes!("../../configs/PL-release.json");
+        let bytes = include_bytes!("../../configs/PL-rc23-release.json");
         let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
         let defaults = serde_json::to_value(Config::default()).unwrap();
         assert!(!parse_runtime_config(bytes).unwrap().0.sim_sweep_any);
@@ -4101,9 +4101,56 @@ mod tests {
         assert_eq!(serde_json::to_value(rc16).unwrap(), expected,
                    "RC16 is RC15 with the three exact fight fixes and the cull explicitly off");
     }
+    // v1.1 ships PL-v11-4-cand as the compiled fallback: the RC23 fallback plus the v1.1 keys
+    // (the 2c ship keys and lag one on potears2 only, no 30 fps cap), with the frame report
+    // off as every release fallback since RC3. PL-rc23-release.json keeps the RC23 bytes.
+    #[test]
+    fn v11_release_fallback_is_the_4_cand_profile_without_the_frame_report() {
+        let parse = |bytes: &[u8]| {
+            let (c, rejected) = parse_runtime_config(bytes).unwrap();
+            assert!(rejected.is_none());
+            c.validate().unwrap();
+            serde_json::to_value(c).unwrap()
+        };
+        let release = parse(include_bytes!("../../configs/PL-release.json"));
+        let four = parse(include_bytes!("../../configs/PL-v11-4-cand.json"));
+        let c_ship = parse(include_bytes!("../../configs/PL-v11-2c-ship.json"));
+        let rc23 = parse(include_bytes!("../../configs/PL-rc23-release.json"));
+        let mut expected = four.clone();
+        assert_eq!(four["log_frame_time_every"], 10);
+        expected["log_frame_time_every"] = 0.into();
+        assert_eq!(release, expected, "the fallback is PL-v11-4-cand with the frame report off");
+        assert_eq!(release["sim_overlap"], true);
+        assert_eq!(release["sim_overlap_normal"], true);
+        assert_eq!(release["sim_overlap_maps"], serde_json::json!(["potears2"]));
+        for key in ["sim_overlap_live", "sim_overlap_cap_30", "diag_sim_timing"] {
+            assert!(release.get(key).is_none_or(|v| v == false), "the fallback never sets {key}");
+        }
+        assert_eq!(release["replay_play"], "");
+        assert_eq!(release["replay_record"], "");
+        let mut with_lag = c_ship.clone();
+        with_lag["log_frame_time_every"] = 0.into();
+        for key in ["sim_overlap", "sim_overlap_normal", "sim_overlap_maps"] {
+            assert!(c_ship.get(key).is_none(), "2c ship has lag off");
+            with_lag[key] = release[key].clone();
+        }
+        assert_eq!(release, with_lag, "the fallback is 2c ship plus only the three lag keys");
+        let mut from_rc23 = rc23.clone();
+        for key in ["gpu_skin_actors", "mover_shape_reuse", "gpu_skin_actor_maps", "actor_glow_subset",
+                    "actor_glow_subset_maps", "actor_lean_lights", "audio_voice_prefetch",
+                    "audio_named_prefetch", "eager_level_gpu", "nav_sweep_cache", "audio_player_prefetch",
+                    "sim_overlap", "sim_overlap_normal", "sim_overlap_maps"] {
+            assert_ne!(rc23.get(key), release.get(key), "{key} is new in v1.1");
+            match release.get(key) {
+                Some(value) => { from_rc23[key] = value.clone(); }
+                None => { from_rc23.as_object_mut().unwrap().remove(key); }
+            }
+        }
+        assert_eq!(release, from_rc23, "the fallback changes only the fourteen v1.1 keys against RC23");
+    }
     #[test]
     fn rc23_play_config_is_the_release_fallback_plus_the_measurement_keys() {
-        let release = parse_runtime_config(include_bytes!("../../configs/PL-release.json"))
+        let release = parse_runtime_config(include_bytes!("../../configs/PL-rc23-release.json"))
             .unwrap().0;
         let play = parse_runtime_config(include_bytes!("../../configs/PL-rc23-release-play.json"))
             .unwrap().0;
@@ -4596,10 +4643,11 @@ mod tests {
             assert!(config_log_lines(c)[0].contains("\"mover_shape_reuse\":"), "key missing from the printed record");
         }
         // The key arrived after every frozen era file: those stay valid unchanged
-        // and their omitted opt-in reads as an explicit off.
+        // and their omitted opt-in reads as an explicit off. v1.1 ships it (see
+        // v11_release_fallback_is_the_4_cand_profile_without_the_frame_report).
         for bytes in [&include_bytes!("../../configs/PL-rc20-release-play.json")[..],
                       &include_bytes!("../../configs/PL-rc17-release-play.json")[..],
-                      &include_bytes!("../../configs/PL-release.json")[..]] {
+                      &include_bytes!("../../configs/PL-rc23-release.json")[..]] {
             let (c, rejected) = parse_runtime_config(bytes).unwrap();
             assert!(rejected.is_none());
             assert!(!c.mover_shape_reuse, "a shipped config enables mover_shape_reuse");
@@ -5294,7 +5342,7 @@ mod tests {
     #[test]
     fn release_inputs_add_only_their_declared_keys_and_packages_add_their_replay_keys() {
         use sha2::{Digest, Sha256};
-        let release_bytes = include_bytes!("../../configs/PL-release.json");
+        let release_bytes = include_bytes!("../../configs/PL-rc23-release.json");
         let rc12_bytes = include_bytes!("../../configs/PL-rc12-release.json");
         let rc11_bytes = include_bytes!("../../configs/PL-rc11-release.json");
         let rc10_bytes = include_bytes!("../../configs/PL-rc10-release.json");
