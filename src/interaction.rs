@@ -263,6 +263,23 @@ impl Events {
     }
 }
 impl Interactions {
+    /// Every controller collision world built over this visit's map (`LevelController::static_worlds`).
+    pub(crate) fn static_worlds(&mut self, visit: &mut dyn FnMut(&mut World)) {
+        if let Some(pool) = &mut self.pool { pool.static_worlds(visit); }
+        if let Some(fortress) = &mut self.fortress { fortress.cinema.static_worlds(visit); }
+        if let Some(school) = &mut self.school { school.static_worlds(visit); }
+        for slot in &mut self.levels { slot.ctl.static_worlds(visit); }
+    }
+    /// A transition keeps these controllers alive for its rollback, but not their static
+    /// geometry: it goes with the outgoing level and `restore_static_worlds` rebuilds it.
+    pub fn release_static_worlds(&mut self) {
+        self.static_worlds(&mut World::release_static);
+    }
+    pub fn restore_static_worlds(&mut self, map: &Bsp) -> Result<()> {
+        let mut result = Ok(());
+        self.static_worlds(&mut |world| if result.is_ok() { result = world.restore_static(map); });
+        result
+    }
     pub fn loot_sources(&self) -> Vec<crate::loot::Source> {
         let mut out = self
             .encounters

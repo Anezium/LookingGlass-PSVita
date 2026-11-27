@@ -186,6 +186,10 @@ fn train(n: &str) -> Option<(usize, usize)> {
     None
 }
 impl Pool {
+    pub(crate) fn static_worlds(&mut self, visit: &mut dyn FnMut(&mut World)) {
+        visit(&mut self.cinema.camera_world);
+        visit(&mut self.cinema.arrival.rabbit_world);
+    }
     pub fn load(assets: &mut crate::assets::Assets, map: &Bsp) -> Result<Self> {
         let paths = (1..=4)
             .map(|i| Path::load(map, &format!("rideleaf{i}path")))

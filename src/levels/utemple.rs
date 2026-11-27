@@ -303,6 +303,9 @@ fn valid_event(n: &str) -> bool {
     )
 }
 impl LevelController for Temple {
+    fn static_worlds(&mut self, visit: &mut dyn FnMut(&mut crate::collision::World)) {
+        visit(&mut self.data.world);
+    }
     fn id(&self) -> &'static str {
         "utemple"
     }

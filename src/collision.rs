@@ -792,11 +792,15 @@ pub struct World {
     liquids: Vec<(i32, Hull)>,
     dynamic_liquids: Vec<Liquid>,
     static_geometry: std::sync::Arc<StaticGeometry>,
+    /// How a map world built its static geometry, so a released one can rebuild it.
+    static_source: Option<StaticSource>,
     pub brush_count: usize,
     pub patch_count: usize,
     pub min: Vec3,
     pub max: Vec3,
 }
+#[derive(Clone, Copy, Debug)]
+struct StaticSource { mask: i32, accelerate: bool, released: bool }
 
 /// Sight traces reused inside one `with_sight_reuse` scope. The scope holds a
 /// shared borrow of its World, so no geometry can be published while entries
@@ -1241,6 +1245,7 @@ impl World {
             brush_count,
             patch_count: 0,
             static_geometry,
+            static_source: None,
             min,
             max,
         }
@@ -1315,9 +1320,8 @@ impl World {
     pub fn actor_world(map: &Bsp) -> Result<Self> {
         Self::from_bsp_mask(map, 1 | 0x20000, true)
     }
-    fn from_bsp_mask(map: &Bsp, mask: i32, accelerate: bool) -> Result<Self> {
-        crate::phase_census::solid_publication();
-        let _r13_memory = crate::allocation_census::Scope::new(3);
+    /// The static hulls of `map` under `mask`, its liquids, and how many hulls are brushes.
+    fn map_hulls(map: &Bsp, mask: i32) -> Result<(Vec<Hull>, Vec<(i32, Hull)>, usize)> {
         let mut hulls = Vec::new();
         let mut liquids = Vec::new();
         for index in map.world_brushes.clone() {
@@ -1381,6 +1385,33 @@ impl World {
                 }
             }
         }
+        Ok((hulls, liquids, brush_count))
+    }
+    /// Drop this world's hold on its map's static geometry while the map is unloaded.
+    /// Until `restore_static` it answers static queries as an empty map. Every other
+    /// field (movers, supports, obstacles, liquids, traversal, caches) is kept.
+    pub(crate) fn release_static(&mut self) {
+        let Some(source) = self.static_source.as_mut().filter(|s| !s.released) else { return; };
+        source.released = true;
+        self.static_geometry = std::sync::Arc::new(StaticGeometry::with_acceleration(Vec::new(), None, false));
+    }
+    /// Rebuild a released static geometry from the same map. Hulls and acceleration are pure
+    /// functions of the map and mask, so the result (or the live geometry it shares) is
+    /// bit-identical to the one released.
+    pub(crate) fn restore_static(&mut self, map: &Bsp) -> Result<()> {
+        let Some(source) = self.static_source.filter(|s| s.released) else { return Ok(()); };
+        let _r13_memory = crate::allocation_census::Scope::new(3);
+        let (hulls, _, _) = Self::map_hulls(map, source.mask)?;
+        self.static_geometry = StaticGeometry::shared_or_built(hulls, source.accelerate);
+        self.static_source = Some(StaticSource { released: false, ..source });
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn static_released(&self) -> bool { self.static_source.is_some_and(|s| s.released) }
+    fn from_bsp_mask(map: &Bsp, mask: i32, accelerate: bool) -> Result<Self> {
+        crate::phase_census::solid_publication();
+        let _r13_memory = crate::allocation_census::Scope::new(3);
+        let (hulls, liquids, brush_count) = Self::map_hulls(map, mask)?;
         let patch_count = hulls.len() - brush_count;
         let static_geometry = StaticGeometry::shared_or_built(hulls, accelerate);
         Ok(Self {
@@ -1409,6 +1440,7 @@ impl World {
             liquids,
             dynamic_liquids: Vec::new(),
             static_geometry,
+            static_source: Some(StaticSource { mask, accelerate, released: false }),
             brush_count,
             patch_count,
             min: map.world_min,
@@ -2033,6 +2065,7 @@ impl World {
             brush_count: hulls.len(),
             patch_count: 0,
             static_geometry: std::sync::Arc::new(StaticGeometry::new(hulls, tree)),
+            static_source: None,
             min: Vec3::splat(-10000.),
             max: Vec3::splat(10000.),
         }

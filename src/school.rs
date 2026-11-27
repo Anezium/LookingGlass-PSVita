@@ -202,6 +202,9 @@ fn path(map: &Bsp, start: &str) -> Vec<Vec3> {
     result
 }
 impl School {
+    pub(crate) fn static_worlds(&mut self, visit: &mut dyn FnMut(&mut World)) {
+        if let Some(world) = &mut self.cinema_world { visit(world); }
+    }
     pub fn sound_state(
         &self,
         loops: &mut Vec<crate::audio::LoopCue>,
