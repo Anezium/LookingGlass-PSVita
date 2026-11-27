@@ -290,6 +290,13 @@ fn lean_cache<'a>(program: Program, lite: &'a mut Option<Lite>, world: &'a mut c
     }
 }
 
+/// Whether `SkyRoom::new` packs the static non-sky batches: the key is on and the map has a sky
+/// camera. Until then the retained renderer keeps their source geometry.
+pub(super) fn reads_room_batches(scene: &Scene) -> bool {
+    let c = config();
+    c.sky_live && c.sky && !c.authored_sky && (scene.sky_origin.is_some() || !scene.sky_candidates.is_empty())
+}
+
 impl SkyRoom {
     /// `None` when the key is off or the map has no sky camera. Buffers, pipelines and programs
     /// are registered with `resources`, so a failed construction releases them. `shader` is the
@@ -309,6 +316,7 @@ impl SkyRoom {
             && b.motion.is_none() && !b.deforms.iter().any(Deform::moves_vertices)
             && !b.layers.iter().all(|l| l.spec.blend == Blend::Invisible)).collect::<Vec<_>>();
         if cameras.is_empty() && shaded.is_empty() { return None; }
+        assert!(cameras.is_empty() || reads_room_batches(scene), "sky room reads batches the renderer released");
         if cameras.len() > MAX_SETS {
             println!("[lg/sky-live] warning sky_cameras={} capped_at={MAX_SETS}", cameras.len());
             cameras.truncate(MAX_SETS);
