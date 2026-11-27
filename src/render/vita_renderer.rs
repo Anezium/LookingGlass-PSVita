@@ -1504,19 +1504,15 @@ impl Pvs {
     }
     fn compile(count: usize, list: impl Fn(Option<usize>) -> Lists) -> Self {
         let unknown = Arc::new(list(None));
-        let mut intern = BTreeMap::new();
+        // Interned by the shared list itself, so each distinct list is held once, not also as a key.
+        let mut intern: std::collections::BTreeSet<Arc<Lists>> = std::collections::BTreeSet::new();
         let clusters = (0..count)
             .map(|c| {
                 let l = list(Some(c));
-                intern
-                    .entry(l)
-                    .or_insert_with_key(|l| {
-                        Arc::new(Lists {
-                            opaque: l.opaque.clone(),
-                            alpha: l.alpha.clone(),
-                        })
-                    })
-                    .clone()
+                if let Some(shared) = intern.get(&l) { return shared.clone(); }
+                let shared = Arc::new(Lists { opaque: l.opaque.clone(), alpha: l.alpha.clone() });
+                intern.insert(shared.clone());
+                shared
             })
             .collect();
         Self { clusters, unknown }
