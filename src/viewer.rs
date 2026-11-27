@@ -1579,10 +1579,11 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 let map = $map;
                 let visit = $visit.id();
                 let reserved = layout_config.sim_overlap_maps.iter().any(|name| name == map);
-                crate::character::skinning::overlap::park_cpu1(reserved);
+                let ([skin0, skin1], repinned) = crate::character::skinning::overlap::park_cpu1(reserved);
                 reserved_visit = reserved.then_some(visit);
                 let workers = if reserved { 1 } else { 2 };
                 eprintln!("[lg/sim-layout] map={map} visit={visit} active_skin_workers={workers}");
+                eprintln!("[lg/skin-layout] map={map} visit={visit} skin-0={skin0:#x} skin-1={skin1:#x} repinned={repinned}");
             }
         }};
     }
@@ -2541,6 +2542,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             || reserved_visit == Some(level_art.snapshot_visit.id()));
         #[cfg(feature = "native_timing")]
         let lag_map = lag_map && timing.recorder.is_none();
+        // An unlisted map steps serially: no clock sample, failure scan or epoch copy for lag.
+        let step_overlap = sim_overlap && (lag_maps.is_empty() || lag_map);
         debug_assert!(audio_step.ops.is_empty());
         // The tape oracle uses release builds. Check the same invariant there.
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
@@ -2744,7 +2747,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             || input.capture_step(
                 replay.as_ref().filter(|r| r.running()).map_or(frame, |r| r.current_step() - 1),
                 physical_input && window_focused() && !bench && !route_running,
-                sim_overlap,
+                step_overlap,
             ),
         );
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
@@ -2763,7 +2766,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let head_f3 = step_input.frame.key(KeyCode::F3, true);
         let head_console_key = step_input.frame.key(KeyCode::GraveAccent, true);
         // Live epochs keep the head sample for a retaining head; nothing else reads it after apply.
-        let epoch_sample = lag_epochs.enabled().then(|| step_input.clone());
+        let epoch_sample = (lag_map && lag_epochs.enabled()).then(|| step_input.clone());
         // The serial owner only needs the clock sampled immediately before the step; a latched
         // epoch reuses the clock its first head ran on.
         let mut step_clock = step_input.clock;
@@ -3970,7 +3973,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         let step_survey = r13_survey.is_some();
         #[cfg(not(target_os = "vita"))]
         let step_survey = false;
-        let dispatch_failures = (sim_overlap || sim_audit.diagnose()).then(|| [
+        let dispatch_failures = (step_overlap || sim_audit.diagnose()).then(|| [
             ("gameplay", !gameplay),
             ("first_replay_step", first_replay_step),
             ("load_probe", step_load_probe),
@@ -3999,7 +4002,6 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
         ]);
         let dispatch_failures = dispatch_failures.as_ref().map_or(&[][..], |failures| &failures[..]);
         let w0_eligible = !dispatch_failures.iter().any(|&(_, failed)| failed);
-        let step_overlap = sim_overlap && (lag_maps.is_empty() || lag_map);
         let dispatchable = step_overlap && w0_eligible;
         let lag_dispatch = lag_map && dispatchable;
         if !lag_dispatch {

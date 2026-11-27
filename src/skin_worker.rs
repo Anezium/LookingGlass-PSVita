@@ -4,13 +4,18 @@ pub(crate) fn mask(worker: usize) -> i32 {
     #[cfg(feature = "vita_renderer")]
     if crate::render::vita_renderer::config().sim_overlap_normal {
         // Worker zero remains eligible when the CPU1 worker is parked.
-        return [0x40000, 0x20000][worker];
+        return layout_mask(worker, true);
     }
     if crate::spike_log::cpu1_reserved() {
         0x40000
     } else {
         [0x20000, 0x40000][worker]
     }
+}
+/// The per-map masks with `sim_overlap_normal`. A listed map parks the CPU1 worker, so worker zero
+/// runs on CPU2; an unlisted map keeps the layout without the key, both workers active.
+pub(crate) fn layout_mask(worker: usize, parked: bool) -> i32 {
+    if parked { [0x40000, 0x20000][worker] } else { [0x20000, 0x40000][worker] }
 }
 
 #[cfg(target_os = "vita")]
@@ -86,11 +91,10 @@ pub(crate) fn startup_inventory(role: &str) {
         info.affinity, info.priority);
 }
 /// Kernel readback is deliberately used instead of pthread_getaffinity_np.
-pub(crate) fn pin(worker: usize, probe: bool) {
+pub(crate) fn pin(worker: usize, requested: i32, probe: bool) {
     #[cfg(target_os = "vita")]
     unsafe {
         let id = sceKernelGetThreadId();
-        let requested = mask(worker);
         let rc = sceKernelChangeThreadCpuAffinityMask(id, requested);
         if rc >= 0 {
             startup_inventory(if worker == 0 { "skin-0" } else { "skin-1" });
@@ -106,10 +110,22 @@ pub(crate) fn pin(worker: usize, probe: bool) {
     #[cfg(not(target_os = "vita"))]
     if probe {
         eprintln!(
-            "[lg/worker-probe] worker={worker} requested={:#x} host_affinity=unavailable",
-            mask(worker)
+            "[lg/worker-probe] worker={worker} requested={requested:#x} host_affinity=unavailable"
         );
     }
+}
+/// Moves the calling skin worker to `mask`, the call its startup pin makes. Returns the kernel
+/// readback, or the request off the console.
+fn repin_current(mask: i32) -> i32 {
+    #[cfg(target_os = "vita")]
+    unsafe {
+        let rc = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), mask);
+        assert!(rc >= 0, "skin worker affinity failed: {rc:#x}");
+        let (_, rc, info) = thread_info();
+        return if rc >= 0 { info.affinity } else { rc };
+    }
+    #[cfg(not(target_os = "vita"))]
+    mask
 }
 /// Reserve CPU0 for the game thread when both remaining application cores skin.
 pub(crate) fn pin_game(probe: bool) {
@@ -192,6 +208,8 @@ fn spin_until(us: u32, done: impl Fn() -> bool) -> bool {
 pub(crate) struct Worker {
     shared: Arc<Shared>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// The mask this worker last requested for itself.
+    mask: i32,
 }
 impl Worker {
     pub(crate) fn new(index: usize, probe: bool) -> Self {
@@ -213,11 +231,12 @@ impl Worker {
             spin_us,
         });
         let other = shared.clone();
+        let requested = mask(index);
         let handle = std::thread::Builder::new()
             .name(format!("skin-persistent-{index}"))
             .stack_size(STACK_BYTES)
             .spawn(move || {
-                let pin_result = std::panic::catch_unwind(|| pin(index, probe));
+                let pin_result = std::panic::catch_unwind(|| pin(index, requested, probe));
                 // Ready acknowledgement proves pinning finished before the first dispatch.
                 let mut s = other.state.lock().unwrap();
                 s.result.ns = 1;
@@ -265,6 +284,7 @@ impl Worker {
         let mut worker = Self {
             shared,
             handle: Some(handle),
+            mask: requested,
         };
         let mut s = worker.shared.state.lock().unwrap();
         while s.result.ns == 0 {
@@ -288,6 +308,16 @@ impl Worker {
         if self.shared.spin_us > 0 { drop(s); }
         self.shared.work_ready.store(true, Ordering::Release);
         self.shared.wake.notify_one();
+    }
+    pub(crate) fn affinity(&self) -> i32 { self.mask }
+    /// Moves this idle worker to `mask` from its own thread. None when it is already there,
+    /// otherwise the kernel readback (the request off the console).
+    pub(crate) fn repin(&mut self, mask: i32) -> Option<i32> {
+        if self.mask == mask { return None; }
+        let mut effective = mask;
+        self.execute(|| effective = repin_current(mask));
+        self.mask = mask;
+        Some(effective)
     }
     /// No job running, by the hint. False costs a later check, never a wrong start.
     pub(crate) fn idle(&self) -> bool { !self.shared.busy_hint.load(Ordering::Acquire) }
@@ -435,6 +465,20 @@ mod persistent_tests {
             Worker::pair(&mut a, &mut b, || x += i, || y += 2 * i);
         }
         assert_eq!((x, y), (499 * 500 / 2, 499 * 500));
+    }
+    #[test]
+    fn repin_moves_an_idle_worker_once_and_keeps_it_working() {
+        assert_eq!([layout_mask(0, true), layout_mask(1, true)], [0x40000, 0x20000]);
+        assert_eq!([layout_mask(0, false), layout_mask(1, false)], [0x20000, 0x40000]);
+        let mut worker = Worker::new(0, false);
+        let start = worker.affinity();
+        let other = if start == 0x20000 { 0x40000 } else { 0x20000 };
+        assert_eq!(worker.repin(start), None);
+        assert_eq!(worker.repin(other), Some(other));
+        assert_eq!((worker.affinity(), worker.repin(other)), (other, None));
+        let mut value = 0;
+        worker.execute(|| value = 3);
+        assert_eq!(value, 3);
     }
     #[test]
     fn spin_until_returns_what_it_saw() {
