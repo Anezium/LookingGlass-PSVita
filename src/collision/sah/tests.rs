@@ -332,3 +332,38 @@ fn transition_releases_pool_static_worlds_and_rollback_restores_them_bit_identic
     assert_eq!(after, before.into_iter().map(|b| (b.0, b.2)).collect::<Vec<_>>());
     interactions.restore_static_worlds(&map).unwrap();
 }
+/// Live, non-empty static geometries registered by `shared_or_built` on this thread.
+fn live_geometries() -> Vec<std::sync::Arc<StaticGeometry>> {
+    crate::collision::LIVE_GEOMETRY.with(|live| live.borrow().iter().filter_map(std::sync::Weak::upgrade)
+        .filter(|g| !g.hulls.is_empty()).collect())
+}
+#[test]
+fn every_campaign_visit_releases_and_restores_all_controller_static_worlds() {
+    let _reset = SwitchReset;
+    let Some(mut assets) = shipped_assets() else { return; };
+    crate::collision::set_sah_enabled_for_test(Some(true));
+    crate::collision::set_geometry_share_for_test(Some(true));
+    let ptrs = |v: &[std::sync::Arc<StaticGeometry>]| v.iter().map(|g| std::sync::Arc::as_ptr(g) as usize).collect::<Vec<_>>();
+    let mut holders = 0;
+    for &(name, entry) in crate::campaign::route() {
+        let before = ptrs(&live_geometries());
+        let crate::campaign::Loaded { map, world, mut interactions, .. } = crate::campaign::load_visit(
+            &mut assets, name, entry, None, Default::default(), true).unwrap();
+        let mut probes = Vec::new();
+        interactions.static_worlds(&mut |w| probes.push(probe(w)));
+        holders += usize::from(!probes.is_empty());
+        drop(world);
+        interactions.release_static_worlds();
+        // A controller World missing from `static_worlds` keeps its geometry alive here.
+        let leaked: Vec<_> = live_geometries().into_iter().filter(|g| !before.contains(&(std::sync::Arc::as_ptr(g) as usize)))
+            .map(|g| g.hulls.len()).collect();
+        assert!(leaked.is_empty(), "{name} {entry:?}: static geometry survives the release, hulls {leaked:?}");
+        let world = World::from_bsp(&map).unwrap();
+        interactions.restore_static_worlds(&map).unwrap();
+        let mut after = Vec::new();
+        interactions.static_worlds(&mut |w| { assert!(!w.static_released()); after.push(probe(w)); });
+        assert_eq!(after, probes, "{name} {entry:?}: restored sweeps differ");
+        drop((world, interactions));
+    }
+    assert!(holders >= 10, "only {holders} visits hold controller worlds");
+}
