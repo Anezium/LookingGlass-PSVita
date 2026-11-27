@@ -217,15 +217,16 @@ pub static SCE_USER_MAIN_THREAD_STACK_SIZE: u32 = 8 * 1024 * 1024;
 #[cfg(target_os = "vita")]
 #[used]
 #[unsafe(export_name = "_newlib_heap_size_user")]
-pub static NEWLIB_HEAP_SIZE_USER: u32 = 192 * 1024 * 1024;
+pub static NEWLIB_HEAP_SIZE_USER: u32 = 208 * 1024 * 1024;
 
 #[cfg(target_os = "vita")]
 fn main() {
     #[cfg(feature="vita_renderer")]
     if render::vita_renderer::config().worker_probe { skin_worker::inventory("entry", None); }
     // Keep startup on a small main frame; the game gets its own explicit stack.
-    // Experiment: both stacks (8 MiB each) plus newlib (192 MiB) request 208 MiB.
-    // vitaGL uses the remaining free memory through its existing threshold.
+    // Both stacks (8 MiB each) plus newlib (208 MiB) request 224 MiB.
+    // vitaGL uses the remaining free memory through its existing threshold, 16 MiB
+    // less than with the former 192 MiB heap (the dialog threshold is unchanged).
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(app_main)

@@ -85,7 +85,7 @@ fn released() {
     reset(true,false);OUTPUT.store(0,Relaxed);PAYLOAD_ERRNO.store(12,Relaxed);
     check(2,[usize::MAX,2,0],kernel_alloc::__wrap_calloc(usize::MAX,2));
     assert_eq!(LAST_SAMPLE_PAYLOAD.load(Relaxed),2);assert_eq!(SAMPLES.load(Relaxed),1);
-    assert_eq!(allocation_census::peak::bounds(),[128,192*1024*1024]);released();
+    assert_eq!(allocation_census::peak::bounds(),[128,208*1024*1024]);released();
     check(7,[0,usize::MAX,2],kernel_alloc::__wrap__calloc_r(core::ptr::null_mut(),usize::MAX,2));released();
 }}
 #[test] fn nesting_never_releases_outer_owner_and_contention_never_waits() {unsafe {
@@ -98,9 +98,9 @@ fn released() {
         THREAD_ID.with(|id|id.set(22));kernel_alloc::__wrap_malloc(49);
     }).join().unwrap();
     assert_eq!(allocation_census::peak::fallbacks(),1);
-    assert_eq!(allocation_census::peak::bounds()[1],192*1024*1024);
+    assert_eq!(allocation_census::peak::bounds()[1],208*1024*1024);
     assert_eq!(SAMPLES.load(Relaxed),0);drop(outer);
-    assert_eq!(SAMPLES.load(Relaxed),1);assert_eq!(allocation_census::peak::bounds()[1],192*1024*1024);
+    assert_eq!(SAMPLES.load(Relaxed),1);assert_eq!(allocation_census::peak::bounds()[1],208*1024*1024);
     THREAD_ID.with(|id|id.set(22));let guard=allocation_census::peak::Guard::enter(1,0,true);drop(guard);
     assert_eq!(allocation_census::peak::fallbacks(),1);
 }}
@@ -116,7 +116,7 @@ fn released() {
     assert!(unwind.is_err());released();
     THREAD_ID.with(|id|id.set(0));drop(allocation_census::peak::Guard::enter(1,0,true));
     assert_eq!(allocation_census::peak::fallbacks(),1);
-    assert_eq!(allocation_census::peak::bounds()[1],192*1024*1024);
+    assert_eq!(allocation_census::peak::bounds()[1],208*1024*1024);
 }
 #[test] fn transition_sampling_and_kernel_count_still_wrap_matching_payload() {unsafe {
     reset(true,true);kernel_alloc::begin();

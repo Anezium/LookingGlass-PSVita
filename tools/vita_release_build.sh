@@ -28,7 +28,7 @@ set -euo pipefail
 TOOLCHAIN=nightly-2026-10-11
 CARGO_VITA_VERSION=0.2.2
 FEATURES=native_timing,vita_renderer,frame_total_only
-HEAP_BYTES=$((192 * 1024 * 1024))
+HEAP_BYTES=$((208 * 1024 * 1024))
 APP_VER=01.00
 # vdpm package and archive name of each C library linked statically.
 SDK_LIBRARIES="vitaGL:libvitaGL.a vitaShaRK:libvitashark.a SceShaccCgExt:libSceShaccCgExt.a libmathneon:libmathneon.a"

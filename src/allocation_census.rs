@@ -98,7 +98,7 @@ pub(crate) fn snapshot(label:&str) {
         "scope_anomalies":ANOMALIES.load(Relaxed),"residual_bytes":used as i64-baseline as i64-attributed,
         "peak_contention_fallbacks":peak_fallbacks(),
         "scope":"all-thread aggregate of signed process-heap brackets; concurrent overlapping brackets may double-count drift; residual is signed closure, not unowned live bytes; not live object ownership; nonzero anomalies invalidate attribution",
-        "peak_bounds":peak_bounds(),"heap_hard_upper_bound_bytes":192*1024*1024,"transient_peak":"transition allocator/phase samples are LOWER bounds; 192 MiB fixed newlib heap is the unconditional upper bound"}));
+        "peak_bounds":peak_bounds(),"heap_hard_upper_bound_bytes":208*1024*1024,"transient_peak":"transition allocator/phase samples are LOWER bounds; 208 MiB fixed newlib heap is the unconditional upper bound"}));
 }
 pub(crate) fn payload(label:&str,fields:serde_json::Value) {
     if enabled(){println!("[lg/r13b-memory] {}",serde_json::json!({"event":"payload","label":label,"fields":fields}));}
@@ -170,7 +170,7 @@ pub(crate) mod peak {
     static UPPER:AtomicUsize=AtomicUsize::new(0);
     static FALLBACKS:AtomicUsize=AtomicUsize::new(0);
     pub fn start(){let u=used();BASE.store(u,Relaxed);LOWER.store(u,Relaxed);UPPER.store(u,Relaxed);}
-    pub fn bounds()->[usize;2] {[LOWER.load(Relaxed),UPPER.load(Relaxed).min(192*1024*1024)]}
+    pub fn bounds()->[usize;2] {[LOWER.load(Relaxed),UPPER.load(Relaxed).min(208*1024*1024)]}
     pub fn fallbacks()->usize {FALLBACKS.load(Relaxed)}
     pub struct Guard {active:bool, sample:bool, nested:bool}
     impl Guard {
@@ -189,7 +189,7 @@ pub(crate) mod peak {
                 Some(false)=>return Self{active:false,sample:false,nested:true},
                 // Never introduce lock-order inversion with newlib reent or
                 // allocator locks. This bound stays latched for the run.
-                None=>{FALLBACKS.fetch_add(1,Relaxed);UPPER.store(192*1024*1024,Relaxed);
+                None=>{FALLBACKS.fetch_add(1,Relaxed);UPPER.store(208*1024*1024,Relaxed);
                     return Self{active:false,sample:false,nested:false};}
             }
             let sample=allocation && (request>=65536 || CALLS.fetch_add(1,Relaxed)%128==0);

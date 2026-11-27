@@ -47,7 +47,7 @@ PINNED_FILES = {
     "examples/transition_texture_lifetime.rs": "8a5bca77466dcd7ded278701f0e0a176118bb8379af71c68021883c6b0d93768",
     "src/frame_total_gl_names.txt": "662e07e8c1886b29626caa105e9d84d25efaec21ad7f61bf5aedacc909aaf6d4",
     "tests/native_allocator_observer.py": "f465d7592afa36fa4b61454b2b18f2bc42afd7d28f6cdfc6deeda27166b04818",
-    "tests/native_allocator_observer.rs.in": "9421c3afc5cf45f208a21defd73434551a7b0826ba25091d8f1800a699683218",
+    "tests/native_allocator_observer.rs.in": "44823847732487870e241ea408528c0507ee118ac9f0e4bbdfd0e3e94f46552a",
     # Reviewed runtime and measurement configurations, one entry per preset.
     "configs/PL-a2-record.json": "6b8f7fb81974848e2645bdd69b6d02ae6c37c4363b3e6a62b95d35696c20fffb",
     "configs/PL-a2-replay.json": "3ab0fd67300807918873724f9562097d89ff34d15e5967a8bf1560d0a08de1c4",
@@ -270,7 +270,7 @@ PINNED_FILES = {
     "tools/vita_licenses/vitaGL-COPYING": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
     "tools/vita_licenses/vitaGL-COPYING.LESSER": "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118",
     "tools/vita_licenses/vitaShaRK-LICENSE": "6557adc4bc1d59232e27567a185dd70cf2ecca3154018b0be61ea29cf9e814e2",
-    "tools/vita_release_build.sh": "1014c938120c6069479f1a2b41f0c24efd224970884c29660f48b2134341a2f1",
+    "tools/vita_release_build.sh": "10fd8389b2dcb2694dc2637036204c77e246504f7bae91c51ca42d66c661b52f",
     # Vita package metadata and original LiveArea art.
     "vita/sce_sys/icon0.png": "87fecbae90a292eedd79da63c552151a41b6ef6e76923fed53a24560de103e6a",
     "vita/sce_sys/livearea/contents/bg.png": "2d2480e5e23fd268a88ed36823837e7ee59afa9b9f193cafa78b24d2f1e13234",
