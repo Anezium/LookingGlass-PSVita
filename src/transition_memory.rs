@@ -21,6 +21,7 @@ fn sample() -> Snapshot {
         extern "C" { fn mallinfo() -> MallInfo; fn vglMemFree(kind: i32) -> usize; }
         unsafe {
             let h = mallinfo();
+            vgl_min::note(vglMemFree(1), vglMemFree(0), vglMemFree(2));
             Snapshot { heap_used: Some(h.uordblks), heap_free: Some(h.fordblks), heap_arena: Some(h.arena),
                 vgl_ram_free: Some(vglMemFree(1)), vgl_vram_free: Some(vglMemFree(0)), vgl_phycont_free: Some(vglMemFree(2)) }
         }
@@ -29,6 +30,57 @@ fn sample() -> Snapshot {
     Snapshot { heap_used: Some(crate::kernel_alloc::live_bytes()), heap_free: None, heap_arena: None,
         vgl_ram_free: None, vgl_vram_free: None, vgl_phycont_free: None }
 }
+/// Running minima of vitaGL free memory (RAM, VRAM, phycont) over one level window:
+/// from one transition begin to the next, so a window covers the load and the play of
+/// the level it is reported for. Fed by `frame()` and the boundary snapshots, both on
+/// the game thread only, so plain loads and stores are enough.
+#[cfg(any(target_os = "vita", test))]
+mod vgl_min {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    static RAM: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static VRAM: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static PHYCONT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static FRAMES: AtomicUsize = AtomicUsize::new(0);
+    fn lower(slot: &AtomicUsize, value: usize) {
+        if value < slot.load(Relaxed) { slot.store(value, Relaxed); }
+    }
+    #[inline]
+    pub(super) fn note(ram: usize, vram: usize, phycont: usize) {
+        lower(&RAM, ram); lower(&VRAM, vram); lower(&PHYCONT, phycont);
+    }
+    #[inline]
+    pub(super) fn frame(ram: usize, vram: usize, phycont: usize) {
+        note(ram, vram, phycont);
+        FRAMES.store(FRAMES.load(Relaxed).wrapping_add(1), Relaxed);
+    }
+    /// Close the current window and start the next one.
+    pub(super) fn take() -> serde_json::Value {
+        let read = |slot: &AtomicUsize| Some(slot.swap(usize::MAX, Relaxed)).filter(|&v| v != usize::MAX);
+        serde_json::json!({"vgl_ram_min": read(&RAM), "vgl_vram_min": read(&VRAM),
+            "vgl_phycont_min": read(&PHYCONT), "vgl_min_frames": FRAMES.swap(0, Relaxed)})
+    }
+}
+/// Once per game-thread frame on the Vita. `vglMemFree` (vitaGL r1488 `2bdbe89`) is a
+/// bounds check and one load from vitaGL's pool counter array, so three calls cost
+/// nanoseconds. Host builds compile this to nothing.
+#[cfg(target_os = "vita")]
+#[inline]
+pub(crate) fn frame() {
+    extern "C" { fn vglMemFree(kind: i32) -> usize; }
+    unsafe { vgl_min::frame(vglMemFree(1), vglMemFree(0), vglMemFree(2)); }
+}
+#[cfg(not(target_os = "vita"))]
+#[inline(always)]
+pub(crate) fn frame() {}
+#[cfg(target_os = "vita")]
+fn with_vgl_min(mut record: serde_json::Value, min: &Option<serde_json::Value>) -> serde_json::Value {
+    if let (Some(fields), Some(target)) = (min.as_ref().and_then(|m| m.as_object()), record.as_object_mut()) {
+        target.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    record
+}
+#[cfg(not(target_os = "vita"))]
+fn with_vgl_min(record: serde_json::Value, _: &Option<serde_json::Value>) -> serde_json::Value { record }
 // Allocation observers need only mallinfo. Query vitaGL's unsynchronized pool
 // counters at the main-thread boundary snapshots, never on allocating workers.
 #[cfg(target_os = "vita")]
@@ -66,6 +118,8 @@ pub(crate) fn allocation(size: usize) {
 struct Record {
     kind: String, from: String, to: String, before: Snapshot,
     released: Option<Snapshot>, finished: bool,
+    /// vitaGL free-memory minima of the window that ends at this begin: the level being left.
+    left_vgl_min: Option<serde_json::Value>,
 }
 thread_local! {
     static CURRENT: std::cell::RefCell<std::rc::Weak<std::cell::RefCell<Record>>> = Default::default();
@@ -85,15 +139,19 @@ impl Transition {
             }
         });
         let before = sample();
+        #[cfg(target_os = "vita")]
+        let left_vgl_min = Some(vgl_min::take());
+        #[cfg(not(target_os = "vita"))]
+        let left_vgl_min = None;
         PEAK.store(before.heap_used.unwrap_or(0), Relaxed);
         PEAK_ARENA.store(before.heap_arena.unwrap_or(0), Relaxed);
         ALLOCATIONS.store(0, Relaxed);
         // A begin record survives a failure inside destination construction.
-        eprintln!("[lg/transition-memory] {}", serde_json::json!({
-            "event":"begin", "kind":kind,"from":from,"to":to,"before":before}));
+        eprintln!("[lg/transition-memory] {}", with_vgl_min(serde_json::json!({
+            "event":"begin", "kind":kind,"from":from,"to":to,"before":before}), &left_vgl_min));
         let result = Self(std::rc::Rc::new(std::cell::RefCell::new(Record {
             kind: kind.into(), from: from.into(), to: to.into(), before,
-            released: None, finished: false })));
+            released: None, finished: false, left_vgl_min })));
         CURRENT.with(|slot| *slot.borrow_mut() = std::rc::Rc::downgrade(&result.0));
         #[cfg(not(target_os="vita"))]
         crate::kernel_alloc::transition_begin();
@@ -114,12 +172,12 @@ impl Record {
         let census = Some(crate::kernel_alloc::transition_finish());
         #[cfg(target_os="vita")]
         let census: Option<[usize;4]> = None;
-        eprintln!("[lg/transition-memory] {}", serde_json::json!({
+        eprintln!("[lg/transition-memory] {}", with_vgl_min(serde_json::json!({
             "event":"end", "kind":self.kind,"from":self.from,"to":self.to,"success":success,
             "before":self.before,"released":self.released,"after":after,
             "peak_heap_used":PEAK.load(Relaxed),"peak_heap_arena":PEAK_ARENA.load(Relaxed),
             "peak_kind":if cfg!(target_os="vita") {"sampled-newlib"} else {"host-rust-requests"},
-            "host_requests_and_newlib32_upper_bound":census}));
+            "host_requests_and_newlib32_upper_bound":census}), &self.left_vgl_min));
         self.finished = true;
     }
 }
@@ -310,5 +368,17 @@ mod tests {
         assert!(!inner.0.borrow().finished);
         inner.finish(true);
         assert!(!ACTIVE.load(Relaxed));
+    }
+    #[test]
+    fn vgl_minima_close_one_window_per_take() {
+        use super::vgl_min;
+        vgl_min::take();
+        vgl_min::frame(30, 20, 10);
+        vgl_min::frame(25, 40, 12);
+        vgl_min::note(28, 18, 11);
+        let w = vgl_min::take();
+        assert_eq!(w, serde_json::json!({"vgl_ram_min":25,"vgl_vram_min":18,"vgl_phycont_min":10,"vgl_min_frames":2}));
+        let empty = vgl_min::take();
+        assert_eq!(empty, serde_json::json!({"vgl_ram_min":null,"vgl_vram_min":null,"vgl_phycont_min":null,"vgl_min_frames":0}));
     }
 }

@@ -5910,6 +5910,7 @@ interactions
         crate::replay::input::epoch_taps::advance();
         #[cfg(target_os = "vita")]
         sim_trace.display_after_swap(display);
+        crate::transition_memory::frame();
         sim_trace.owner(present_stamp, sim_timing::Scope::Present, None, present_started);
         sim_trace.owner(present_stamp, sim_timing::Scope::InputToPresent, None, input_started);
         sim_audit.event("present", present_stamp);
