@@ -188,6 +188,9 @@ pub struct Data {
     cave_clearance: Vec<f32>,
 }
 impl Data {
+    pub(crate) fn static_worlds(&mut self, visit: &mut dyn FnMut(&mut World)) {
+        visit(&mut self.camera_world);
+    }
     pub fn load(assets: &mut Assets, map: &Bsp) -> Result<Self> {
         let mut tracks = BTreeMap::new();
         for name in [

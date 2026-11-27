@@ -386,6 +386,9 @@ impl Encounter {
 }
 
 impl LevelController for Encounter {
+    fn static_worlds(&mut self, visit: &mut dyn FnMut(&mut crate::collision::World)) {
+        visit(&mut self.data.arena);
+    }
     fn particles(&self, steam: &mut crate::particles::SteamSim) {
         // The reward scene draws this altar itself. Its placed copy must never
         // emit as ambient scenery, including before the reward and after pickup.

@@ -190,7 +190,7 @@ type RebuiltScene = (LevelArt, crate::npc::Npcs, crate::particles::Steam, Loaded
 async fn rebuild_outgoing(
     assets: &mut Assets,
     checkpoint: &Game,
-    interactions: &Interactions,
+    interactions: &mut Interactions,
     difficulty: crate::powerups::Difficulty,
     options: &Options,
     reload_alice: bool,
@@ -214,6 +214,7 @@ async fn rebuild_outgoing(
                 let Loaded { mut scene, mut world } = Scene::load(assets, &level.map)?;
                 // The recovered scene still owns the only map handle before cast loading.
                 scene.map_mut().difficulty = difficulty;
+                interactions.restore_static_worlds(&scene.map)?;
                 interactions.sync(&mut world);
                 let mut cast = crate::npc::Npcs::load(assets, &scene.map, &level.map,
                     level.entry.as_deref(), options.npc_preview, options.combat_preview)?;
@@ -2128,6 +2129,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             let resources = (level_art, npcs, steam, Loaded { scene, world });
             if crate::transition_memory::legacy_overlap() { Some(resources) } else {
                 drop(resources);
+                interactions.release_static_worlds();
                 audio.release_scene();
                 None
             }
@@ -2144,7 +2146,7 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
                 // Dead, airborne and scripted frames must not pass save validators
                 // or migrate/reset their untouched live controllers and clocks.
                 let Some(rebuilt) = owner_yield!($guards, Box::pin(rebuild_outgoing(&mut assets, &$checkpoint,
-                    &interactions, stats.difficulty, &options, $reload_alice,
+                    &mut interactions, stats.difficulty, &options, $reload_alice,
                     &mut escape_menu, &ui, &preferences))) else {
                     mouse_look.release();
                     // Transition's drop guard closes this operation as failed.

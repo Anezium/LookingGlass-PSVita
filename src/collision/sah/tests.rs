@@ -265,3 +265,70 @@ fn unordered_boolean_traversal_stops_before_collecting_a_dense_query() {
     let expected = g.legacy_trace(a, b, h, &q, &mut Counts::default());
     assert!(expected.start_solid || expected.fraction < 1.);
 }
+
+fn shipped_assets() -> Option<crate::assets::Assets> {
+    let dir = std::env::var_os("LOOKING_GLASS_TEST_DATA").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/Users/anezium/vita-work/alice-data/Alice1/bin/base".into());
+    if !dir.is_dir() {
+        println!("skipping shipped map case: {} absent", dir.display());
+        return None;
+    }
+    Some(crate::assets::Assets::open(&dir).unwrap())
+}
+struct SwitchReset;
+impl Drop for SwitchReset { fn drop(&mut self) {
+    crate::collision::set_sah_enabled_for_test(None);
+    crate::collision::set_geometry_share_for_test(None);
+} }
+#[test]
+fn natural_arrival_footing_on_shared_static_matches_legacy_on_hedge3() {
+    let _reset = SwitchReset;
+    let Some(mut assets) = shipped_assets() else { return; };
+    crate::collision::set_sah_enabled_for_test(Some(true));
+    let map = crate::bsp::Bsp::parse(&assets.read("maps/hedge3.bsp").unwrap()).unwrap();
+    let main = World::from_bsp(&map).unwrap();
+    let pose = |(eye, yaw): (Vec3, f32)| (eye.to_array().map(f32::to_bits), yaw.to_bits());
+    for entry in [None, Some("hedge3_start1")] {
+        let legacy = crate::interaction::spawn_with_static(&map, entry, None);
+        let shared = crate::interaction::spawn_with_static(&map, entry, Some(main.audio_geometry()));
+        assert_eq!(pose(legacy), pose(shared), "{entry:?}");
+    }
+}
+/// Deterministic sweeps across a world's bounds, as trace bits.
+fn probe(world: &World) -> Vec<[u32; 6]> {
+    let span = world.max - world.min;
+    let at = |i: u32| world.min + span * Vec3::new(
+        (i * 37 % 101) as f32 / 101., (i * 53 % 103) as f32 / 103., (i * 71 % 107) as f32 / 107.);
+    (0..96).flat_map(|i| [Vec3::splat(0.5), PLAYER_HALF].map(|half| bits(world.sweep(at(i), at(i + 1), half))))
+        .collect()
+}
+#[test]
+fn transition_releases_pool_static_worlds_and_rollback_restores_them_bit_identical() {
+    let _reset = SwitchReset;
+    let Some(mut assets) = shipped_assets() else { return; };
+    crate::collision::set_sah_enabled_for_test(Some(true));
+    crate::collision::set_geometry_share_for_test(Some(true));
+    let crate::campaign::Loaded { map, world, mut interactions, .. } = crate::campaign::load_visit(
+        &mut assets, "potears1", None, None, Default::default(), false).unwrap();
+    let mut before = Vec::new();
+    interactions.static_worlds(&mut |w| before.push((probe(w), std::sync::Arc::downgrade(&w.static_geometry),
+        std::sync::Arc::ptr_eq(&w.static_geometry, &world.static_geometry))));
+    assert_eq!(before.len(), 2, "camera_world and rabbit_world");
+    assert_eq!(before.iter().map(|b| b.2).collect::<Vec<_>>(), [true, false], "only camera_world shares the level world");
+    assert!(before.iter().all(|b| b.0.iter().any(|t| t[0] != 1f32.to_bits())), "the probes must hit geometry");
+    // `unload_scene!`: the level world goes, then the controllers' hold on its geometry.
+    drop(world);
+    interactions.release_static_worlds();
+    let mut released = 0;
+    interactions.static_worlds(&mut |w| { released += 1; assert!(w.static_released() && w.static_geometry.hulls.is_empty()); });
+    assert_eq!(released, 2);
+    assert!(before.iter().all(|b| b.1.upgrade().is_none()), "no static geometry of the outgoing level survives");
+    // `rebuild_outgoing`: the recovered level world, then the controllers.
+    let world = World::from_bsp(&map).unwrap();
+    interactions.restore_static_worlds(&map).unwrap();
+    let mut after = Vec::new();
+    interactions.static_worlds(&mut |w| { assert!(!w.static_released());
+        after.push((probe(w), std::sync::Arc::ptr_eq(&w.static_geometry, &world.static_geometry))); });
+    assert_eq!(after, before.into_iter().map(|b| (b.0, b.2)).collect::<Vec<_>>());
+    interactions.restore_static_worlds(&map).unwrap();
+}

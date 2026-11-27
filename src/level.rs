@@ -191,6 +191,10 @@ pub trait LevelController: Any + Send {
         Events::default()
     }
 
+    /// Collision worlds this controller built over the visit's static map geometry.
+    /// A transition releases them with the outgoing level; a rollback rebuilds them.
+    fn static_worlds(&mut self, _visit: &mut dyn FnMut(&mut crate::collision::World)) {}
+
     // Per-frame simulation.
 
     /// Apply map-owned arrival grants and breath contacts before ordinary movement.

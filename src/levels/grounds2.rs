@@ -193,6 +193,10 @@ impl Royale {
     }
 }
 impl LevelController for Royale {
+    fn static_worlds(&mut self, visit: &mut dyn FnMut(&mut crate::collision::World)) {
+        visit(&mut self.data.support);
+        visit(&mut self.data.arena);
+    }
     fn id(&self) -> &'static str {
         "grounds2"
     }
