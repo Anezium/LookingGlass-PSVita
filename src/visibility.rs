@@ -76,7 +76,7 @@ impl Visibility {
                 && stride.checked_mul(clusters).context("PVS overflow")? == vis.len() - 8,
             "Invalid PVS dimensions"
         );
-        let nodes = nodes
+        let nodes = crate::bsp::collect_exact(nodes
             .chunks_exact(36)
             .map(|b| {
                 let plane = usize::try_from(int(b, 0))?;
@@ -85,9 +85,8 @@ impl Visibility {
                     plane,
                     children: [int(b, 4), int(b, 8)],
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let leaves = leaves
+            }))?;
+        let leaves = crate::bsp::collect_exact(leaves
             .chunks_exact(48)
             .map(|b| {
                 let cluster = int(b, 0);
@@ -106,21 +105,19 @@ impl Visibility {
                         .is_some_and(|v| v <= faces.len() / 4),
                     "Invalid leaf face span"
                 );
-                let faces = (first..first + count)
+                let faces = crate::bsp::collect_exact((first..first + count)
                     .map(|i| {
                         let f = usize::try_from(int(faces, i * 4))?;
                         ensure!(f < face_count, "Invalid leaf face");
                         Ok(f)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                    }))?;
                 Ok(Leaf {
                     cluster,
                     min,
                     max,
                     faces,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }))?;
         for n in &nodes {
             for &child in &n.children {
                 ensure!(
