@@ -287,10 +287,20 @@ pub(super) fn begin_stack_sampling() {
     }
 }
 
+/// The armed check is all that runs on the hot path: it inlines into every sweep,
+/// animation sample and model-shape build as one relaxed load, and the sampling
+/// body stays out of line in the cold function below.
+#[inline(always)]
 pub(crate) fn sample_stack(site: &'static str) {
     if !STACK_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    sample_stack_slow(site);
+}
+
+#[cold]
+#[inline(never)]
+fn sample_stack_slow(site: &'static str) {
     if let Some(mut sample) = STACK.get() {
         let marker = 0u8;
         let here = std::hint::black_box(&marker) as *const u8 as usize;

@@ -169,8 +169,10 @@ pub struct Scene {
     pub(crate) gpu_skin_actors: bool,
     #[cfg(feature = "vita_renderer")]
     actor_glow_subset: bool,
+    /// Boxed: `draw` trades this field through a take/put-back pair every frame,
+    /// and the box keeps those moves one pointer wide.
     #[cfg(feature = "vita_renderer")]
-    retained: Option<vita_renderer::Renderer>,
+    retained: Option<Box<vita_renderer::Renderer>>,
     #[cfg(feature = "vita_renderer")]
     authored_sky: bool,
     #[cfg(feature = "vita_renderer")]
@@ -2240,7 +2242,7 @@ impl Scene {
         if retained_world {
             let retained = assets.fingerprint().and_then(|corpus| vita_renderer::Renderer::new(&scene, &corpus));
             match retained {
-                Ok(renderer) => scene.retained = Some(renderer),
+                Ok(renderer) => scene.retained = Some(Box::new(renderer)),
                 Err(error) => {
                     vita_renderer::construction_failed(name, &error);
                     // Rebuild with portals enabled and their aperture surfaces excluded.
