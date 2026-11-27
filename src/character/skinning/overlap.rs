@@ -427,7 +427,7 @@ unsafe fn skin_draw(draw: &Draw, pose: &[Transform], scales: &[f32], palette: &[
 struct Store {
     // Workers drain before storage is released, also on TLS shutdown.
     workers: Vec<crate::skin_worker::Worker>,
-    // The CPU2 worker is first in the per-map layout. Collection uses pending
+    // The CPU2 worker is first in a listed map's layout. Collection uses pending
     // so it always joins the prefix dispatched for that frame.
     active_workers: usize,
     tasks: [UnsafeCell<Task>; 2],
@@ -956,9 +956,11 @@ pub(crate) fn reset_publications() {
     }});
     crate::render_fx::actor_publication::reset();
 }
-/// Commit an installed map's eligible worker prefix while every skin arena is idle.
+/// Commit an installed map's eligible worker prefix while every skin arena is idle, and move
+/// the workers to its masks (`skin_worker::layout_mask`). Returns those masks and whether a
+/// worker moved.
 #[cfg(feature = "vita_renderer")]
-pub(crate) fn park_cpu1(park: bool) {
+pub(crate) fn park_cpu1(park: bool) -> ([i32; 2], bool) {
     assert!(PHASE.with(|phase| phase.get() == Phase::Idle));
     STORE.with(|store| {
         let mut store = store.borrow_mut();
@@ -967,7 +969,16 @@ pub(crate) fn park_cpu1(park: bool) {
         assert_eq!(store.workers.len(), 2);
         assert!(store.workers.iter().all(crate::skin_worker::Worker::idle));
         store.active_workers = if park { 1 } else { 2 };
-    });
+        let mut moved = false;
+        let masks = std::array::from_fn(|index| {
+            let worker = &mut store.workers[index];
+            match worker.repin(crate::skin_worker::layout_mask(index, park)) {
+                Some(effective) => { moved = true; effective }
+                None => worker.affinity(),
+            }
+        });
+        (masks, moved)
+    })
 }
 
 pub(crate) fn startup(workers: usize, probe: bool) {
@@ -1551,6 +1562,41 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    #[cfg(feature = "vita_renderer")]
+    fn each_install_moves_the_workers_to_its_map_masks() {
+        use crate::skin_worker::Worker;
+        crate::render::vita_renderer::with_config(|config| config.sim_overlap_normal = true, || {
+            startup(2, false);
+            // Startup pins the listed layout, so the first potears2 install moves nothing.
+            for (map, listed, masks, moved) in [
+                ("potears2", true, [0x40000, 0x20000], false),
+                ("potears3", false, [0x20000, 0x40000], true),
+                ("potears2", true, [0x40000, 0x20000], true),
+                ("wchess1", false, [0x20000, 0x40000], true),
+                ("wchess1", false, [0x20000, 0x40000], false),
+                ("potears2", true, [0x40000, 0x20000], true),
+            ] {
+                assert_eq!(park_cpu1(listed), (masks, moved), "{map}");
+                let mut first_on_worker_zero = false;
+                let mut second_on_worker_one = false;
+                cpu_pair(
+                    || first_on_worker_zero = std::thread::current().name() == Some("skin-persistent-0"),
+                    || second_on_worker_one = std::thread::current().name() == Some("skin-persistent-1"),
+                );
+                assert!(first_on_worker_zero, "{map}");
+                assert_eq!(second_on_worker_one, !listed, "{map}");
+                STORE.with(|pool| {
+                    let pool = pool.borrow();
+                    let store = pool.as_ref().unwrap();
+                    assert_eq!(store.active_workers, if listed { 1 } else { 2 }, "{map}");
+                    assert!(store.workers.iter().all(Worker::idle), "{map}");
+                    assert_eq!(store.workers.iter().map(Worker::affinity).collect::<Vec<_>>(), masks, "{map}");
+                });
+            }
+        });
     }
 
     #[test]

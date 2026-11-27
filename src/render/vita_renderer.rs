@@ -6823,6 +6823,9 @@ mod overlap_probe_tests {
         super::with_config(|current| *current = config.clone(), || {
             assert_eq!(crate::skin_worker::mask(0), 0x40000);
             assert_eq!(crate::skin_worker::mask(1), 0x20000);
+            // An unlisted map moves them back to the masks without the key.
+            assert_eq!(crate::skin_worker::layout_mask(0, false), 0x20000);
+            assert_eq!(crate::skin_worker::layout_mask(1, false), 0x40000);
         });
         config.skin_workers = 1;
         assert!(config.validate().is_err());
