@@ -356,7 +356,7 @@ pub async fn arrive_async(
     let key = save::visit_key(name, entry);
     let cached = ledger.levels.get(&key).cloned();
     let loaded = load_visit_async(assets, name, entry, cached.as_ref(), stats.difficulty, true, install_voices).await?;
-    let (eye, yaw) = interaction::spawn(&loaded.map, entry);
+    let (eye, yaw) = interaction::spawn_with_static(&loaded.map, entry, Some(loaded.world.audio_geometry()));
     let player = clear_entrance(&loaded.world, eye, &key)?;
     ledger.completed.insert(leaving.key());
     ledger.levels.insert(leaving.key(), leaving);

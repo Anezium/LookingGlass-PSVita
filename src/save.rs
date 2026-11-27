@@ -1206,7 +1206,7 @@ fn settle(
         || (migrate.fortress && (game.player.feet.x > 2000. || !world.body_clear(game.player.feet)))
         || joined
     {
-        let (eye, yaw) = crate::interaction::spawn(map, entry);
+        let (eye, yaw) = crate::interaction::spawn_with_static(map, entry, Some(world.audio_geometry()));
         game.player = Player::spawn(world, eye).context("Migrated level entrance obstructed")?;
         game.stats.prepare_player(&mut game.player);
         game.view.position = game.player.eye();
