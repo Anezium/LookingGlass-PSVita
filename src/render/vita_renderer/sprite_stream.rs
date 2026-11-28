@@ -141,10 +141,11 @@ pub(super) fn record_part(quads: &mut Vec<Quad>, geometry: &Geometry, batch: usi
     distinct.sort_unstable();
     distinct.dedup();
     for chunk in distinct.chunks_exact(4) {
-        let ids = chunk.map(|src| geometry.packed(batch, src).expect("an appended source vertex"));
+        let face = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let ids = face.map(|src| geometry.packed(batch, src).expect("an appended source vertex"));
         quads.push(Quad {
             ids,
-            corners: chunk.map(|src| b.base[src as usize].position),
+            corners: face.map(|src| b.base[src as usize].position),
             locked,
         });
     }
@@ -156,10 +157,11 @@ pub(super) fn quads_of_batch(b: &crate::render::Batch, locked: bool, first: usiz
     distinct.sort_unstable();
     distinct.dedup();
     distinct.chunks_exact(4).map(|chunk| {
-        let ids = chunk.map(|src| {
-            (first + source.iter().position(|&s| s == *src).expect("a packed source vertex")) as u16
+        let face = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let ids = face.map(|src| {
+            (first + source.iter().position(|&s| s == src).expect("a packed source vertex")) as u16
         });
-        Quad { ids, corners: chunk.map(|src| b.base[*src as usize].position), locked }
+        Quad { ids, corners: face.map(|src| b.base[src as usize].position), locked }
     }).collect()
 }
 /// Pack every sprite pending's geometry into one stream, in pending order. Returns the

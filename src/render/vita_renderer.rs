@@ -2190,7 +2190,7 @@ impl Renderer {
             old_scene_geometry_capacity_bytes + pending_geometry_capacity_bytes + packing_capacity_bytes + uploaded_geometry_bytes);
         let sprite_buffers = sprites.as_ref().map(|s| s.buffers());
         let mut groups = Vec::new();
-        for ((((p, texture), (slot, base_element, indices)), material_key), id) in pending.into_iter().zip(first_textures).zip(allocations).zip(material_keys_by_group).enumerate() {
+        for (id, (((p, texture), (slot, base_element, indices)), material_key)) in pending.into_iter().zip(first_textures).zip(allocations).zip(material_keys_by_group).enumerate() {
             let extent = deform_extent(&p.recipe.deform);
             let (vertex,index) = if slot == usize::MAX {
                 sprite_buffers.expect("a sprite group without its stream")
