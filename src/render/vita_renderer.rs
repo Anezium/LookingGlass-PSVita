@@ -13,6 +13,8 @@ mod world_list;
 mod gxm;
 mod low_fog;
 mod draw_cuts;
+#[cfg(not(target_os = "vita"))]
+mod parity_census;
 mod alpha_fill;
 mod sky_surfaces;
 mod sky_room;
@@ -342,6 +344,12 @@ pub struct Config {
     /// the world program applies the lightmap itself. Each kept stage is one more draw of its
     /// surface. Off keeps the RC3 world, which drops them. Default off.
     pub detail_layers: bool,
+    /// Diagnostic for the PC-parity study, picture-changing, default empty: world batches whose
+    /// BSP shader name is listed (case-insensitive) keep up to four stages instead of
+    /// `max_layers`. Each kept stage is one more draw of its surface. Owner approval required
+    /// before any shipping config lists a shader.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extra_layer_shaders: Vec<String>,
     /// Draw the authored sky from a cube map captured once from the sky camera, instead of the
     /// gradient: the sky room (portal maps) and the sky shader layers are drawn by the legacy path
     /// into six faces of one render target on the first frame, and the map's sky surfaces sample it
@@ -767,6 +775,7 @@ impl Default for Config {
             fog_sky: false,
             exact_blends: false,
             detail_layers: false,
+            extra_layer_shaders: Vec::new(),
             sky_cube: false,
             sky_cube_size: 256,
             sky_cube_refresh: 0,
@@ -1706,6 +1715,8 @@ impl Renderer {
         let started=std::time::Instant::now();
         let c = config();
         assert_eq!(release.len(), scene.batches.len());
+        #[cfg(not(target_os = "vita"))]
+        parity_census::print(scene, c, corpus);
         // Buffer payload accounting, not allocator/driver/process high-water RAM. Taken before
         // any release, so the reported bound keeps its meaning.
         let old_scene_geometry_capacity_bytes: usize = scene.batches.iter().chain(&scene.sky_props).map(|b| {
@@ -1755,12 +1766,16 @@ impl Renderer {
                 scene.map.shaders[scene.map.surfaces[part.face].shader].contents & crate::collision::LIQUID_MASK != 0
             });
             let mut rank = 0;
+            let cap = if !c.extra_layer_shaders.is_empty() && b.parts.iter().any(|part| {
+                let name = &scene.map.shaders[scene.map.surfaces[part.face].shader].name;
+                c.extra_layer_shaders.iter().any(|s| s.eq_ignore_ascii_case(name))
+            }) { 4 } else { c.max_layers };
             for layer in &b.layers {
                 if layer.spec.blend == Blend::Invisible || (layer.spec.detail && !c.detail_layers) {
                     dropped_layers += 1;
                     continue;
                 }
-                if rank == c.max_layers {
+                if rank == cap {
                     dropped_layers += 1;
                     continue;
                 }
