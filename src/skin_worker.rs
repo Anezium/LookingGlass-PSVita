@@ -3,8 +3,9 @@ pub(crate) const STACK_BYTES: usize = 512 * 1024;
 pub(crate) fn mask(worker: usize) -> i32 {
     #[cfg(feature = "vita_renderer")]
     if crate::render::vita_renderer::config().sim_overlap_normal {
-        // Worker zero remains eligible when the CPU1 worker is parked.
-        return layout_mask(worker, true);
+        // Worker zero remains eligible when the CPU1 worker is parked. The lazy layout starts
+        // unparked and lets the first listed install move the workers.
+        return layout_mask(worker, !crate::render::vita_renderer::config().sim_overlap_lazy_layout);
     }
     if crate::spike_log::cpu1_reserved() {
         0x40000
