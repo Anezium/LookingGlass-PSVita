@@ -218,6 +218,10 @@ impl Drop for Sink {
     }
 }
 impl Output {
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    pub(super) fn alive(&self) -> bool {
+        self.controls.alive.load(Ordering::Acquire)
+    }
     pub(super) fn movie_id(&self) -> u32 {
         self.controls.movie.as_ref().map_or(0, |(id, _)| *id)
     }

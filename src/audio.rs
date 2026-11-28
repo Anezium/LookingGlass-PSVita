@@ -12,6 +12,7 @@ mod output;
 pub(crate) use output::background_service_policy;
 mod block;
 mod music;
+mod music_file;
 pub mod events;
 mod reaction;
 pub mod regression;
@@ -1660,6 +1661,10 @@ pub struct Audio {
     prefetch_clips: usize,
     prefetch_bytes: usize,
     retiring: Vec<FadingMusic>,
+    /// `audio_release_early` only: the current track's bytes, and every track's
+    /// bytes a decoder still reads (current, retiring, a dropped sink not yet reaped).
+    music_file: Option<music_file::File>,
+    music_files: Vec<music_file::File>,
     cues: BTreeMap<String, Music>,
     room: f32,
     acoustic_clock: f32,
@@ -1735,6 +1740,34 @@ impl Audio {
         self.release_level();
         self.music = music;
         self.fade_elapsed = fade;
+        if block::settings().release_early {
+            self.release_music_bytes();
+        }
+        #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+        if !block::settings().release_early && std::env::var_os("LOOKING_GLASS_SAH_REAP_AT_RELEASE").is_some() {
+            let reaped = SAH_MIXER.with(|s| s.borrow_mut().as_mut().map_or(0, |m| m.reap()));
+            eprintln!("[lg/audio-release] early=false reaped_sources={reaped}");
+        }
+    }
+    /// The outgoing track stays paused for rollback and for its fade after the next
+    /// presentation; keep only the bytes those can read. On the host probe mixer,
+    /// also drop the released level sinks now; a device producer drops them within a block.
+    fn release_music_bytes(&mut self) {
+        self.music_files.retain(music_file::File::live);
+        let (mut held, mut kept) = (0, 0);
+        for file in &self.music_files {
+            let (before, after) = file.trim(music_file::WINDOW);
+            held += before;
+            kept += after;
+        }
+        #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+        let reaped = SAH_MIXER.with(|s| s.borrow_mut().as_mut().map_or(0, |m| m.reap()));
+        #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
+        eprintln!("[lg/audio-release] early=true reaped_sources={reaped} music_files={} music_bytes_held={held} music_bytes_kept={kept} window_misses={}",
+            self.music_files.len(), music_file::MISSES.load(Ordering::Relaxed));
+        #[cfg(not(all(feature="sim_maps_probe",not(target_os="vita"))))]
+        eprintln!("[lg/audio-release] early=true music_files={} music_bytes_held={held} music_bytes_kept={kept} window_misses={}",
+            self.music_files.len(), music_file::MISSES.load(Ordering::Relaxed));
     }
     pub(crate) fn restore_transition(&mut self, checkpoint: TransitionCheckpoint) {
         self.fade_elapsed = checkpoint.fade_elapsed;
@@ -1746,12 +1779,19 @@ impl Audio {
     }
     pub(crate) fn reload_failed_transition(&mut self, assets: &mut Assets, name: &str, map: &Bsp, knife_available: bool) {
         let music = self.music.take();
+        let file = self.music_file.take();
         let retiring = std::mem::take(&mut self.retiring);
         let cues = std::mem::take(&mut self.cues);
         self.load(assets, name, map, knife_available);
         self.music = music;
+        self.music_file = file;
         self.retiring = retiring;
         self.cues = cues;
+        // The kept decoder resumes from its own position; give it the whole file back.
+        if let (Some(file), Some((_, cue))) = (&self.music_file, &self.music) {
+            let restored = assets.read(&cue.path).map(|bytes| file.fill(bytes));
+            eprintln!("[lg/audio-release] rollback_music_restored={} path={}", matches!(restored, Ok(true)), cue.path);
+        }
     }
     /// Binding observes only events AFTER activation. Playback may already be
     /// running; no earlier counter values or audio lifetime are reconstructed.
@@ -1815,6 +1855,8 @@ impl Audio {
             prefetch_clips: 0,
             prefetch_bytes: 0,
             retiring: Vec::new(),
+            music_file: None,
+            music_files: Vec::new(),
             cues: BTreeMap::new(),
             room: 0.,
             acoustic_clock: 0.,
@@ -2520,6 +2562,7 @@ impl Audio {
     }
     fn retire_music(&mut self) {
         if let Some((sink, cue)) = self.music.take() {
+            self.music_file = None;
             let fraction = if cue.fade > 0. {
                 (self.fade_elapsed / cue.fade).min(1.)
             } else {
@@ -2555,12 +2598,28 @@ impl Audio {
         sink.set_music();
         sink.pause();
         sink.set_volume(0.);
-        if cue.looping {
-            sink.append(Decoder::new_looped(Cursor::new(bytes))?);
+        let file = if block::settings().release_early {
+            let (file, reader) = music_file::File::new(bytes);
+            if cue.looping {
+                sink.append(Decoder::new_looped(reader)?);
+            } else {
+                sink.append(Decoder::new(reader)?);
+            }
+            Some(file)
         } else {
-            sink.append(Decoder::new(Cursor::new(bytes))?);
-        }
+            if cue.looping {
+                sink.append(Decoder::new_looped(Cursor::new(bytes))?);
+            } else {
+                sink.append(Decoder::new(Cursor::new(bytes))?);
+            }
+            None
+        };
         self.retire_music();
+        if let Some(file) = file {
+            self.music_files.retain(music_file::File::live);
+            self.music_files.push(file.clone());
+            self.music_file = Some(file);
+        }
         self.fade_elapsed = 0.;
         println!(
             "Music {name}: {} (loop={}, fade={}s)",

@@ -128,6 +128,20 @@ impl Control {
     }
 }
 impl Mixer {
+    /// Drop the sources of released sinks now, as the next render would, without
+    /// rendering. A dead source adds no sample and never takes an ambience rank, and
+    /// the live ones keep their order, so later blocks are unchanged. The host probe
+    /// mixer only renders inside frames; a device producer renders every block.
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    pub(super) fn reap(&mut self) -> usize {
+        while let Some(s) = self.pending.pop() {
+            self.has_movies |= s.movie_id() != 0;
+            self.sources.push(s);
+        }
+        let before = self.sources.len();
+        self.sources.retain(|s| s.alive());
+        before - self.sources.len()
+    }
     pub(super) fn premix(&mut self, epoch: u32) -> Block {
         if self.config.mix {
             self.render();
