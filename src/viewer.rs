@@ -40,6 +40,18 @@ pub fn config() -> macroquad::conf::Conf {
     let (width, height, high_dpi) = (1200, 680, true);
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     let (width, height, high_dpi) = if crate::sim_maps::probe::enabled() { probe_window_request() } else { (width, height, high_dpi) };
+    // Host-only present pacing: with the env unset the platform default (vsync 1) applies.
+    #[cfg(not(target_os = "vita"))]
+    let host_swap_interval = match std::env::var("LOOKING_GLASS_HOST_SWAP_INTERVAL") {
+        Ok(value) => match value.parse::<i32>() {
+            Ok(interval) => Some(interval),
+            Err(_) => {
+                eprintln!("[lg/startup] LOOKING_GLASS_HOST_SWAP_INTERVAL is not an i32: {value:?}; keeping vsync");
+                None
+            }
+        },
+        Err(_) => None,
+    };
     macroquad::conf::Conf {
         miniquad_conf: Conf {
             window_title: "Looking Glass".into(),
@@ -50,6 +62,11 @@ pub fn config() -> macroquad::conf::Conf {
             sample_count: crate::render::vita_renderer::config().msaa_samples,
             #[cfg(not(feature="vita_renderer"))]
             sample_count: 1,
+            #[cfg(not(target_os = "vita"))]
+            platform: macroquad::miniquad::conf::Platform {
+                swap_interval: host_swap_interval,
+                ..Default::default()
+            },
             ..Default::default()
         },
         draw_call_vertex_capacity: 60000,
