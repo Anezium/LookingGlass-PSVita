@@ -402,15 +402,17 @@ mod tests {
             // Under the 30 floor: hidden even on the first solve.
             assert!(!camera.update(&tight, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2);
             assert!(camera.arm < 30.);
-            // A later solve at arm 39.8 keeps the 42 rule.
-            assert!(!camera.update(&near, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2);
-            assert!(camera.arm > 30. && camera.arm < 42.);
+            // Later solves easing out to arm 39.8 keep the 42 rule.
+            for _ in 0..120 {
+                assert!(!camera.update(&near, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2);
+            }
+            assert!(camera.arm > 30. && camera.arm < 42., "arm {}", camera.arm);
             // A teleport is fresh for the arm but is not a reset.
             let far = vec3(400., 0., 0.);
             let moved = World::fixture(&[(vec3(far.x - 53., -200., -100.), vec3(far.x - 43., 200., 200.))]);
             camera.update(&tight, Vec3::ZERO, Vec3::X, 132., 1. / 60.);
             assert!(!camera.update(&moved, far, Vec3::X, 132., 1. / 60.).2);
-            assert!(camera.arm > 30. && camera.arm < 42.);
+            assert!(camera.arm > 30. && camera.arm < 42., "arm {}", camera.arm);
             camera.reset();
             assert!(camera.update(&near, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2);
         });
