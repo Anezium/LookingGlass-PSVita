@@ -283,6 +283,40 @@ pub(crate) fn scale_pose(skeleton: &Skeleton, pose: &mut [Transform], roots: &[(
     scales
 }
 
+/// `scale_pose(skeleton, global_pose(animation.sample(time, looping)), roots)[bone]`, built
+/// along the bone's parent chain only. Each chain bone goes through the same blend,
+/// composition and subtree-scale operations in the same order, so the result has the same bits.
+pub(crate) fn scaled_bone_pose(
+    skeleton: &Skeleton, animation: &Animation, time: f32, looping: bool, bone: usize, roots: &[(usize, f32)],
+) -> Transform {
+    #[cfg(any(target_os = "vita", feature = "sim_maps_probe"))]
+    crate::viewer::sim_audit::sample_stack("skeletal_sample");
+    let _npc_work = crate::npc::profile::work(crate::npc::profile::Phase::Animation);
+    let _census = crate::phase_census::span(crate::phase_census::Region::ActorPose);
+    let (a, b, t) = animation.frame_pair(time, looping);
+    let local = |i: usize| animation.frames[a].pose[i].blend(animation.frames[b].pose[i], t);
+    let (world, translation, _) = chain_pose(skeleton, &local, bone, roots);
+    Transform { rotation: world.rotation, translation }
+}
+/// (global transform, subtree-scaled translation, subtree scale) of bone `i`.
+fn chain_pose(
+    skeleton: &Skeleton, local: &impl Fn(usize) -> Transform, i: usize, roots: &[(usize, f32)],
+) -> (Transform, Vec3, f32) {
+    let pose = local(i);
+    let own = roots.iter().find(|(n, _)| *n == i).map_or(1., |(_, s)| *s);
+    match skeleton.bones[i].parent {
+        None => (pose, pose.translation, 1. * own),
+        Some(p) => {
+            let (parent, parent_scaled, inherited) = chain_pose(skeleton, local, p, roots);
+            let world = Transform {
+                rotation: (parent.rotation * pose.rotation).normalize(),
+                translation: parent.point(pose.translation),
+            };
+            (world, parent_scaled + (world.translation - parent.translation) * inherited, inherited * own)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Transform {
     pub rotation: Quat,
@@ -473,6 +507,16 @@ impl Animation {
             || self.sample_uncached(time, looping))
     }
     fn sample_uncached(&self, time: f32, looping: bool) -> Vec<Transform> {
+        let (a, b, t) = self.frame_pair(time, looping);
+        self.frames[a]
+            .pose
+            .iter()
+            .zip(&self.frames[b].pose)
+            .map(|(&x, &y)| x.blend(y, t))
+            .collect()
+    }
+    /// The two frames `sample` blends at `time`, and the blend weight.
+    fn frame_pair(&self, time: f32, looping: bool) -> (usize, usize, f32) {
         let frame = if looping {
             time.max(0.).rem_euclid(self.duration()) / self.frame_time
         } else {
@@ -486,12 +530,7 @@ impl Animation {
         } else {
             (a + 1).min(self.frames.len() - 1)
         };
-        self.frames[a]
-            .pose
-            .iter()
-            .zip(&self.frames[b].pose)
-            .map(|(&x, &y)| x.blend(y, frame.fract()))
-            .collect()
+        (a, b, frame.fract())
     }
 }
 
@@ -625,7 +664,7 @@ pub fn check(assets: &mut Assets) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     fn put(b: &mut [u8], p: usize, n: i32) {
         b[p..p + 4].copy_from_slice(&n.to_le_bytes());
@@ -875,5 +914,48 @@ mod tests {
         assert_eq!(edge / anim.frame_time, 18.);
         assert_eq!(anim.sample(edge, true)[0].translation, Vec3::ZERO);
         assert_eq!(anim.sample(edge, false)[0].translation, Vec3::X * 17.);
+    }
+    pub(crate) fn transform_bits(t: Transform) -> [u32; 7] {
+        let (r, p) = (t.rotation.to_array(), t.translation.to_array());
+        [r[0], r[1], r[2], r[3], p[0], p[1], p[2]].map(f32::to_bits)
+    }
+    /// `scaled_bone_pose` against the full sample, global pose and subtree scale it replaces.
+    pub(crate) fn assert_scaled_bone_pose_matches(
+        skeleton: &Skeleton, animation: &Animation, time: f32, looping: bool, roots: &[(usize, f32)], bones: &[usize],
+    ) {
+        let mut full = skeleton.global_pose(&animation.sample(time, looping));
+        scale_pose(skeleton, &mut full, roots);
+        for &bone in bones {
+            assert_eq!(transform_bits(scaled_bone_pose(skeleton, animation, time, looping, bone, roots)),
+                       transform_bits(full[bone]), "bone={bone} time={time} looping={looping} roots={roots:?}");
+        }
+    }
+    #[test]
+    fn scaled_bone_pose_matches_the_full_skeleton_bit_for_bit() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || { seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); (seed >> 8) as f32 / (1 << 24) as f32 * 2. - 1. };
+        let parents: Vec<Option<usize>> = (0..40).map(|i| match i { 0 | 17 => None, i => Some((i * 7 + 3) % i) }).collect();
+        let skeleton = Skeleton {
+            bones: parents.iter().enumerate().map(|(i, &parent)| Bone { parent, name: format!("b{i}") }).collect(),
+            surfaces: Vec::new(),
+            skin_bounds: Vec::new(),
+        };
+        let frames = (0..7).map(|_| Frame {
+            pose: (0..40).map(|_| Transform {
+                rotation: Quat::from_xyzw(next(), next(), next(), next()).normalize(),
+                translation: Vec3::new(next(), next(), next()) * 30.,
+            }).collect(),
+            delta: Vec3::ZERO, min: Vec3::ZERO, max: Vec3::ZERO,
+        }).collect();
+        let animation = Animation { frames, frame_time: 0.05, distance: 0. };
+        let bones: Vec<usize> = (0..40).collect();
+        let roots: [&[(usize, f32)]; 4] = [&[], &[(3, 1.25)], &[(0, 0.8), (10, 1.5), (10, 3.)], &[(17, 0.6), (5, 1.1), (24, 2.)]];
+        for looping in [true, false] {
+            for time in [0., 0.01, 0.05, 0.0999, 0.17, 0.35, 0.3499999, 1.234, 86.7, -2.] {
+                for roots in roots {
+                    assert_scaled_bone_pose_matches(&skeleton, &animation, time, looping, roots, &bones);
+                }
+            }
+        }
     }
 }

@@ -755,6 +755,8 @@ struct ModelArt {
     attachments: Vec<(usize, f32, Prop)>,
     electric_attachments: Vec<usize>,
     electric_props: Vec<String>,
+    /// `emitter_fast`: own-effect emitter timelines by (clip, looping), built on first use.
+    emitter_timelines: Vec<(String, bool, crate::animation_events::EmitterTimeline)>,
 }
 #[derive(Clone, Default)]
 struct PoseOverrides {
@@ -1720,17 +1722,23 @@ impl ModelArt {
             animation.frame_time,
             looping,
         );
+        let fast = crate::sim_maps::emitter_fast();
         let tag_pose = |tag: Option<&str>, at: f32| {
             let Some(bone) =
                 tag.and_then(|name| d.skeleton.bones.iter().position(|b| b.name == name))
             else {
                 return transform;
             };
-            let mut pose = d.skeleton.global_pose(&animation.sample(at, looping));
-            crate::skeletal::scale_pose(&d.skeleton, &mut pose, bone_scales);
+            let pose = if fast {
+                crate::skeletal::scaled_bone_pose(&d.skeleton, animation, at, looping, bone, bone_scales)
+            } else {
+                let mut pose = d.skeleton.global_pose(&animation.sample(at, looping));
+                crate::skeletal::scale_pose(&d.skeleton, &mut pose, bone_scales);
+                pose[bone]
+            };
             Transform {
-                translation: transform.point(pose[bone].translation * d.def.scale * scale),
-                rotation: transform.rotation * pose[bone].rotation,
+                translation: transform.point(pose.translation * d.def.scale * scale),
+                rotation: transform.rotation * pose.rotation,
             }
         };
         for (tag, a) in &visual.attachments {
@@ -1754,11 +1762,23 @@ impl ModelArt {
             }
         }
         if let Some(effect) = &mut self.own_effect {
+            let timeline = if fast {
+                let timelines = &mut self.emitter_timelines;
+                let at = timelines.iter().position(|(c, l, _)| c == clip && *l == looping).unwrap_or_else(|| {
+                    timelines.push((clip.to_owned(), looping,
+                        d.events.emitter_timeline(clip, animation.duration(), animation.frame_time, looping)));
+                    timelines.len() - 1
+                });
+                Some(&timelines[at].2)
+            } else {
+                None
+            };
             effect.draw(
                 time,
                 scale,
                 |at, tag| tag_pose(tag, at),
                 |name, at, default| {
+                    if let Some(timeline) = timeline { return timeline.enabled(name, at, default); }
                     d.events
                         .visual(
                             clip,
@@ -1959,6 +1979,7 @@ impl ModelArt {
             attachments,
             electric_attachments: Vec::new(),
             electric_props: Vec::new(),
+            emitter_timelines: Vec::new(),
         })
     }
 }
@@ -5468,6 +5489,96 @@ pub(crate) fn test_split_and_owned_slots(assets: &mut Assets) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `emitter_fast` exactness on the shipped models: every clip's emitter timeline answers as
+    /// visual() does, and every tag's one-chain pose has the full skeleton's bits.
+    #[test]
+    fn emitter_fast_matches_visual_and_full_pose_on_shipped_models() {
+        let dir = std::env::var_os("LOOKING_GLASS_TEST_DATA").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/Users/anezium/vita-work/alice-data/Alice1/bin/base".into());
+        if !dir.is_dir() {
+            println!("skipping shipped model case: {} absent", dir.display());
+            return;
+        }
+        let mut assets = Assets::open(&dir).unwrap();
+        let models: Vec<String> = assets.names()
+            .filter_map(|n| n.strip_prefix("models/")?.strip_suffix(".tik"))
+            .filter(|n| !n.contains('/')).map(str::to_owned).collect();
+        let (mut loaded, mut queries, mut poses) = (0, 0u64, 0u64);
+        for name in &models {
+            let Ok(def) = Definition::load(&mut assets, &format!("models/{name}.tik")) else { continue };
+            if def.model.is_empty() { continue; }
+            let clips: Vec<String> = def.animations.keys().cloned().collect();
+            let Ok(d) = ModelData::load(&mut assets, name, &clips) else { continue };
+            loaded += 1;
+            let tags: Vec<usize> = (0..d.skeleton.bones.len())
+                .filter(|&i| d.skeleton.bones[i].name.starts_with("tag_")).collect();
+            let mid = d.skeleton.bones.len() / 2;
+            for (clip, animation) in &d.clips {
+                let (duration, step) = (animation.duration(), animation.frame_time);
+                let mut emitters: Vec<&str> = d.events.clips.get(clip).into_iter().flatten()
+                    .filter_map(|e| match &e.command {
+                        crate::animation_events::Command::Emitter { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    }).collect();
+                emitters.push("missing");
+                for looping in [true, false] {
+                    let timeline = d.events.emitter_timeline(clip, duration, step, looping);
+                    let frames = animation.frames.len() as u32;
+                    let mut times: Vec<f32> = (0..=frames + 1).flat_map(|k| {
+                        let t = k as f32 * step;
+                        [t, f32::from_bits(t.to_bits().wrapping_sub(1)), f32::from_bits(t.to_bits() + 1), t + 0.5 * step]
+                    }).collect();
+                    times.extend((0..1200).map(|n| n as f32 / 200.));
+                    times.extend([duration * 3.5, duration * 17. + step, 37.3, f32::NAN, -1.]);
+                    if !emitters.is_empty() {
+                        for &at in &times {
+                            let visual = d.events.visual(clip, at, duration, step, looping);
+                            for &emitter in &emitters { for initial in [true, false] {
+                                assert_eq!(timeline.enabled(emitter, at, initial),
+                                    visual.emitters.get(emitter).copied().unwrap_or(initial),
+                                    "{name} {clip} {emitter} at={at} looping={looping}");
+                                queries += 1;
+                            } }
+                        }
+                    }
+                    if !tags.is_empty() {
+                        let roots: [&[(usize, f32)]; 2] = [&[], &[(mid, 1.4), (tags[0], 0.75)]];
+                        for &at in times.iter().step_by(37) {
+                            for roots in roots {
+                                crate::skeletal::tests::assert_scaled_bone_pose_matches(
+                                    &d.skeleton, animation, at, looping, roots, &tags);
+                                poses += tags.len() as u64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The swim bubbles' `bubble_on` gate, with the duration and frame time water_art reads.
+        let breath = Definition::load(&mut assets, "models/fx_alicebreath.tik").unwrap();
+        let bytes = assets.read(&format!("{}/{}", breath.path, breath.animations["bubble_on"])).unwrap();
+        let header = crate::skeletal::Bytes(&bytes);
+        let duration = header.float(84).unwrap();
+        let step = duration / header.count(72, 10000).unwrap().max(1) as f32;
+        let events = crate::animation_events::Model::load(&mut assets, "models/fx_alicebreath.tik").unwrap();
+        let timeline = events.emitter_timeline("bubble_on", duration, step, true);
+        let names: Vec<&str> = events.clips["bubble_on"].iter().filter_map(|e| match &e.command {
+            crate::animation_events::Command::Emitter { name, .. } => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(!names.is_empty());
+        for n in 0..4000 {
+            let at = n as f32 * duration / 997.;
+            let visual = events.visual("bubble_on", at, duration, step, true);
+            for &name in &names { for initial in [true, false] {
+                assert_eq!(timeline.enabled(name, at, initial),
+                    visual.emitters.get(name).copied().unwrap_or(initial), "bubble_on {name} at={at}");
+                queries += 1;
+            } }
+        }
+        println!("emitter_fast shipped models: {loaded} models, {queries} emitter queries, {poses} tag poses");
+        assert!(loaded > 20 && queries > 0 && poses > 0, "{loaded} {queries} {poses}");
+    }
     #[test]
     fn actor_publication_rejects_membership_for_retired_generation() {
         let mut registry = SnapshotRegistry::default();

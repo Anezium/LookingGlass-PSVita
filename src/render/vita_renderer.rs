@@ -226,6 +226,10 @@ pub struct Config {
     /// Attached emitters keep each birth's constants, and an Alpha set takes the raw quad path
     /// additive sets already use. Same quads, blend and order. Default off.
     pub fx_attached_persist: bool,
+    /// Own-effect and swim-bubble emitter gates answer from one cached emitter timeline per
+    /// clip instead of a full animation-event state per slot, and a birth's tag pose walks
+    /// only the tag's parent chain instead of the whole skeleton. Same bits. Default off.
+    pub emitter_fast: bool,
     /// School two publishes the other movers' colliders only when a rider's body trace will read
     /// them, and builds a mover's collider only when something can read it. Default off.
     pub mover_advance_reuse: bool,
@@ -732,6 +736,7 @@ impl Default for Config {
             prop_occurrence_reuse: true,
             fx_observe_move: true,
             fx_attached_persist: false,
+            emitter_fast: false,
             mover_advance_reuse: false,
             mover_shape_reuse: false,
             world_pass_clock: false,
@@ -4069,6 +4074,25 @@ mod tests {
         assert!(serde_json::from_value::<Config>(serde_json::json!({"spike_log_first_frame":20,"spike_log_last_frame":10})).unwrap().validate().is_err());
     }
     #[test]
+    fn emitter_fast_defaults_off_and_is_strict() {
+        assert!(!Config::default().emitter_fast);
+        assert!(!serde_json::from_str::<Config>("{}").unwrap().emitter_fast);
+        for invalid in [serde_json::json!(0), serde_json::json!("on"), serde_json::Value::Null] {
+            assert!(serde_json::from_value::<Config>(serde_json::json!({"emitter_fast": invalid})).is_err());
+        }
+        let on: Config = serde_json::from_value(serde_json::json!({"emitter_fast": true})).unwrap();
+        on.validate().unwrap();
+        assert_eq!(serde_json::to_value(&on).unwrap()["emitter_fast"], true);
+        assert!(config_log_lines(&on)[0].contains("\"emitter_fast\":true"));
+        for bytes in [&include_bytes!("../../configs/PL-release.json")[..],
+                      &include_bytes!("../../configs/PL-v11-4-cand.json")[..],
+                      &include_bytes!("../../configs/PL-v11-2c-ship.json")[..]] {
+            let (c, rejected) = parse_runtime_config(bytes).unwrap();
+            assert!(rejected.is_none());
+            assert!(!c.emitter_fast, "a shipped config predates the key and reads it off");
+        }
+    }
+    #[test]
     fn nav_sweep_cache_defaults_off_and_requires_a_boolean() {
         assert!(!Config::default().nav_sweep_cache);
         assert!(!serde_json::from_str::<Config>("{}").unwrap().nav_sweep_cache);
@@ -4535,7 +4559,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache" | "emitter_fast") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);

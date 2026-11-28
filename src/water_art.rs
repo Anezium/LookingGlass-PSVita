@@ -16,6 +16,8 @@ pub struct Art {
     shell: Prop,
     bubbles: Attached,
     events: crate::animation_events::Model,
+    /// `emitter_fast`: the `bubble_on` emitter timeline, built on first use.
+    bubble_timeline: Option<crate::animation_events::EmitterTimeline>,
     warning_duration: f32,
     warning_frame: f32,
     back: usize,
@@ -252,6 +254,7 @@ impl Art {
             bubbles: Attached::load(a, "fx_alicebreath", specs)?
                 .context("Missing breath bubbles")?,
             events: crate::animation_events::Model::load(a, "models/fx_alicebreath.tik")?,
+            bubble_timeline: None,
             warning_duration,
             warning_frame,
             back: tag("tag_back")?,
@@ -291,11 +294,20 @@ impl Art {
         if let Some(age) = state.1 {
             let mouth = tag(self.mouth);
             let (atmosphere, camera) = &*self.view.borrow();
+            let timeline = if crate::sim_maps::emitter_fast() {
+                let events = &self.events;
+                let (duration, frame) = (self.warning_duration, self.warning_frame);
+                Some(&*self.bubble_timeline
+                    .get_or_insert_with(|| events.emitter_timeline("bubble_on", duration, frame, true)))
+            } else {
+                None
+            };
             self.bubbles.draw(
                 age,
                 scale,
                 |_, _| mouth,
                 |name, birth, default| {
+                    if let Some(timeline) = timeline { return timeline.enabled(name, birth, default); }
                     self.events
                         .visual(
                             "bubble_on",

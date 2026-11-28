@@ -277,6 +277,14 @@ pub fn fx_attached_persist() -> bool {
     #[cfg(all(not(test), not(feature="vita_renderer")))]
     { false }
 }
+/// `emitter_fast`: attached-emitter queries answer from a cached emitter timeline and a
+/// one-chain tag pose instead of a full visual() and skeleton per call. Exact. Default off.
+pub fn emitter_fast() -> bool {
+    #[cfg(feature="vita_renderer")]
+    { crate::render::vita_renderer::config().emitter_fast }
+    #[cfg(not(feature="vita_renderer"))]
+    { false }
+}
 /// Attached emitters honour `sphere`. Changes pixels. Default off.
 pub fn fx_attached_sphere() -> bool {
     #[cfg(feature="vita_renderer")]
