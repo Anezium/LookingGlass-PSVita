@@ -342,6 +342,12 @@ impl Menu {
     /// big preview in 0.5 s; DeleteYES and DeleteNO are invisible hit boxes over its words. The
     /// selected word gets a thin pulsing underline so the D-pad choice is visible.
     pub(super) fn draw_delete_confirm(&self, canvas: Canvas, now: f64) {
+        // The urc only enables delete_group: the screen's buttons stay in place, unlit, under it.
+        for b in self.buttons(Page::LoadSave) {
+            if !matches!(b.click, Click::Slot(_)) {
+                self.art(canvas, &b.art, b.rect, 1.);
+            }
+        }
         let fade = ((now - self.delete_opened) / 0.5).clamp(0., 1.) as f32;
         let w = self.save_widget("DeleteConfirm");
         self.art(canvas, w.art(), w.rect, fade);
