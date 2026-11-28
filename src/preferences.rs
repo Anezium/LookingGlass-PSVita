@@ -95,11 +95,20 @@ fn pad_defaults() -> Vec<String> {
         .collect()
 }
 
+pub const GAMMA_MIN: f32 = 0.5;
+pub const GAMMA_MAX: f32 = 1.5;
+
+fn neutral_gamma(gamma: &f32) -> bool {
+    *gamma == 1.
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub resolution: usize,
     pub fullscreen: bool,
+    #[serde(skip_serializing_if = "neutral_gamma")]
+    pub gamma: f32,
     pub sensitivity: f32,
     pub invert_mouse: bool,
     pub camera_distance: f32,
@@ -116,6 +125,7 @@ impl Default for Preferences {
         let mut preferences = Self {
             resolution: 2,
             fullscreen: false,
+            gamma: 1.,
             sensitivity: 1.,
             invert_mouse: false,
             camera_distance: 132.,
@@ -156,6 +166,7 @@ impl Preferences {
     }
     fn validate(&self) -> Result<()> {
         ensure!(self.resolution < SIZES.len(), "Invalid display size");
+        ensure!((GAMMA_MIN..=GAMMA_MAX).contains(&self.gamma), "Invalid brightness");
         ensure!(
             self.sensitivity.is_finite() && (0.2..=3.).contains(&self.sensitivity),
             "Invalid sensitivity"
@@ -307,6 +318,7 @@ mod tests {
             sensitivity: 2.4,
             invert_mouse: true,
             fullscreen: true,
+            gamma: 1.2,
             ..Default::default()
         };
         assert_eq!(
@@ -315,6 +327,7 @@ mod tests {
         );
         assert!(Preferences::parse(br#"{"sensitivity":0}"#).is_err());
         assert!(Preferences::parse(br#"{"resolution":100}"#).is_err());
+        assert!(Preferences::parse(br#"{"gamma":0.4}"#).is_err());
         assert!(Preferences::parse(br#"{"camera_distance":-1}"#).is_err());
         assert_eq!(Preferences::parse(b"{}").unwrap(), Preferences::default());
     }

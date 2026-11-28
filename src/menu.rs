@@ -4,7 +4,7 @@ use crate::{
     assets::Assets,
     audio, bsp,
     powerups::Difficulty,
-    preferences::{Preferences, BINDINGS, SIZES},
+    preferences::{Preferences, BINDINGS, GAMMA_MAX, GAMMA_MIN, SIZES},
     save::{Slot, Store},
     texture,
     ui::{Canvas, Ui},
@@ -214,6 +214,13 @@ fn load_texture(assets: &mut Assets, path: &str, additive: bool) -> Result<Textu
 }
 
 // Extra touch rows fit above the stock Game footer on the Vita screen.
+fn gamma_available() -> bool {
+    #[cfg(feature = "vita_renderer")]
+    { crate::render::vita_renderer::gamma_available() }
+    #[cfg(not(feature = "vita_renderer"))]
+    { false }
+}
+
 fn game_rows(vita: bool) -> Vec<(String, f32)> {
     if vita {
         [("Stick Sensitivity", 60.), ("Invert Look", 104.),
@@ -628,7 +635,7 @@ impl Menu {
                 ),
             ],
             _ => {
-                let rows: Vec<(String, f32)> = match page {
+                let mut rows: Vec<(String, f32)> = match page {
                     Page::Video => vec![
                         (
                             format!(
@@ -655,6 +662,15 @@ impl Menu {
                     Page::Game => game_rows(cfg!(target_os = "vita")),
                     _ => Vec::new(),
                 };
+                if page == Page::Video && gamma_available() {
+                    let label = self.layouts["controls"]
+                        .iter()
+                        .find(|widget| widget.value("name") == "Brightness")
+                        .map(|widget| widget.value("title"))
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or("Brightness");
+                    rows.push((format!("{label}  {:.1}", self.draft.gamma), 252.));
+                }
                 let mut buttons = rows
                     .into_iter()
                     .enumerate()
@@ -704,6 +720,10 @@ impl Menu {
                 .rem_euclid(SIZES.len() as i32) as usize
             }
             (Page::Video, 1) => self.draft.fullscreen = !self.draft.fullscreen,
+            (Page::Video, 2) => {
+                let tenths = (self.draft.gamma * 10.).round() + delta;
+                self.draft.gamma = (tenths / 10.).clamp(GAMMA_MIN, GAMMA_MAX);
+            }
             (Page::Audio, 0) => {
                 self.draft_audio.music = (self.draft_audio.music + delta * 0.05).clamp(0., 1.)
             }
@@ -761,6 +781,7 @@ impl Menu {
     }
     fn slider(&self, page: Page, row: usize) -> Option<f32> {
         match (page, row) {
+            (Page::Video, 2) => Some((self.draft.gamma - GAMMA_MIN) / (GAMMA_MAX - GAMMA_MIN)),
             (Page::Audio, 0) => Some(self.draft_audio.music),
             (Page::Audio, 1) => Some(self.draft_audio.effects),
             (Page::Game, 0) if cfg!(target_os = "vita") => Some((self.draft.pad_sensitivity - 0.2) / 2.8),
@@ -779,6 +800,9 @@ impl Menu {
     fn drag_slider(&mut self, page: Page, row: usize, value: f32) {
         let v = value.clamp(0., 1.);
         match (page, row) {
+            (Page::Video, 2) => {
+                self.draft.gamma = ((GAMMA_MIN + v * (GAMMA_MAX - GAMMA_MIN)) * 10.).round() / 10.;
+            }
             (Page::Audio, 0) => self.draft_audio.music = v,
             (Page::Audio, 1) => self.draft_audio.effects = v,
             (Page::Game, 0) if cfg!(target_os = "vita") => self.draft.pad_sensitivity = 0.2 + v * 2.8,
@@ -1044,13 +1068,15 @@ impl Menu {
             self.ui
                 .font
                 .draw(canvas, preset, Rect::new(65., 141., 226., 21.), 18., ink);
-            for (text, y) in [
-                ("Fullscreen fits your desktop.", 257.),
-                ("Windowed uses the size above.", 281.),
-            ] {
-                self.ui
-                    .font
-                    .draw(canvas, text, Rect::new(65., y, 226., 21.), 17., ink);
+            if !gamma_available() {
+                for (text, y) in [
+                    ("Fullscreen fits your desktop.", 257.),
+                    ("Windowed uses the size above.", 281.),
+                ] {
+                    self.ui
+                        .font
+                        .draw(canvas, text, Rect::new(65., y, 226., 21.), 17., ink);
+                }
             }
         }
         if matches!(page, Page::Audio | Page::Game) {

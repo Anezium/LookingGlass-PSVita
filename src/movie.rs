@@ -354,6 +354,27 @@ pub fn bypass_requested() -> bool {
     { false }
 }
 
+#[cfg(feature = "vita_renderer")]
+pub async fn play_logos(
+    assets: &mut Assets,
+    audio: &mut Audio,
+    ui: &Ui,
+    input: &mut Input,
+    preferences: &Preferences,
+) -> bool {
+    for name in ["ealogo", "roguelogo"] {
+        let mut memory = crate::transition_memory::Transition::begin("startup-logo", "boot", name);
+        let result = play(assets, audio, ui, input, preferences, name).await;
+        memory.finish(matches!(result, Ok(true)));
+        match result {
+            Ok(false) => return false,
+            Ok(true) => (),
+            Err(error) => eprintln!("Startup film {name} unavailable: {error:#}"),
+        }
+    }
+    true
+}
+
 /// Returns false when the window was closed; true when watched or deliberately skipped.
 pub async fn play(
     assets: &mut Assets,
@@ -365,7 +386,10 @@ pub async fn play(
 ) -> Result<bool> {
     let _r13=crate::allocation_census::Scope::new(8);
     let mut skip = crate::cinematic::Skip::film(name, input.film_skip_label(preferences));
-    ensure!(matches!(name, "opening" | "ending"), "Unknown story movie");
+    ensure!(
+        matches!(name, "opening" | "ending" | "ealogo" | "roguelogo"),
+        "Unknown movie"
+    );
     // Bench, renderbench and fullbench restore a save. They must not open a film.
     #[cfg(target_os = "vita")]
     if crate::frame_profile::story_movies_blocked() {
@@ -378,6 +402,7 @@ pub async fn play(
         skip.handoff("config-bypass");
         return Ok(true);
     }
+    let load_started = matches!(name, "ealogo" | "roguelogo").then(Instant::now);
     let path = format!("video/{name}.roq");
     let mut video = Video::new(assets.open_stream(&path)?)?;
     let mut reader = assets.open_stream(&path)?;
@@ -400,6 +425,9 @@ pub async fn play(
     texture.set_filter(FilterMode::Linear);
     audio.update(0., Vec3::ZERO, 0., true, true);
     let soundtrack = audio.movie_sound(assets, &format!("video/{name}.mp3"))?;
+    if let Some(started) = load_started {
+        eprintln!("[lg/film] id={name} load_ms={:.3}", started.elapsed().as_secs_f64() * 1000.);
+    }
     let mut elapsed = 0_f64;
     let mut paused = false;
     let mut clock_at = Instant::now();

@@ -496,6 +496,12 @@ pub struct Config {
     pub startup_splash:bool,
     /// Human fallback only; preserves normal game/renderer policy when off.
     pub story_film_bypass: bool,
+    /// Play publisher and developer films before the front end.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub logo_films: bool,
+    /// Expose Brightness when the single upscale pass is active.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gamma_option: bool,
     /// Explicit console candidate: move DSP/decoding off the device callback.
     pub audio_pcm_worker: bool,
     /// Exact static acoustic traces on the PCM producer, only while its cushion is full.
@@ -801,6 +807,8 @@ impl Default for Config {
             gpu_index_dedupe: false, gpu_uniform_dedupe: false,
             startup_splash:false,
             story_film_bypass: false,
+            logo_films: false,
+            gamma_option: false,
             audio_pcm_worker: false,
             audio_offmain: false,
             audio_static_cache: true,
@@ -1264,7 +1272,12 @@ pub(crate) use scale::probe_depth as probe_first_frame_depth;
 pub(crate) fn display_clear_skipped() -> bool { config().display_clear_skip && config().render_scale < 1. }
 pub(crate) fn begin_3d_pass(action:PassAction){scale::begin(action);}
 pub(crate) fn set_3d_camera(camera:&Camera3D){scale::camera(camera);}
-pub(crate) fn present_3d(){scale::present();}
+pub(crate) fn present_3d() { scale::present(1.); }
+pub(crate) fn present_3d_with_gamma(gamma: f32) { scale::present(gamma); }
+
+pub(crate) fn gamma_available() -> bool {
+    config().gamma_option && config().render_scale < 1.
+}
 pub(crate) fn diagnostic_target() -> Option<[u32; 2]> { scale::diagnostic_size() }
 pub(crate) fn end_world_pass() {
     depth_sentinel::opaque();

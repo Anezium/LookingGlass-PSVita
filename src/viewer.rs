@@ -1486,6 +1486,12 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     } else if saves_enabled && !options.new_game && !options.direct_map
         && (options.frames.is_none() || crate::transition_memory::host_start_chapter().is_some())
     {
+        #[cfg(feature = "vita_renderer")]
+        if options.frames.is_none() && crate::render::vita_renderer::config().logo_films
+            && !crate::movie::play_logos(&mut assets, &mut audio, &ui, &mut input, &preferences).await
+        {
+            return Ok(());
+        }
         match start::choose(
             &mut options,
             &mut escape_menu,
@@ -5327,7 +5333,7 @@ interactions
             crate::render::vita_renderer::probe_first_frame_depth()?;
         }
         #[cfg(feature="vita_renderer")]
-        crate::render::vita_renderer::present_3d();
+        crate::render::vita_renderer::present_3d_with_gamma(preferences.gamma);
         let census_capture = crate::phase_census::span(crate::phase_census::Region::RenderCapture);
         #[cfg(feature = "vita_renderer")]
         if let Some(p) = &load_probe { p.gl("present-queued"); }

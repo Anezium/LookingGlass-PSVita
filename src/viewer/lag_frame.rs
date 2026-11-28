@@ -93,7 +93,7 @@ impl Frame {
         );
         trace.owner(stamp, Scope::Render, None, started);
         #[cfg(feature = "vita_renderer")]
-        crate::render::vita_renderer::present_3d();
+        crate::render::vita_renderer::present_3d_with_gamma(self.preferences.gamma);
         if tail.preview_capture {
             save_frame.update();
         }
