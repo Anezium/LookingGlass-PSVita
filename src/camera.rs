@@ -15,7 +15,20 @@ pub struct Follow {
     arm: f32,
     release: f32,
     visible: bool,
+    solved: bool,
     last: Solve,
+}
+
+/// `camera_start_visible`: the first solve after `reset()` uses the lower visibility threshold.
+fn start_visible() -> bool {
+    #[cfg(feature = "vita_renderer")]
+    {
+        crate::render::vita_renderer::config().camera_start_visible
+    }
+    #[cfg(not(feature = "vita_renderer"))]
+    {
+        false
+    }
 }
 
 /// The last arm solve, kept for the off-by-default camera log only.
@@ -137,8 +150,14 @@ impl Follow {
             self.arm += (preferred - self.arm) * (1. - (-8. * ease_dt).exp());
         }
         let eye = target + offset * (self.arm / length.max(0.001));
+        let first = !std::mem::replace(&mut self.solved, true);
         // Hysteresis avoids flickering Alice on/off as the camera grazes an edge.
-        self.visible = self.arm > if self.visible { 30. } else { 42. };
+        self.visible = self.arm
+            > if self.visible || (first && start_visible()) {
+                30.
+            } else {
+                42.
+            };
         let look_at = if self.arm < 0.1 {
             eye - offset.normalize_or_zero()
         } else {
@@ -348,6 +367,53 @@ mod tests {
             "A close wall must not swing the camera overhead"
         );
         assert!(eye.x > -18.);
+    }
+
+    #[cfg(feature = "vita_renderer")]
+    fn start(on: bool, run: impl FnOnce()) {
+        crate::render::vita_renderer::with_config(|c| c.camera_start_visible = on, run)
+    }
+
+    #[cfg(feature = "vita_renderer")]
+    #[test]
+    fn a_fresh_start_between_the_thresholds_shows_alice_only_with_the_key() {
+        // Arm about 39.8, between the 30 and 42 thresholds (the fortress2 start is 40.786).
+        let near = wall(-43.);
+        for on in [false, true] {
+            start(on, || {
+                let mut camera = Follow::default();
+                let (eye, target, visible) = camera.update(&near, Vec3::ZERO, Vec3::X, 132., 1. / 60.);
+                safe(&near, eye, target);
+                assert!(camera.arm > 30. && camera.arm < 42., "arm {}", camera.arm);
+                assert_eq!(visible, on);
+                for _ in 0..30 {
+                    assert_eq!(camera.update(&near, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2, on);
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "vita_renderer")]
+    #[test]
+    fn only_the_first_solve_after_a_reset_uses_the_lower_threshold() {
+        start(true, || {
+            let (tight, near) = (wall(-26.), wall(-43.));
+            let mut camera = Follow::default();
+            // Under the 30 floor: hidden even on the first solve.
+            assert!(!camera.update(&tight, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2);
+            assert!(camera.arm < 30.);
+            // A later solve at arm 39.8 keeps the 42 rule.
+            assert!(!camera.update(&near, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2);
+            assert!(camera.arm > 30. && camera.arm < 42.);
+            // A teleport is fresh for the arm but is not a reset.
+            let far = vec3(400., 0., 0.);
+            let moved = World::fixture(&[(vec3(far.x - 53., -200., -100.), vec3(far.x - 43., 200., 200.))]);
+            camera.update(&tight, Vec3::ZERO, Vec3::X, 132., 1. / 60.);
+            assert!(!camera.update(&moved, far, Vec3::X, 132., 1. / 60.).2);
+            assert!(camera.arm > 30. && camera.arm < 42.);
+            camera.reset();
+            assert!(camera.update(&near, Vec3::ZERO, Vec3::X, 132., 1. / 60.).2);
+        });
     }
 
     #[test]

@@ -565,6 +565,10 @@ pub struct Config {
     /// Vita display queue interval of two vblanks (nominally 30 fps), for lag-one runs.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sim_overlap_cap_30: bool,
+    /// Judge the first follow-camera solve after a reset (load, death retry, save load) against the
+    /// lower 30-unit visibility threshold, as if Alice were already visible. Picture change; off by default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub camera_start_visible: bool,
     /// Buffer stamped simulation and presentation timings until viewer teardown.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub diag_sim_timing: bool,
@@ -834,6 +838,7 @@ impl Default for Config {
             sim_overlap_maps: Vec::new(),
             sim_overlap_live: false,
             sim_overlap_cap_30: false,
+            camera_start_visible: false,
             diag_sim_timing: false,
             replay_play: String::new(),
             replay_start: String::new(),
