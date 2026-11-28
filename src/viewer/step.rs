@@ -1864,6 +1864,7 @@ pub(super) fn step_b_in_place(
             gameplay_alice && camera.distance(sim.player.feet + Vec3::Z * 32.) > 30.
         };
     drop(census_leaf);
+    #[cfg(not(target_os = "vita"))]
     if crate::camera::log_enabled() {
         crate::camera::log_step(
             &map_name.to_string(),

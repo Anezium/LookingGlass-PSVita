@@ -4180,7 +4180,7 @@ mod tests {
         assert_eq!(release["sim_overlap"], true);
         assert_eq!(release["sim_overlap_normal"], true);
         assert_eq!(release["sim_overlap_maps"], serde_json::json!(["potears2"]));
-        for key in ["sim_overlap_live", "sim_overlap_cap_30", "diag_sim_timing"] {
+        for key in ["sim_overlap_live", "sim_overlap_cap_30", "diag_sim_timing", "camera_start_visible"] {
             assert!(release.get(key).is_none_or(|v| v == false), "the fallback never sets {key}");
         }
         assert_eq!(release["replay_play"], "");
@@ -4205,6 +4205,36 @@ mod tests {
         }
         assert_eq!(release, from_rc23, "the fallback changes only the fourteen v1.1 keys against RC23");
     }
+    #[test]
+    fn camera_start_visible_defaults_off_and_is_a_strict_boolean() {
+        let defaults = Config::default();
+        assert!(!defaults.camera_start_visible);
+        assert!(serde_json::to_value(defaults).unwrap().get("camera_start_visible").is_none());
+
+        for (json, enabled) in [
+            ("{}", false),
+            (r#"{"camera_start_visible":false}"#, false),
+            (r#"{"camera_start_visible":true}"#, true),
+        ] {
+            let (config, rejected) = parse_runtime_config(json.as_bytes()).unwrap();
+            assert!(rejected.is_none());
+            assert_eq!(config.camera_start_visible, enabled);
+            let serialized = serde_json::to_value(config).unwrap();
+            let expected = enabled.then_some(serde_json::Value::Bool(true));
+            assert_eq!(serialized.get("camera_start_visible"), expected.as_ref());
+        }
+
+        for value in ["0", "1", r#""true""#, "null", "[]", "{}"] {
+            let json = format!(r#"{{"camera_start_visible":{value}}}"#);
+            assert!(parse_runtime_config(json.as_bytes()).is_err(), "{json}");
+        }
+
+        let (release, rejected) =
+            parse_runtime_config(include_bytes!("../../configs/PL-release.json")).unwrap();
+        assert!(rejected.is_none());
+        assert!(!release.camera_start_visible);
+    }
+
     #[test]
     fn rc23_play_config_is_the_release_fallback_plus_the_measurement_keys() {
         let release = parse_runtime_config(include_bytes!("../../configs/PL-rc23-release.json"))

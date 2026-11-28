@@ -16,6 +16,7 @@ pub struct Follow {
     release: f32,
     visible: bool,
     solved: bool,
+    #[cfg(not(target_os = "vita"))]
     last: Solve,
 }
 
@@ -31,7 +32,8 @@ fn start_visible() -> bool {
     }
 }
 
-/// The last arm solve, kept for the off-by-default camera log only.
+/// The last arm solve, kept for host diagnostics.
+#[cfg(not(target_os = "vita"))]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Solve {
     pub length: f32,
@@ -126,12 +128,15 @@ impl Follow {
         let length = offset.length();
         let hit = world.camera_sweep(target, target + offset, HALF);
         let limit = length * if hit.start_solid { 0. } else { hit.fraction };
-        self.last = Solve {
-            length,
-            limit,
-            normal: hit.normal,
-            start_solid: hit.start_solid,
-        };
+        #[cfg(not(target_os = "vita"))]
+        {
+            self.last = Solve {
+                length,
+                limit,
+                normal: hit.normal,
+                start_solid: hit.start_solid,
+            };
+        }
         let preferred = limit.min(anticipated);
         if fresh {
             self.arm = preferred;
@@ -167,6 +172,7 @@ impl Follow {
     }
 }
 
+#[cfg(not(target_os = "vita"))]
 impl Follow {
     pub fn arm(&self) -> f32 {
         self.arm
@@ -178,11 +184,13 @@ impl Follow {
 
 /// Diagnostic camera log, silent unless `LOOKING_GLASS_CAMERA_LOG` is set.
 /// One `[lg/camera]` line per gameplay step; it never changes the camera.
+#[cfg(not(target_os = "vita"))]
 pub fn log_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LOOKING_GLASS_CAMERA_LOG").is_some())
 }
 
+#[cfg(not(target_os = "vita"))]
 #[allow(clippy::too_many_arguments)]
 pub fn log_step(
     map: &str,
@@ -208,6 +216,7 @@ pub fn log_step(
 /// Host diagnostic (`--camera-entry-probe MAP [--entry NAME]`): solve the follow camera at the
 /// map entrance for 60 steps at the spawn yaw and every 15 degrees, and name the world brush
 /// that stops the arm. Reads game data only; it changes no game state.
+#[cfg(not(target_os = "vita"))]
 pub fn entry_probe(
     assets: &mut crate::assets::Assets,
     name: &str,

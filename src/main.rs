@@ -491,6 +491,7 @@ fn run() -> Result<()> {
             "--hud-check" => mode = "hud",
             "--loadout-check" => mode = "loadout",
             "--camera-check" => mode = "camera",
+            #[cfg(not(target_os = "vita"))]
             "--camera-entry-probe" => {
                 mode = "camera-entry-probe";
                 movie_name = args.next().context("--camera-entry-probe requires a map")?;
@@ -820,6 +821,7 @@ fn run() -> Result<()> {
     if mode == "camera" {
         return camera::check(&mut assets);
     }
+    #[cfg(not(target_os = "vita"))]
     if mode == "camera-entry-probe" {
         return camera::entry_probe(&mut assets, &movie_name, o.entry.as_deref());
     }
