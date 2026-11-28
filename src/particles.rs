@@ -547,6 +547,9 @@ struct AnimationBinding {
 struct PuffSweep {
     start: Option<Vec3>,
     ticks: u32,
+    /// Host probe: the puff crossed world geometry while collision was off.
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    crossed: bool,
 }
 impl PuffSweep {
     fn segment(&mut self, config: &crate::vita_sim::Config, position: Vec3, next: Vec3, velocity: Vec3) -> Option<(Vec3, Vec3)> {
@@ -565,7 +568,11 @@ impl PuffSweep {
             Some((start, next))
         } else {
             if config.puff_collide == PuffCollide::None {
+                #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                let crossed = self.crossed;
                 *self = Self::default();
+                #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                { self.crossed = crossed; }
             }
             None
         }
@@ -1259,6 +1266,12 @@ impl SteamSim {
                 } else {
                     #[cfg(target_os = "vita")]
                     { skipped += 1; }
+                    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                    if puff_cross::on() && config.puff_collide == crate::vita_sim::PuffCollide::None
+                        && !p.sweep.crossed && world.sweep(p.position, next, Vec3::ZERO).fraction < 1. {
+                        p.sweep.crossed = true;
+                        puff_cross::new_crossing(&self.emitters[p.emitter].spec.image);
+                    }
                 }
             } else {
                 #[cfg(target_os = "vita")]
@@ -1281,6 +1294,11 @@ impl SteamSim {
             self.puffs.retain(|p| p.age < p.life);
         }
         let retained = self.puffs.len() as u32;
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        if puff_cross::on() {
+            puff_cross::report(self.puffs.iter().filter(|p| p.sweep.crossed)
+                .map(|p| self.emitters[p.emitter].spec.image.as_str()), self.puffs.len());
+        }
         #[cfg(target_os = "vita")]
         let _emit_profile = crate::frame_profile::span("particles_emit");
 
@@ -3356,5 +3374,29 @@ mod snapshot_render_tests {
         steam.sim.puffs[0].emitter = steam.sim.emitters.len();
         assert!(steam.extract_render_input(visit).1);
         assert!(steam.draw_input(visit).is_none());
+    }
+}
+
+/// Host probe, `LOOKING_GLASS_PUFF_CROSS=1`: with `puff_collide: none`, count puffs whose step
+/// crosses world geometry (with collision on, that step kills the puff) and how many such puffs
+/// are still alive after each update. Prints `PUFF_CROSS` when any exist. Diagnostic only.
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+mod puff_cross {
+    use std::{cell::RefCell, collections::BTreeMap, sync::OnceLock};
+    thread_local! { static NEW: RefCell<BTreeMap<String, u64>> = RefCell::default(); }
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LOOKING_GLASS_PUFF_CROSS").is_some())
+    }
+    pub(super) fn new_crossing(image: &str) {
+        NEW.with(|n| *n.borrow_mut().entry(image.to_string()).or_default() += 1);
+    }
+    pub(super) fn report<'a>(alive: impl Iterator<Item = &'a str>, total: usize) {
+        let mut by: BTreeMap<&str, u64> = BTreeMap::new();
+        for image in alive { *by.entry(image).or_default() += 1; }
+        let new = NEW.with(|n| std::mem::take(&mut *n.borrow_mut()));
+        if by.is_empty() && new.is_empty() { return; }
+        println!("PUFF_CROSS {}", serde_json::json!({"frame": crate::sim_maps::probe::frame(),
+            "alive": by, "new": new, "puffs": total}));
     }
 }
