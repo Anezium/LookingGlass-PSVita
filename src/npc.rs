@@ -1250,6 +1250,11 @@ impl Puppet {
         self.material.bind();
     }
 }
+#[cfg(not(target_os = "vita"))]
+fn i07_timeline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LOOKING_GLASS_I07_TIMELINE").is_some_and(|v| v == "1"))
+}
 pub fn placed_guards(map: &Bsp, name: &str) -> Vec<Guard> {
     placements(map, name, None, false)
         .into_iter()
@@ -1721,6 +1726,9 @@ impl ModelArt {
             looping,
         );
         let tag_pose = |tag: Option<&str>, at: f32| {
+            // Host-only I07 diagnostic (no-op in Vita builds): skeleton evaluations per new birth.
+            crate::sim_maps::count("i07_tag_pose_calls", 1);
+            let _i07 = crate::sim_maps::timer("i07_tag_pose_ns");
             let Some(bone) =
                 tag.and_then(|name| d.skeleton.bones.iter().position(|b| b.name == name))
             else {
@@ -1754,11 +1762,22 @@ impl ModelArt {
             }
         }
         if let Some(effect) = &mut self.own_effect {
+            // Host-only I07 prototype, off unless LOOKING_GLASS_I07_TIMELINE=1: answer the per-slot emitter
+            // query from one EmitterTimeline per draw instead of a full visual() per slot.
+            #[cfg(not(target_os = "vita"))]
+            let i07_timeline = i07_timeline_enabled()
+                .then(|| d.events.emitter_timeline(clip, animation.duration(), animation.frame_time, looping));
+            #[cfg(target_os = "vita")]
+            let i07_timeline: Option<crate::animation_events::EmitterTimeline> = None;
             effect.draw(
                 time,
                 scale,
                 |at, tag| tag_pose(tag, at),
                 |name, at, default| {
+                    // Host-only I07 diagnostic (no-op in Vita builds): one full visual() per slot per frame.
+                    crate::sim_maps::count("i07_own_effect_enabled_calls", 1);
+                    let _i07 = crate::sim_maps::timer("i07_own_effect_enabled_ns");
+                    if let Some(t) = &i07_timeline { return t.enabled(name, at, default); }
                     d.events
                         .visual(
                             clip,
