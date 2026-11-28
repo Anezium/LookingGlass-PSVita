@@ -238,7 +238,7 @@ fn log_framebuffer() {
     ONCE.get_or_init(||{
         let values=unsafe{let mut result=Vec::new();for (label,param) in [("red_bits",0x0D52),("green_bits",0x0D53),("blue_bits",0x0D54),("alpha_bits",0x0D55),("depth_bits",0x0D56),("stencil_bits",0x0D57)]{
             let mut value=0;macroquad::miniquad::gl::glGetIntegerv(param,&mut value);let error=macroquad::miniquad::gl::glGetError();result.push(serde_json::json!({"name":label,"value":value,"gl_error":error}));}result};
-        println!("[lg/vita-renderer] framebuffer sample_count={} gxm_msaa={} default_queries={} extra_fullscreen_pass={}",config().msaa_samples,match config().msaa_samples{1=>"NONE",2=>"2X",_=>"4X"},serde_json::to_string(&values).unwrap(),if config().render_scale<1.{"one upscale"}else{"none"});
+        crate::spike_log::play_line(crate::spike_log::Stream::Out, format_args!("[lg/vita-renderer] framebuffer sample_count={} gxm_msaa={} default_queries={} extra_fullscreen_pass={}",config().msaa_samples,match config().msaa_samples{1=>"NONE",2=>"2X",_=>"4X"},serde_json::to_string(&values).unwrap(),if config().render_scale<1.{"one upscale"}else{"none"}));
     });
 }
 
@@ -269,7 +269,7 @@ pub(super) fn log_depth(opaque: bool) {
             #[cfg(not(target_os="vita"))]
             {let mut enabled=0;let mut write=0;let mut func=0;macroquad::miniquad::gl::glGetIntegerv(0x0B71,&mut enabled);macroquad::miniquad::gl::glGetIntegerv(0x0B72,&mut write);macroquad::miniquad::gl::glGetIntegerv(0x0B74,&mut func);(enabled,write,func)}
         };
-        println!("[lg/vita-renderer] effective depth opaque={opaque} enabled={enabled} write={write} func={func} order={} early_z=hardware-unverified",config().opaque_order);
+        crate::spike_log::play_line(crate::spike_log::Stream::Out, format_args!("[lg/vita-renderer] effective depth opaque={opaque} enabled={enabled} write={write} func={func} order={} early_z=hardware-unverified",config().opaque_order));
     });
 }
 

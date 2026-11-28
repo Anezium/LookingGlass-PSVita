@@ -267,12 +267,12 @@ fn audio_memory(event: &str, cache_samples: usize, player: Option<PlayerPcm>) {
             fordblks: usize, keepcost: usize }
         extern "C" { fn mallinfo() -> MallInfo; }
         let heap = unsafe { mallinfo() };
-        eprintln!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used={} heap_free_arena={} heap_arena={}{player}",
-            cache_samples * 4, CACHE_SAMPLES * 4, heap.uordblks, heap.fordblks, heap.arena);
+        crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used={} heap_free_arena={} heap_arena={}{player}",
+            cache_samples * 4, CACHE_SAMPLES * 4, heap.uordblks, heap.fordblks, heap.arena));
     }
     #[cfg(not(target_os = "vita"))]
-    eprintln!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used=unavailable heap_free_arena=unavailable{player}",
-        cache_samples * 4, CACHE_SAMPLES * 4);
+    crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used=unavailable heap_free_arena=unavailable{player}",
+        cache_samples * 4, CACHE_SAMPLES * 4));
 }
 #[cfg(test)]
 mod named_prefetch_tests {

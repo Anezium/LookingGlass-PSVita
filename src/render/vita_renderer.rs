@@ -71,6 +71,10 @@ pub struct Config {
     /// Diagnostic: print every gameplay frame slower than this many milliseconds with its main-thread
     /// split, and every load done outside a load phase (`spike_log.rs`). 0 is off.
     pub spike_log_ms: f32,
+    /// Write the load diagnostics of the first gameplay frame and the audio-memory line of a clip
+    /// admitted during play at the next flush point (`spike_log.rs`, `play_line`), not on the game
+    /// thread inside the frame. Same bytes and order on each stream. Default off.
+    pub play_log_buffer: bool,
     /// Preload, with the level's sounds, the combat sounds of the enemy kinds placed in the map, Alice's
     /// pain cries and the weapon flesh hits, so the first hit or death does not read and decode a clip
     /// in a frame (`audio.rs`, `combat_preload`).
@@ -519,6 +523,9 @@ pub struct Config {
     /// Decode Alice's measured global player cues once into a resident cache
     /// that survives map loads.
     pub audio_player_prefetch: bool,
+    /// With `audio_voice_prefetch`, admit story WAVs up to 1.25 MiB instead of 1 MiB
+    /// (`audio/voice.rs`), so jlair2's 1,060,974 B `jbwk004.wav` is not read in play. Default off.
+    pub voice_wav_cap_1_25: bool,
     pub audio_block_mix: bool,
     pub audio_preresample: bool,
     pub audio_block_parameters: bool,
@@ -655,6 +662,7 @@ impl Default for Config {
             worker_spin_us: 0,
             skin_stream: false,
             spike_log_ms: 0.,
+            play_log_buffer: false,
             audio_combat_preload: false,
             sim_sweep_blocked: false,
             sim_sweep_any: false,
@@ -810,6 +818,7 @@ impl Default for Config {
             audio_voice_prefetch: false,
             audio_named_prefetch: false,
             audio_player_prefetch: false,
+            voice_wav_cap_1_25: false,
             audio_block_mix: false,
             audio_preresample: false,
             audio_block_parameters: false,
@@ -4527,6 +4536,23 @@ mod tests {
             assert!(!c.finale_checkpoint_background, "a shipped config predates the key and reads it off");
         }
     }
+    #[test]
+    fn play_log_buffer_and_voice_wav_cap_default_off_and_are_strict() {
+        for key in ["play_log_buffer", "voice_wav_cap_1_25"] {
+            let off = serde_json::to_value(Config::default()).unwrap();
+            assert_eq!(off[key], false);
+            assert_eq!(serde_json::to_value(serde_json::from_str::<Config>("{}").unwrap()).unwrap()[key], false);
+            let on: Config = serde_json::from_value(serde_json::json!({key: true})).unwrap();
+            on.validate().unwrap();
+            assert_eq!(serde_json::to_value(on).unwrap()[key], true);
+            for invalid in [serde_json::json!(0), serde_json::json!("on"), serde_json::Value::Null] {
+                assert!(serde_json::from_value::<Config>(serde_json::json!({key: invalid})).is_err());
+            }
+            let (release, rejected) = parse_runtime_config(include_bytes!("../../configs/PL-release.json")).unwrap();
+            assert!(rejected.is_none());
+            assert_eq!(serde_json::to_value(release).unwrap()[key], false, "the fallback predates {key}");
+        }
+    }
     // Historical console configs must stay usable by their original SELF. Their omitted
     // new opt-in is checked as off; every earlier runtime key remains pinned by these tests.
     // The two actor keys arrived after every frozen era file, so those files stay valid
@@ -4535,7 +4561,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache" | "play_log_buffer" | "voice_wav_cap_1_25") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);

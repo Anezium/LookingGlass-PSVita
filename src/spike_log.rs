@@ -24,7 +24,15 @@
 //! crashes are lost.
 //!
 //! Nothing here runs when the key is 0 beyond one config load per call site.
-use std::{cell::RefCell, fmt::Write as _, time::Instant};
+//!
+//! `play_log_buffer` (default off) applies the same deferral to other diagnostic lines, with or
+//! without the spike threshold: the load diagnostics of the first gameplay frame
+//! (`restore_diagnostic::Probe`, the framebuffer and depth records) and the `[lg/audio-memory]`
+//! line of a clip admitted during play. While a gameplay frame is open on the game thread and no
+//! load phase is, `play_line` keeps them in their own buffer and writes them at the same flush
+//! points, each to its own stream, in the order they came, then one `[lg/play-log] flushed` line.
+//! A line that would not fit first writes the buffer at once, so no line is dropped or reordered.
+use std::{cell::{Cell, RefCell}, fmt::Write as _, time::Instant};
 
 pub(crate) const KINDS: [&str; 7] = ["texture_read", "texture_decode", "texture_upload", "shader", "asset_read",
     "material_parse", "audio_clip"];
@@ -115,6 +123,78 @@ impl Out {
         }
     }
 
+}
+
+/// The stream a deferred diagnostic line belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum Stream { Out, Err }
+/// Lines deferred by `play_log_buffer`, each led by its stream tag and ended by a newline.
+#[derive(Default)]
+struct Play { text: String, lines: u32, bytes: usize, early: u32 }
+/// Reserved on the first deferred line. The first frame after a load defers about 2.7 KB, a clip
+/// admitted in play about 265 B.
+const PLAY_CAP: usize = 64 << 10;
+const TAG_OUT: char = '\u{1}';
+const TAG_ERR: char = '\u{2}';
+thread_local! {
+    static PLAY: RefCell<Play> = RefCell::default();
+    /// Between `begin_frame` and `end_play` on the game thread, with `play_log_buffer` on.
+    static PLAY_OPEN: Cell<bool> = const { Cell::new(false) };
+}
+impl Play {
+    fn push(&mut self, stream: Stream, args: std::fmt::Arguments<'_>) {
+        if self.text.capacity() == 0 { self.text.reserve_exact(PLAY_CAP); }
+        if self.text.len() + LINE_MAX > PLAY_CAP {
+            self.write();
+            self.early += 1;
+        }
+        let mark = self.text.len();
+        self.text.push(match stream { Stream::Out => TAG_OUT, Stream::Err => TAG_ERR });
+        let _ = writeln!(self.text, "{args}");
+        self.lines += 1;
+        self.bytes += self.text.len() - mark - 1;
+    }
+    /// Writes the buffered lines in order, each to its stream, and keeps the reservation.
+    fn write(&mut self) {
+        for line in self.text.lines() {
+            match line.strip_prefix(TAG_OUT) {
+                Some(body) => println!("{body}"),
+                None => eprintln!("{}", line.strip_prefix(TAG_ERR).unwrap_or(line)),
+            }
+        }
+        self.text.clear();
+    }
+}
+#[inline]
+fn play_buffer() -> bool {
+    #[cfg(feature = "vita_renderer")]
+    { crate::render::vita_renderer::config().play_log_buffer }
+    #[cfg(not(feature = "vita_renderer"))]
+    { false }
+}
+/// One diagnostic line for `stream`: written now, or with `play_log_buffer`, while a gameplay frame
+/// is open on this thread outside a load phase, at the next flush point.
+pub(crate) fn play_line(stream: Stream, args: std::fmt::Arguments<'_>) {
+    if play_buffer() && PLAY_OPEN.with(Cell::get) && !crate::startup::in_phase() {
+        PLAY.with(|p| p.borrow_mut().push(stream, args));
+        return;
+    }
+    match stream {
+        Stream::Out => println!("{args}"),
+        Stream::Err => eprintln!("{args}"),
+    }
+}
+fn flush_play(at: &str) {
+    if !play_buffer() { return; }
+    PLAY.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.lines == 0 { return; }
+        let start = Instant::now();
+        p.write();
+        eprintln!("[lg/play-log] flushed at={at} lines={} early_writes={} bytes={} ms={:.1}", p.lines, p.early,
+            p.bytes, start.elapsed().as_secs_f64() * 1000.);
+        (p.lines, p.bytes, p.early) = (0, 0, 0);
+    });
 }
 
 #[inline]
@@ -240,6 +320,7 @@ impl Frame {
 
 /// Top of the viewer's gameplay loop. Closes the previous frame and prints it if it was slow.
 pub(crate) fn begin_frame() {
+    if play_buffer() { PLAY_OPEN.with(|o| o.set(true)); }
     let limit = threshold_ms();
     if limit <= 0. { return; }
     #[cfg(target_os = "vita")]
@@ -328,6 +409,7 @@ impl WorkerLateLines {
 /// Writes the buffered lines, one record each, then one `[lg/spike] flushed` line with the count,
 /// the drops and the time the writes took. `at` names the flush point. Called outside play.
 pub(crate) fn flush(at: &str) {
+    flush_play(at);
     if !on() { return; }
     let (mut text, lines, dropped) = OUT.with(|o| {
         let mut o = o.borrow_mut();
@@ -345,7 +427,8 @@ pub(crate) fn flush(at: &str) {
 }
 /// The viewer loop ended: flush, and print later lines at once until the next `begin_frame`.
 pub(crate) fn end_play() {
-    if !on() { return; }
+    PLAY_OPEN.with(|o| o.set(false));
+    if !on() { flush_play("viewer-end"); return; }
     FRAME.with(|f| { let mut f = f.borrow_mut();
         #[cfg(all(feature="vita_renderer",feature="sim_maps_probe",not(target_os="vita")))]
         if let (Some(render),Some(hud),Some(_))=(f.render,f.hud,f.cpu_end) {f.host_share(render,hud);}
@@ -517,6 +600,27 @@ mod tests {
         assert_eq!(out.dropped, 2, "an over-long line is dropped too");
         assert_eq!(out.text.capacity(), OUT_CAP, "the buffer never grows during play");
         assert_eq!(out.text.lines().count() as u32, out.lines);
+    }
+    #[test]
+    fn play_lines_are_written_at_once_with_the_key_off() {
+        assert!(!crate::render::vita_renderer::Config::default().play_log_buffer);
+        begin_frame();
+        assert!(!PLAY_OPEN.with(Cell::get));
+        play_line(Stream::Err, format_args!("[lg/audio-memory] event=runtime:x"));
+        PLAY.with(|p| assert!(p.borrow().text.capacity() == 0 && p.borrow().lines == 0));
+    }
+    #[test]
+    fn play_buffer_keeps_streams_and_order_and_never_grows() {
+        let mut play = Play::default();
+        play.push(Stream::Out, format_args!("[lg/vita-renderer] framebuffer {}", 1));
+        play.push(Stream::Err, format_args!("[lg/load-diagnostic] stage={}", "world-begin"));
+        assert_eq!(play.text, "\u{1}[lg/vita-renderer] framebuffer 1\n\u{2}[lg/load-diagnostic] stage=world-begin\n");
+        assert_eq!((play.lines, play.bytes, play.early), (2, 72, 0));
+        assert_eq!(play.text.capacity(), PLAY_CAP);
+        let long = "x".repeat(1000);
+        while play.early == 0 { play.push(Stream::Err, format_args!("{long}")); }
+        assert_eq!(play.text, format!("\u{2}{long}\n"), "a full buffer is written, then the new line kept");
+        assert_eq!(play.text.capacity(), PLAY_CAP, "the buffer never grows during play");
     }
     #[test]
     fn log_field_reports_the_previous_line_cost() {

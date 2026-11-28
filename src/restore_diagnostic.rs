@@ -15,11 +15,11 @@ impl Probe {
         Self { reason, start: Instant::now(), world_draws: 0, triangles: 0, retained: false }
     }
     pub fn stage(&self, stage: &str) {
-        eprintln!("[lg/load-diagnostic] reason={} stage={stage} wall_ms={:.3}", self.reason, self.start.elapsed().as_secs_f64()*1000.);
+        crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/load-diagnostic] reason={} stage={stage} wall_ms={:.3}", self.reason, self.start.elapsed().as_secs_f64()*1000.));
     }
     pub fn camera(&self, camera: &Camera3D, feet: Vec3, paused: bool, scene: Option<&str>) {
-        eprintln!("[lg/load-diagnostic] reason={} camera_eye={:?} camera_target={:?} camera_up={:?} feet={feet:?} fovy={} paused={paused} cinema_owner=engine scene={scene:?}",
-            self.reason, camera.position, camera.target, camera.up, camera.fovy);
+        crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/load-diagnostic] reason={} camera_eye={:?} camera_target={:?} camera_up={:?} feet={feet:?} fovy={} paused={paused} cinema_owner=engine scene={scene:?}",
+            self.reason, camera.position, camera.target, camera.up, camera.fovy));
     }
     pub fn world(&mut self, draws: usize, triangles: usize, retained: bool) {
         self.world_draws = draws; self.triangles = triangles; self.retained = retained;
@@ -37,12 +37,12 @@ impl Probe {
             let status = glCheckFramebufferStatus(0x8D40);
             (error_before, framebuffer, viewport, status, glGetError())
         };
-        eprintln!("[lg/load-diagnostic] reason={} stage={stage} framebuffer_binding={framebuffer} viewport={viewport:?} framebuffer_status={status:#x} gl_error_before={error_before:#x} gl_error_after={error_after:#x} scale_target={:?} render_scale={}",
-            self.reason, crate::render::vita_renderer::diagnostic_target(), crate::render::vita_renderer::config().render_scale);
+        crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/load-diagnostic] reason={} stage={stage} framebuffer_binding={framebuffer} viewport={viewport:?} framebuffer_status={status:#x} gl_error_before={error_before:#x} gl_error_after={error_after:#x} scale_target={:?} render_scale={}",
+            self.reason, crate::render::vita_renderer::diagnostic_target(), crate::render::vita_renderer::config().render_scale));
     }
     pub fn finish(&self, map: &str, hud_submitted: bool) {
         self.gl("hud-queued");
-        eprintln!("[lg/load-diagnostic] reason={} map={map} end=frame-queued retained={} world_draws={} triangles={} world_submitted={} hud_submitted={hud_submitted} flush_forced=false wall_ms={:.3}",
-            self.reason, self.retained, self.world_draws, self.triangles, self.world_draws > 0, self.start.elapsed().as_secs_f64()*1000.);
+        crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/load-diagnostic] reason={} map={map} end=frame-queued retained={} world_draws={} triangles={} world_submitted={} hud_submitted={hud_submitted} flush_forced=false wall_ms={:.3}",
+            self.reason, self.retained, self.world_draws, self.triangles, self.world_draws > 0, self.start.elapsed().as_secs_f64()*1000.));
     }
 }
