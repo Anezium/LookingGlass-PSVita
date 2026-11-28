@@ -213,7 +213,7 @@ mod tests {
             bounds: (Vec3::ZERO, Vec3::ZERO),
             detail: Vec::new(),
             animation: None,
-            mesh: Mesh { upload_identity: None, surface: None, vertices: Vec::new(),
+            mesh: crate::mesh::Mesh { upload_identity: None, surface: None, vertices: Vec::new(),
                 indices: Vec::new(), texture: None },
             base: positions.iter().map(|&position| Vertex {
                 position,
@@ -313,6 +313,6 @@ mod tests {
             }
         }
         // Nothing to re-face: the authored box.
-        assert_eq!(covering_bounds(&[], (Vec3::ONE, Vec3::TWO)), (Vec3::ONE, Vec3::TWO));
+        assert_eq!(covering_bounds(&[], (Vec3::ONE, Vec3::splat(2.))), (Vec3::ONE, Vec3::splat(2.)));
     }
 }
