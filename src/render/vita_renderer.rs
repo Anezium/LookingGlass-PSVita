@@ -565,6 +565,10 @@ pub struct Config {
     /// Vita display queue interval of two vblanks (nominally 30 fps), for lag-one runs.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sim_overlap_cap_30: bool,
+    /// Display queue entries a finished frame may wait behind under the cap: 2 (vitaGL's default)
+    /// or 1 (the swap waits until the previous entry's display callback has returned). Vita only.
+    #[serde(skip_serializing_if = "is_default_cap_queue_depth")]
+    pub cap_queue_depth: u8,
     /// Buffer stamped simulation and presentation timings until viewer teardown.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub diag_sim_timing: bool,
@@ -834,6 +838,7 @@ impl Default for Config {
             sim_overlap_maps: Vec::new(),
             sim_overlap_live: false,
             sim_overlap_cap_30: false,
+            cap_queue_depth: 2,
             diag_sim_timing: false,
             replay_play: String::new(),
             replay_start: String::new(),
@@ -945,6 +950,9 @@ impl Config {
             "lag-one overlap is available on potears2, skool1 and centipede1");
         ensure!(!self.sim_overlap_cap_30 || !self.sim_overlap_maps.is_empty(),
             "sim_overlap_cap_30 requires an explicit lag-one map allowlist");
+        ensure!(matches!(self.cap_queue_depth, 1 | 2), "cap_queue_depth must be 1 or 2");
+        ensure!(self.cap_queue_depth == 2 || (self.sim_overlap_cap_30 && !self.startup_splash),
+            "cap_queue_depth 1 requires sim_overlap_cap_30 and no startup_splash");
         crate::replay::validate_settings(&crate::replay::Settings { record: self.replay_record.clone(),
             play: self.replay_play.clone(), start: self.replay_start.clone(), check_every: self.replay_check_every,
             state_every: self.replay_state_every, stop_after: self.replay_stop_after })?;
@@ -1046,6 +1054,7 @@ fn sky_gradient(bg: Color, flat: bool) -> [[f32; 4]; 2] {
     let top = if flat { 1. } else { 1.5 };
     [[bg.r, bg.g, bg.b, 1.], [bg.r * top, bg.g * top, bg.b * top, 1.]]
 }
+fn is_default_cap_queue_depth(depth: &u8) -> bool { *depth == 2 }
 /// The effective miniquad report cadence, as printed: `off` or a frame count.
 fn report_cadence(c: &Config) -> String {
     c.log_frame_time_every.filter(|&n| n > 0).map_or_else(|| "off".into(), |n| n.to_string())
@@ -5364,8 +5373,24 @@ mod tests {
         assert!(defaults.get("sim_overlap_maps").is_none());
         assert!(defaults.get("sim_overlap_live").is_none());
         assert!(defaults.get("sim_overlap_cap_30").is_none());
+        assert!(defaults.get("cap_queue_depth").is_none());
 
         config.sim_overlap_maps.pop();
+        config.cap_queue_depth = 1;
+        assert!(config.validate().is_ok());
+        assert_eq!(serde_json::to_value(&config).unwrap()["cap_queue_depth"], 1);
+        config.cap_queue_depth = 3;
+        assert!(config.validate().is_err());
+        config.cap_queue_depth = 0;
+        assert!(config.validate().is_err());
+        config.cap_queue_depth = 1;
+        config.startup_splash = true;
+        assert!(config.validate().is_err());
+        config.startup_splash = false;
+        config.sim_overlap_cap_30 = false;
+        assert!(config.validate().is_err()); // The gate exists only under the cap.
+        config.sim_overlap_cap_30 = true;
+        config.cap_queue_depth = 2;
         config.sim_overlap_live = true;
         config.replay_start = "chapter:potears2".into();
         assert!(config.validate().is_err()); // Live opt-in with playback.

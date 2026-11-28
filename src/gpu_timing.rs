@@ -317,6 +317,7 @@ mod vita {
         let vcount = if CAP_30.load(Relaxed) { vcount.max(2) } else { vcount };
         let result = __real_sceDisplayWaitVblankStartMulti(vcount);
         if armed() { if let Some(log) = log() { log.display_vblank(now()); } }
+        crate::display_timing::callback_returned();
         result
     }
     extern "C" fn display_callback(_framebuffer: *mut c_void) {
@@ -383,6 +384,10 @@ pub(crate) fn before_gl_init() {
         if config.sim_overlap_cap_30 {
             vita::CAP_30.store(true, Relaxed);
             println!("[lg/display] cap_vblanks=2");
+            if config.cap_queue_depth == 1 {
+                let sema = crate::display_timing::enable_gate();
+                println!("[lg/display] cap_queue_depth=1 sema={sema:#x}");
+            }
         }
         #[cfg(target_os = "vita")]
         if let Some([display, fbo]) = config.rt_scenes { vita::set_render_target_scenes(display, fbo); }

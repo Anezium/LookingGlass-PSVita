@@ -128,7 +128,7 @@ pub(super) struct Trace {
     #[cfg(target_os = "vita")]
     display_pending: Vec<DisplaySample>,
     #[cfg(target_os = "vita")]
-    display_rows: Vec<(DisplaySample, u32)>,
+    display_rows: Vec<(DisplaySample, crate::display_timing::Displayed)>,
 }
 
 impl Trace {
@@ -269,13 +269,22 @@ impl Trace {
             }
             this.collect_display();
             this.dropped += this.display_pending.len() as u64;
-            for (sample, time) in this.display_rows {
+            for (sample, shown) in this.display_rows {
                 let stamp = sample.stamp;
+                let time = shown.scheduled_us;
                 println!("SIM_W0_DISPLAY {}", serde_json::json!({
                     "frame": stamp.frame.frame, "tape_step": stamp.frame.tape_step,
                     "visit": stamp.frame.visit_id, "generation": stamp.slot_generation,
                     "submission": sample.ticket, "scheduled_us": time,
                     "input_to_display_us": time.wrapping_sub(sample.input_us),
+                    "add_entry_us": shown.add_entry_us, "gate_wait_us": shown.gate_wait_us,
+                    "gate_pending": shown.gate_pending, "gate_timeout": shown.gate_timeout,
+                }));
+            }
+            if let Some(gate) = crate::display_timing::gate_stats() {
+                println!("SIM_W0_CAP_QUEUE {}", serde_json::json!({
+                    "depth": 1, "entries": gate.entries, "callbacks": gate.callbacks, "waits": gate.waits,
+                    "timeouts": gate.timeouts, "max_wait_us": gate.max_wait_us, "off": gate.off,
                 }));
             }
         }
