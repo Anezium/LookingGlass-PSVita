@@ -41,8 +41,8 @@
 //! eye-to-vertex ray as texture coordinates. Those faces are drawn after the depth clear, merged
 //! per shader, with every stage.
 //!
-//! Not reproduced: autosprite deforms (the quads keep their authored facing), wave-normal
-//! ripples, and the fortress1 `SkyFade` backdrop.
+//! Not reproduced: autosprite deforms (the quads keep their authored facing) and wave-normal
+//! ripples. The fortress1 `SkyFade` backdrop is this room itself under `fortress1_sky_fade`.
 use super::*;
 
 /// The most sky cameras one map gets a set for.

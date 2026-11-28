@@ -1026,6 +1026,11 @@ impl Config {
             "low_fog_per_vertex is a separate picture-changing option");
         ensure!(!self.fortress1_sky_fade || self.low_fog_per_vertex,
             "fortress1_sky_fade requires low_fog_per_vertex");
+        // The blend sums onto whatever the target holds: the live sky room must be under the world,
+        // and nearer groups must draw first.
+        ensure!(!self.fortress1_sky_fade || (self.sky && self.sky_live && self.opaque_order == "front_to_back"
+            && !self.world_texture_sort && !self.world_material_sort && !self.world_static_merge),
+            "fortress1_sky_fade requires sky, sky_live and opaque_order front_to_back, and excludes world_texture_sort, world_material_sort and world_static_merge");
         ensure!(!self.fortress1_sky_fade_pixel || self.fortress1_sky_fade,
             "fortress1_sky_fade_pixel requires fortress1_sky_fade");
         ensure!(matches!(self.opaque_order.as_str(),"material"|"front_to_back"),"invalid opaque_order");
@@ -2023,16 +2028,23 @@ impl Renderer {
         let (low_shader, low_pipelines) = if c.quality == "low" {
             let (vertex, fragment) = shader::low_fog_sources(c, volume_slots);
             // Desktop builds its `SkyFade` backdrop for fortress1 alone; `sky_backdrop` is that test.
-            let (shader, pipelines) = if c.fortress1_sky_fade && scene.sky_backdrop.is_some() {
-                println!("[lg/vita-renderer] fortress1_sky_fade=on volumes={volume_slots} pixel={}", c.fortress1_sky_fade_pixel);
-                if c.fortress1_sky_fade_pixel {
+            let faded = (c.fortress1_sky_fade && scene.sky_backdrop.is_some()).then(|| {
+                let built = if c.fortress1_sky_fade_pixel {
                     make_low("retained-world-low-sky-fade-pixel", &shader::vertex(c.water_normals),
-                        &shader::sky_fade_fragment(&shader::low_fragment(true)), alpha_fill::merge_blend())?
+                        &shader::sky_fade_fragment(&shader::low_fragment(true)), alpha_fill::merge_blend())
                 } else {
                     make_low("retained-world-low-sky-fade", &vertex, &shader::sky_fade_fragment(&fragment),
-                        alpha_fill::merge_blend())?
-                }
-            } else { make_low("retained-world-low", &vertex, &fragment, (None, None))? };
+                        alpha_fill::merge_blend())
+                };
+                built.map_err(|e| eprintln!("[lg/vita-renderer] warning fortress1_sky_fade program failed, key off: {e:?}")).ok()
+            }).flatten();
+            if faded.is_some() {
+                println!("[lg/vita-renderer] fortress1_sky_fade=on volumes={volume_slots} pixel={}", c.fortress1_sky_fade_pixel);
+            }
+            let (shader, pipelines) = match faded {
+                Some(built) => built,
+                None => make_low("retained-world-low", &vertex, &fragment, (None, None))?,
+            };
             if c.low_fog { println!("[lg/vita-renderer] low_fog=on"); }
             (Some(shader), pipelines)
         } else { (None, Vec::new()) };
@@ -4105,12 +4117,18 @@ mod tests {
         assert!(serde_json::from_str::<Config>(r#"{"fortress1_sky_fade":1}"#).is_err());
         let on = |extra: &str| serde_json::from_str::<Config>(&format!(r#"{{"fortress1_sky_fade":true{extra}}}"#)).unwrap();
         assert!(on("").validate().is_err());
-        let ship = on(r#","quality":"low","low_fog":true,"low_fog_per_vertex":true"#);
+        const SHIP: &str = r#","quality":"low","low_fog":true,"low_fog_per_vertex":true,"sky":true,"sky_live":true,"opaque_order":"front_to_back""#;
+        assert!(on(r#","quality":"low","low_fog":true,"low_fog_per_vertex":true,"sky_live":false"#).validate().is_err());
+        let ship = on(SHIP);
         assert!(ship.fortress1_sky_fade && ship.validate().is_ok());
+        for extra in [r#","sky":false"#, r#","opaque_order":"material""#, r#","world_texture_sort":true"#,
+                      r#","world_material_sort":true"#, r#","world_static_merge":true"#] {
+            assert!(on(&format!("{SHIP}{extra}")).validate().is_err(), "{extra}");
+        }
         assert_eq!(serde_json::to_value(&ship).unwrap()["fortress1_sky_fade"], true);
         assert!(serde_json::to_value(&ship).unwrap().get("fortress1_sky_fade_pixel").is_none());
         let pixel = |fade: bool| serde_json::from_str::<Config>(&format!(
-            r#"{{"fortress1_sky_fade":{fade},"fortress1_sky_fade_pixel":true,"quality":"low","low_fog":true,"low_fog_per_vertex":true}}"#)).unwrap();
+            r#"{{"fortress1_sky_fade":{fade},"fortress1_sky_fade_pixel":true{SHIP}}}"#)).unwrap();
         assert!(pixel(true).validate().is_ok() && pixel(false).validate().is_err());
     }
     #[test]
