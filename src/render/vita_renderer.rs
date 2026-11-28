@@ -2746,7 +2746,10 @@ impl Renderer {
             count("vita_world_parameter_builds", builds);
             count("vita_world_parameter_time_updates", time_updates);
             count("vita_world_parameter_reuses", self.alpha_order.len() as u64 - builds);
-            if self.extra_stages {
+            let record_extra_stages = self.extra_stages;
+            #[cfg(target_os = "vita")]
+            let record_extra_stages = record_extra_stages && crate::frame_profile::counts_recording();
+            if record_extra_stages {
                 let max_layers = config().max_layers;
                 let extra = self.alpha_order.iter().filter(|&&(_, id)| self.groups[id].recipe.rank >= max_layers).count();
                 counts(&[("vita_world_extra_stage_groups", extra as u64)]);

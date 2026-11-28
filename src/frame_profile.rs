@@ -474,6 +474,9 @@ pub use vita::{
 };
 
 #[cfg(target_os = "vita")]
+pub(crate) use vita::counts_recording;
+
+#[cfg(target_os = "vita")]
 mod vita {
     use super::*;
     pub const PROFILE_DIR: &str = "ux0:data/alice/private/frame_profile";
@@ -1056,9 +1059,17 @@ mod vita {
             }
         });
     }
+    fn counters_armed() -> bool {
+        HOT_RECORDING.load(Relaxed) || WORKER_RECORDING.load(Relaxed)
+    }
+
+    pub(crate) fn counts_recording() -> bool {
+        !cfg!(feature = "frame_total_only") && counters_armed() && STATE.with(|s| s.borrow().recording)
+    }
+
     // Call once after local integer loops. No per-plan or per-triplet timing.
     pub fn counts(values: &[(&'static str, u64)]) {
-        if !HOT_RECORDING.load(Relaxed) && !WORKER_RECORDING.load(Relaxed) { return; }
+        if !counters_armed() { return; }
         STATE.with(|s| {
             let mut s = s.borrow_mut();
             if !s.recording {
