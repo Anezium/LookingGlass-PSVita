@@ -183,6 +183,12 @@ pub(super) fn census(p: &Pass, u: &[f32; UNIFORM_FLOATS], depth_write: bool, rou
         "layers": surface.map(|s| s.layers.iter().map(|l| (l.stage.environment, l.stage.alpha_test)).collect::<Vec<_>>()),
         "vertex_alpha_opaque": mesh.vertices.iter().all(|v| v.color[3] == 255),
         "triangles": mesh.indices.len() / 3, "vertices": mesh.vertices.len(),
+        "gpu_skin": p.gpu_skin.is_some(), "eye": [u[116], u[117], u[118]],
+        "eye_dist": ({
+            let eye = Vec3::new(u[116], u[117], u[118]);
+            mesh.vertices.iter().fold([f32::INFINITY, 0f32], |[lo, hi], v| {
+                let d = (v.position - eye).length(); [lo.min(d), hi.max(d)] })
+        }),
     }));
 }
 

@@ -3451,6 +3451,20 @@ impl Renderer {
                     "cpu_ns": started.elapsed().as_nanos() as u64,
                     "query_overhead_included": true,
                 }));
+                // I09 diagnostic: eye distance of the group's bounds against the fog terms.
+                println!("WORLD_ALPHA_FOG {}", serde_json::json!({
+                    "frame": crate::sim_maps::probe::frame(), "group": p.group,
+                    "fog_eye": u.fog_eye, "fog_w": [u.distance_fog[3], u.liquid_fog[3], u.fog_a[3], u.fog_b[3]],
+                    "fog_mode": u.alpha[2],
+                    "eye_dist": ({
+                        let eye = Vec3::from(u.fog_eye);
+                        let (lo, hi) = (g.min, g.max);
+                        let far = (0..8).map(|i| vec3(if i & 1 == 0 { lo.x } else { hi.x },
+                            if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z }))
+                            .map(|c| (c - eye).length()).fold(0f32, f32::max);
+                        [(eye.clamp(lo, hi) - eye).length(), far]
+                    }),
+                }));
             }
             #[cfg(target_os = "vita")]
             {
