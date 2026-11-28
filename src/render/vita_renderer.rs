@@ -84,6 +84,12 @@ pub struct Config {
     pub sim_flight_memo: bool,
     /// Reuse nearby static sweep candidates inside one ground detour when collision SAH is active.
     pub nav_sweep_cache: bool,
+    /// Save screen: wire the original Delete button and its confirmation (manual and quick
+    /// slots only). Off by default.
+    pub save_delete: bool,
+    /// Save screen: wire the original Prev/Next buttons and page number, with pages of
+    /// extra manual slots (slot5 and up) after the first page. Off by default.
+    pub save_pages: bool,
     /// Draw omission diagnostics only; these never belong in a release config.
     pub diag_skip_ant_corpses: bool,
     /// Reject dead Ant triangles strictly outside the homogeneous view before GPU submission.
@@ -684,6 +690,8 @@ impl Default for Config {
             diag_skip_sky: false,
             sim_flight_memo: false,
             nav_sweep_cache: false,
+            save_delete: false,
+            save_pages: false,
             spike_log_first_frame: 0,
             spike_log_last_frame: 0,
             actor_near_cull: 0.,
@@ -4069,6 +4077,18 @@ mod tests {
         assert!(serde_json::from_value::<Config>(serde_json::json!({"spike_log_first_frame":20,"spike_log_last_frame":10})).unwrap().validate().is_err());
     }
     #[test]
+    fn save_menu_keys_are_opt_in_and_strict() {
+        let c = Config::default();
+        assert!(!c.save_delete && !c.save_pages);
+        for key in ["save_delete", "save_pages"] {
+            let off = serde_json::to_value(serde_json::from_str::<Config>("{}").unwrap()).unwrap();
+            assert_eq!(off[key], false);
+            let on = serde_json::to_value(serde_json::from_str::<Config>(&format!(r#"{{"{key}":true}}"#)).unwrap()).unwrap();
+            assert_eq!(on[key], true);
+            assert!(serde_json::from_str::<Config>(&format!(r#"{{"{key}":1}}"#)).is_err());
+        }
+    }
+    #[test]
     fn nav_sweep_cache_defaults_off_and_requires_a_boolean() {
         assert!(!Config::default().nav_sweep_cache);
         assert!(!serde_json::from_str::<Config>("{}").unwrap().nav_sweep_cache);
@@ -4535,7 +4555,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache" | "save_delete" | "save_pages") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);

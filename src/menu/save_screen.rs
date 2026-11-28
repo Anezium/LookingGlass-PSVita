@@ -150,6 +150,26 @@ impl Film {
     }
 }
 
+/// The page Prev/Next lead to. Pages stop at both ends (no wrap); without `save_pages` there is
+/// one page and the buttons do nothing.
+pub(super) fn turn_page(page: usize, delta: i32, pages: bool) -> usize {
+    if !pages {
+        return 0;
+    }
+    (page as i64 + i64::from(delta)).clamp(0, Slot::PAGES as i64 - 1) as usize
+}
+
+/// Whether Delete may open its confirmation for `slot`, or the message the screen shows instead.
+pub(super) fn delete_request(slot: Slot, exists: bool) -> std::result::Result<(), &'static str> {
+    if !slot.deletable() {
+        Err("The automatic save cannot be deleted.")
+    } else if !exists {
+        Err("This slot has no save to delete.")
+    } else {
+        Ok(())
+    }
+}
+
 /// UTC is explicit so saves remain unambiguous across time-zone changes.
 pub(super) fn timestamp(ms: u64) -> String {
     let seconds = ms / 1000;
@@ -232,7 +252,7 @@ impl Menu {
         self.shutter_art(canvas, "bigcover_right", 190. * open, rect);
     }
     pub(super) fn draw_save_details(&self, canvas: Canvas, page: Page) {
-        for (index, slot) in Slot::ALL.into_iter().enumerate() {
+        for (index, slot) in (0..6).map(|i| (i, Slot::on_page(self.save_page, i))) {
             let b = self.save_widget(&format!("LoadButton{}", index + 1));
             let lit =
                 index == self.save_selected || page == Page::LoadSave && index == self.selected;
@@ -253,8 +273,8 @@ impl Menu {
             };
             self.ui.font.draw(
                 canvas,
-                if slot == Slot::Auto {
-                    "Autosave"
+                &if slot == Slot::Auto {
+                    "Autosave".into()
                 } else {
                     slot.title()
                 },
@@ -263,22 +283,34 @@ impl Menu {
                 crate::ui::PAPER_TEXT,
             );
         }
-        // The six existing slots occupy one page. Keep the original unlit
-        // pagination/delete hardware visible without inventing new actions.
-        for name in ["PrevButton", "NextButton", "DeleteButton"] {
-            let w = self.save_widget(name);
-            self.art(canvas, w.art(), w.rect, 0.65);
+        // Without their keys the pagination/delete hardware stays visible, unlit
+        // and without actions; with a key on, the button loop draws it.
+        for (name, wired) in [
+            ("PrevButton", self.save_keys.pages),
+            ("NextButton", self.save_keys.pages),
+            ("DeleteButton", self.save_keys.delete),
+        ] {
+            if !wired {
+                let w = self.save_widget(name);
+                self.art(canvas, w.art(), w.rect, 0.65);
+            }
         }
         let page_num = self.save_widget("PageNum").rect;
-        self.ui
-            .font
-            .draw(canvas, "1", page_num, 18., crate::ui::PAPER_TEXT);
+        self.ui.font.draw(
+            canvas,
+            &(self.save_page + 1).to_string(),
+            page_num,
+            18.,
+            crate::ui::PAPER_TEXT,
+        );
         let shown = self.save_film.shutter.sample(get_time()).0;
         let title = self.save_widget("MapName").rect;
         self.ui
             .font
             .draw(canvas, &self.save_labels[shown], title, 23., crate::ui::INK);
-        let status = if page == Page::LoadSave {
+        let status = if page != Page::LoadSave {
+            &self.save_dates[shown]
+        } else if self.save_keys == MenuKeys::default() {
             match self.selected {
                 6 => "Load Game",
                 7 if self.save_selected == 5 => "Automatic save",
@@ -286,7 +318,14 @@ impl Menu {
                 _ => &self.save_dates[shown],
             }
         } else {
-            &self.save_dates[shown]
+            // The keys add buttons: name the selected button by its action (urc mouseEnterCmd).
+            match self.buttons(Page::LoadSave).get(self.selected).map(|b| b.click) {
+                Some(Click::LoadSelection) => "Load Game",
+                Some(Click::SaveSelection) if self.selected_slot() == Slot::Auto => "Automatic save",
+                Some(Click::SaveSelection) => "Save Game",
+                Some(Click::DeleteSelection) => "Delete Game",
+                _ => &self.save_dates[shown],
+            }
         };
         self.ui.font.draw(
             canvas,
@@ -298,9 +337,76 @@ impl Menu {
     }
 }
 
+impl Menu {
+    /// loadsave.urc `delete_group`: the DeleteConfirm art ("Delete? yes no") fades in over the
+    /// big preview in 0.5 s; DeleteYES and DeleteNO are invisible hit boxes over its words. The
+    /// selected word gets a thin pulsing underline so the D-pad choice is visible.
+    pub(super) fn draw_delete_confirm(&self, canvas: Canvas, now: f64) {
+        let fade = ((now - self.delete_opened) / 0.5).clamp(0., 1.) as f32;
+        let w = self.save_widget("DeleteConfirm");
+        self.art(canvas, w.art(), w.rect, fade);
+        let choice = self.save_widget(if self.selected == 0 { "DeleteYES" } else { "DeleteNO" }).rect;
+        let r = canvas.rect(Rect::new(choice.x + 4., choice.bottom() - 2., choice.w - 8., 2.));
+        let pulse = 0.9 + (now as f32 * std::f32::consts::PI).sin() * 0.1;
+        draw_rectangle(r.x, r.y, r.w, r.h, Color::new(1., 1., 1., pulse * fade));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pages_stop_at_both_ends_and_need_the_key() {
+        assert_eq!(turn_page(0, -1, true), 0);
+        assert_eq!(turn_page(0, 1, true), 1);
+        let last = Slot::PAGES - 1;
+        assert_eq!(turn_page(last, 1, true), last);
+        assert_eq!(turn_page(last, -1, true), last - 1);
+        let mut page = 0;
+        for _ in 0..20 {
+            page = turn_page(page, 1, true);
+        }
+        assert_eq!(page, last);
+        for page in 0..Slot::PAGES {
+            assert_eq!(turn_page(page, 1, false), 0);
+            assert_eq!(turn_page(page, -1, false), 0);
+        }
+    }
+    #[test]
+    fn delete_needs_an_existing_deletable_slot() {
+        assert_eq!(delete_request(Slot::One, true), Ok(()));
+        assert_eq!(delete_request(Slot::Quick, true), Ok(()));
+        assert_eq!(delete_request(Slot::Extra(12), true), Ok(()));
+        assert!(delete_request(Slot::Auto, true).is_err());
+        assert!(delete_request(Slot::Two, false).is_err());
+    }
+    #[test]
+    fn cancelling_the_confirmation_keeps_every_save() {
+        // DeleteNO and Escape are Back to the save screen: no store call at all.
+        assert_eq!(Page::ConfirmDelete(Slot::Two).parent(), Some(Page::LoadSave));
+        assert_eq!(Page::ConfirmDelete(Slot::Two).layout(), "loadsave");
+        let scratch = crate::save::format12::Scratch::new("delete-cancel");
+        let store = scratch.store();
+        let game = crate::save::tests::jlair2_game();
+        for slot in [Slot::One, Slot::Two, Slot::Extra(5)] {
+            store.write(slot, &game).unwrap();
+            store.write(slot, &game).unwrap();
+        }
+        let snapshot = || {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&scratch.0)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(p).unwrap()))
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot();
+        assert_eq!(before.len(), 6);
+        assert_eq!(delete_request(Slot::Two, store.exists(Slot::Two)), Ok(()));
+        // The menu opens ConfirmDelete(Two); No returns to LoadSave without touching the store.
+        assert_eq!(snapshot(), before);
+    }
     #[test]
     fn selection_changes_behind_closed_shutters_and_rapid_clicks_settle() {
         let mut s = Shutter {

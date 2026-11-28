@@ -26,6 +26,26 @@ const VERSION: u32 = 12;
 const LEVELS_SINCE: u32 = 12;
 pub(crate) const LIMIT: u64 = 8 * 1024 * 1024;
 
+/// The v1.2 save-screen keys of the runtime config (`save_delete`, `save_pages`). Both are off
+/// unless the config turns them on; builds without the renderer config have them off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MenuKeys {
+    pub delete: bool,
+    pub pages: bool,
+}
+pub fn menu_keys() -> MenuKeys {
+    #[cfg(feature = "vita_renderer")]
+    {
+        let c = crate::render::vita_renderer::config();
+        MenuKeys {
+            delete: c.save_delete,
+            pages: c.save_pages,
+        }
+    }
+    #[cfg(not(feature = "vita_renderer"))]
+    MenuKeys::default()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     Quick,
@@ -34,6 +54,9 @@ pub enum Slot {
     Two,
     Three,
     Four,
+    /// A manual slot on a later save-screen page (`save_pages`): slot5 to slot[`Slot::LAST`].
+    /// Same file format as every other slot; only the file name extends.
+    Extra(u8),
 }
 impl Slot {
     pub const ALL: [Self; 6] = [
@@ -44,6 +67,24 @@ impl Slot {
         Self::Quick,
         Self::Auto,
     ];
+    /// Save-screen pages with `save_pages`: the first is [`Slot::ALL`], each later page holds six
+    /// manual slots, so slot5..slot28. The page number widget fits one digit.
+    pub const PAGES: usize = 5;
+    pub const LAST: u8 = 4 + 6 * (Self::PAGES as u8 - 1);
+    /// The slot shown at `index` (0..6) of save-screen page `page` (0-based).
+    pub fn on_page(page: usize, index: usize) -> Self {
+        assert!(page < Self::PAGES && index < 6, "save page {page} index {index}");
+        if page == 0 {
+            Self::ALL[index]
+        } else {
+            Self::Extra((5 + 6 * (page - 1) + index) as u8)
+        }
+    }
+    /// Every manual slot of the later pages, in page order.
+    pub fn extra() -> impl Iterator<Item = Self> {
+        (5..=Self::LAST).map(Self::Extra)
+    }
+    /// Only the original six names parse here (command line); later pages are menu-only.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "quick" => Ok(Self::Quick),
@@ -55,25 +96,32 @@ impl Slot {
             _ => anyhow::bail!("Use quick, auto or slot1-slot4"),
         }
     }
-    pub fn name(self) -> &'static str {
+    pub fn name(self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Quick => "quick",
-            Self::Auto => "auto",
-            Self::One => "slot1",
-            Self::Two => "slot2",
-            Self::Three => "slot3",
-            Self::Four => "slot4",
+            Self::Quick => "quick".into(),
+            Self::Auto => "auto".into(),
+            Self::One => "slot1".into(),
+            Self::Two => "slot2".into(),
+            Self::Three => "slot3".into(),
+            Self::Four => "slot4".into(),
+            Self::Extra(n) => format!("slot{n}").into(),
         }
     }
-    pub fn title(self) -> &'static str {
+    pub fn title(self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::One => "Slot 1",
-            Self::Two => "Slot 2",
-            Self::Three => "Slot 3",
-            Self::Four => "Slot 4",
-            Self::Quick => "Quick save",
-            Self::Auto => "Automatic save",
+            Self::One => "Slot 1".into(),
+            Self::Two => "Slot 2".into(),
+            Self::Three => "Slot 3".into(),
+            Self::Four => "Slot 4".into(),
+            Self::Quick => "Quick save".into(),
+            Self::Auto => "Automatic save".into(),
+            Self::Extra(n) => format!("Slot {n}").into(),
         }
+    }
+    /// Whether the save screen may delete this slot (`save_delete`). The automatic save belongs
+    /// to progression (Continue, the checkpoint writer, the finale checkpoint): never deleted.
+    pub fn deletable(self) -> bool {
+        self != Self::Auto
     }
 }
 
@@ -489,8 +537,14 @@ impl Store {
         }
     }
     pub fn latest(&self) -> Option<(Slot, Loaded)> {
+        self.latest_with(menu_keys().pages)
+    }
+    /// With `pages`, Continue also considers the later pages' slots that have a file.
+    fn latest_with(&self, pages: bool) -> Option<(Slot, Loaded)> {
+        let extra = Slot::extra().filter(|&slot| pages && self.exists(slot));
         let latest = Slot::ALL
             .into_iter()
+            .chain(extra)
             .filter_map(|slot| self.read(slot).ok().map(|s| (slot, s)))
             .max_by_key(|(_, s)| s.saved_at);
         // Completion leaves the six player slots intact. Continue can replay
@@ -506,6 +560,38 @@ impl Store {
             }
         }
         latest
+    }
+    /// The order `delete` removes a slot's two files in: the file the slot does not load from goes
+    /// first, the one it loads from goes last. Until the last unlink the slot still loads exactly
+    /// what the screen showed, so a crash between the two never exposes an older backup in place
+    /// of the deleted save, and never leaves a save half removed.
+    fn delete_order(&self, slot: Slot) -> [PathBuf; 2] {
+        let primary = self.path(slot, false);
+        let backup = self.path(slot, true);
+        if read_limited(&primary).and_then(|b| self.decode(&b)).is_ok() {
+            [backup, primary]
+        } else {
+            [primary, backup]
+        }
+    }
+    /// Delete one slot's save and its backup (`save_delete`). The automatic save is refused.
+    pub fn delete(&self, slot: Slot) -> Result<()> {
+        ensure!(slot.deletable(), "The automatic save cannot be deleted");
+        if self.discard_writes {
+            println!("[lg/replay] save not deleted slot={}", slot.name());
+            return Ok(());
+        }
+        for path in self.delete_order(slot) {
+            match fs::remove_file(&path) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Could not delete {}", path.display()))
+                }
+            }
+        }
+        println!("[lg/save] deleted slot={} ({})", slot.name(), self.directory.display());
+        Ok(())
     }
     fn finale_store(&self) -> Self {
         Self {
@@ -1439,6 +1525,154 @@ pub(crate) mod tests {
             BenchScene::ReuseValidated
         );
     }
+    fn village() -> Game {
+        format12::game(vec![format12::level("gvillage", None, serde_json::Value::Null)])
+    }
+    fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), fs::read(&p).unwrap()))
+            .collect()
+    }
+    /// Every slot of every page written twice, so each has a primary and a backup file.
+    fn every_slot(scratch: &format12::Scratch) -> Store {
+        let store = scratch.store();
+        let game = village();
+        for (i, slot) in Slot::ALL.into_iter().chain(Slot::extra()).enumerate() {
+            for round in 0..2 {
+                let _at = Pinned::new(1_000 + 10 * i as u64 + round);
+                store.write(slot, &game).unwrap();
+            }
+        }
+        store
+    }
+    #[test]
+    fn save_pages_extend_slot_names_and_keep_the_first_page() {
+        for index in 0..6 {
+            assert_eq!(Slot::on_page(0, index), Slot::ALL[index]);
+        }
+        assert_eq!(Slot::LAST, 28);
+        let all: Vec<Slot> = (0..Slot::PAGES).flat_map(|p| (0..6).map(move |i| Slot::on_page(p, i))).collect();
+        assert_eq!(all.len(), 30);
+        let names: std::collections::BTreeSet<String> = all.iter().map(|s| s.name().into_owned()).collect();
+        assert_eq!(names.len(), 30, "every page slot has its own file");
+        assert_eq!(Slot::on_page(1, 0).name(), "slot5");
+        assert_eq!(Slot::on_page(Slot::PAGES - 1, 5).name(), "slot28");
+        assert_eq!(Slot::on_page(1, 3).title(), "Slot 8");
+        assert_eq!(Slot::extra().count(), 24);
+        let store = Store::new(PathBuf::from("test-saves"), "fixture".into());
+        for slot in all {
+            assert_eq!(store.path(slot, false).parent(), Some(Path::new("test-saves")));
+            assert_ne!(store.path(slot, false), store.path(slot, true));
+        }
+        assert!(std::panic::catch_unwind(|| Slot::on_page(Slot::PAGES, 0)).is_err());
+        assert!(std::panic::catch_unwind(|| Slot::on_page(0, 6)).is_err());
+    }
+    #[test]
+    fn extra_slots_use_the_unchanged_save_format() {
+        let scratch = format12::Scratch::new("extra-slot-format");
+        let store = scratch.store();
+        let game = village();
+        let _at = Pinned::new(4_242);
+        store.write(Slot::One, &game).unwrap();
+        store.write(Slot::Extra(9), &game).unwrap();
+        assert_eq!(fs::read(scratch.file(Slot::One)).unwrap(), fs::read(scratch.file(Slot::Extra(9))).unwrap());
+        assert_eq!(store.read(Slot::Extra(9)).unwrap().saved_at, 4_242);
+    }
+    #[test]
+    fn delete_removes_only_the_selected_slot_and_its_backup() {
+        let scratch = format12::Scratch::new("delete-selected");
+        let store = every_slot(&scratch);
+        let before = files(&scratch.0);
+        assert_eq!(before.len(), 60);
+        for slot in [Slot::Extra(6), Slot::Quick, Slot::Two] {
+            store.delete(slot).unwrap();
+            assert!(!store.exists(slot) && store.read(slot).is_err());
+        }
+        let after = files(&scratch.0);
+        let gone: Vec<&String> = before.keys().filter(|k| !after.contains_key(*k)).collect();
+        assert_eq!(gone, ["quick.json", "quick.previous.json", "slot2.json", "slot2.previous.json",
+                          "slot6.json", "slot6.previous.json"]);
+        for (name, bytes) in &after {
+            assert_eq!(&before[name], bytes, "{name} changed");
+        }
+        // Deleting an already empty slot changes nothing.
+        store.delete(Slot::Extra(6)).unwrap();
+        assert_eq!(files(&scratch.0), after);
+    }
+    #[test]
+    fn the_automatic_save_is_never_deleted() {
+        let scratch = format12::Scratch::new("delete-auto");
+        let store = every_slot(&scratch);
+        let before = files(&scratch.0);
+        assert!(!Slot::Auto.deletable());
+        assert!(store.delete(Slot::Auto).is_err());
+        assert_eq!(files(&scratch.0), before);
+    }
+    #[test]
+    fn a_crash_between_the_two_unlinks_shows_the_same_save() {
+        let scratch = format12::Scratch::new("delete-crash");
+        let store = every_slot(&scratch);
+        // Usable primary: the backup (older save) goes first.
+        let shown = store.read(Slot::Three).unwrap();
+        assert!(!shown.backup);
+        let [first, last] = store.delete_order(Slot::Three);
+        assert_eq!((first.clone(), last.clone()), (store.path(Slot::Three, true), store.path(Slot::Three, false)));
+        fs::remove_file(&first).unwrap();
+        let mid = store.read(Slot::Three).unwrap();
+        assert_eq!((mid.saved_at, mid.backup), (shown.saved_at, false));
+        // Damaged primary, the screen shows the backup: the primary goes first.
+        fs::write(store.path(Slot::Extra(11), false), b"{damaged").unwrap();
+        let shown = store.read(Slot::Extra(11)).unwrap();
+        assert!(shown.backup);
+        let [first, _] = store.delete_order(Slot::Extra(11));
+        assert_eq!(first, store.path(Slot::Extra(11), false));
+        fs::remove_file(&first).unwrap();
+        let mid = store.read(Slot::Extra(11)).unwrap();
+        assert_eq!((mid.saved_at, mid.backup), (shown.saved_at, true));
+    }
+    #[test]
+    fn a_failed_unlink_leaves_the_slot_as_it_was() {
+        let scratch = format12::Scratch::new("delete-failure");
+        let store = scratch.store();
+        let _at = Pinned::new(7_000);
+        store.write(Slot::One, &village()).unwrap();
+        // A directory where the backup file goes cannot be removed as a file.
+        fs::create_dir_all(store.path(Slot::One, true).join("held")).unwrap();
+        let before = fs::read(scratch.file(Slot::One)).unwrap();
+        assert!(store.delete(Slot::One).is_err());
+        assert_eq!(fs::read(scratch.file(Slot::One)).unwrap(), before);
+        assert_eq!(store.read(Slot::One).unwrap().saved_at, 7_000);
+    }
+    #[test]
+    fn a_replay_store_deletes_nothing() {
+        let scratch = format12::Scratch::new("delete-discard");
+        let before = {
+            every_slot(&scratch);
+            files(&scratch.0)
+        };
+        scratch.store().discarding_writes().delete(Slot::Four).unwrap();
+        assert_eq!(files(&scratch.0), before);
+    }
+    #[test]
+    fn continue_reads_later_pages_only_with_the_key() {
+        let scratch = format12::Scratch::new("pages-continue");
+        let store = scratch.store();
+        let game = village();
+        {
+            let _at = Pinned::new(1_000);
+            store.write(Slot::One, &game).unwrap();
+        }
+        {
+            let _at = Pinned::new(2_000);
+            store.write(Slot::Extra(17), &game).unwrap();
+        }
+        assert_eq!(store.latest_with(false).unwrap().0, Slot::One);
+        assert_eq!(store.latest().unwrap().0, Slot::One, "the key is off by default");
+        assert_eq!(store.latest_with(true).unwrap().0, Slot::Extra(17));
+    }
     #[test]
     fn manual_slots_have_separate_files_and_cannot_escape_save_directory() {
         let store = Store::new(PathBuf::from("test-saves"), "fixture".into());
@@ -1448,7 +1682,7 @@ pub(crate) mod tests {
             6
         );
         for slot in Slot::ALL {
-            assert_eq!(Slot::parse(slot.name()).unwrap(), slot);
+            assert_eq!(Slot::parse(&slot.name()).unwrap(), slot);
             assert_eq!(
                 store.path(slot, false).parent(),
                 Some(Path::new("test-saves"))

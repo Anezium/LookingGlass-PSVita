@@ -5,7 +5,7 @@ use crate::{
     audio, bsp,
     powerups::Difficulty,
     preferences::{Preferences, BINDINGS, SIZES},
-    save::{Slot, Store},
+    save::{MenuKeys, Slot, Store},
     texture,
     ui::{Canvas, Ui},
 };
@@ -31,6 +31,8 @@ pub enum Page {
     ConfirmNew(Difficulty),
     ConfirmLoad(Slot),
     ConfirmSave(Slot),
+    /// The original delete confirmation (`save_delete`), drawn over the save screen.
+    ConfirmDelete(Slot),
 }
 impl Page {
     fn parent(self) -> Option<Self> {
@@ -39,14 +41,18 @@ impl Page {
             Self::Video | Self::Audio | Self::Game | Self::Controls => Some(Self::Settings),
             Self::Credits => Some(Self::Quit),
             Self::ConfirmNew(_) => Some(Self::NewGame),
-            Self::ConfirmLoad(_) | Self::ConfirmSave(_) => Some(Self::LoadSave),
+            Self::ConfirmLoad(_) | Self::ConfirmSave(_) | Self::ConfirmDelete(_) => {
+                Some(Self::LoadSave)
+            }
             _ => Some(Self::Main),
         }
     }
     fn layout(self) -> &'static str {
         match self {
             Self::Settings | Self::Video | Self::Audio | Self::Game | Self::Controls => "controls",
-            Self::LoadSave | Self::ConfirmLoad(_) | Self::ConfirmSave(_) => "loadsave",
+            Self::LoadSave | Self::ConfirmLoad(_) | Self::ConfirmSave(_) | Self::ConfirmDelete(_) => {
+                "loadsave"
+            }
             Self::NewGame | Self::ConfirmNew(_) => "newgame",
             Self::Quit => "quit",
             Self::Credits => "credits",
@@ -84,6 +90,12 @@ enum Click {
     Slot(usize),
     SaveSelection,
     LoadSelection,
+    /// Prev/Next on the save screen (`save_pages`).
+    SavePage(i32),
+    /// The Delete button (`save_delete`): opens the confirmation.
+    DeleteSelection,
+    /// DeleteYES in the confirmation.
+    DeleteConfirmed,
 }
 struct Button {
     rect: Rect,
@@ -246,6 +258,10 @@ pub struct Menu {
     save_previews: [Option<Texture2D>; 6],
     save_selected: usize,
     save_film: save_screen::Film,
+    save_keys: MenuKeys,
+    /// Save-screen page, 0-based; stays 0 without `save_pages`.
+    save_page: usize,
+    delete_opened: f64,
     controls_pad: bool,
     controls_page: usize,
     using_pad: bool,
@@ -313,6 +329,15 @@ impl Menu {
                 layouts["loadsave"].iter().any(|w| w.value("name") == name),
                 "Missing original save widget {name}"
             );
+        }
+        let save_keys = crate::save::menu_keys();
+        if save_keys.delete {
+            for name in ["DeleteConfirm", "DeleteYES", "DeleteNO"] {
+                ensure!(
+                    layouts["loadsave"].iter().any(|w| w.value("name") == name),
+                    "Missing original save widget {name}"
+                );
+            }
         }
         timing.mark("layouts");
         let mut names = vec![
@@ -397,6 +422,9 @@ impl Menu {
             save_previews: Default::default(),
             save_selected: 0,
             save_film: save_screen::Film::load(assets)?,
+            save_keys,
+            save_page: 0,
+            delete_opened: 0.,
             controls_pad: false,
             controls_page: 0,
             using_pad: false,
@@ -427,6 +455,11 @@ impl Menu {
         if page == Page::LoadSave {
             self.selected = self.save_selected;
             self.save_film.open(self.save_selected, get_time());
+        }
+        if let Page::ConfirmDelete(_) = page {
+            // No is the safe default for a destructive choice.
+            self.selected = 1;
+            self.delete_opened = get_time();
         }
     }
     pub fn close(&mut self) {
@@ -520,6 +553,10 @@ impl Menu {
                 ])
                 .map(|(w, c)| w.button(c))
                 .collect(),
+            Page::ConfirmDelete(_) => vec![
+                self.button_named("loadsave", "DeleteYES", Click::DeleteConfirmed),
+                self.button_named("loadsave", "DeleteNO", Click::Back),
+            ],
             Page::ConfirmNew(_) | Page::ConfirmLoad(_) | Page::ConfirmSave(_) => {
                 let action = match page {
                     Page::ConfirmNew(d) => Action::NewGame(d),
@@ -549,6 +586,13 @@ impl Menu {
                 buttons.push(self.button_named("loadsave", "LoadingButton", Click::LoadSelection));
                 if !self.frontend {
                     buttons.push(self.button_named("loadsave", "SaveButton", Click::SaveSelection));
+                }
+                if self.save_keys.pages {
+                    buttons.push(self.button_named("loadsave", "PrevButton", Click::SavePage(-1)));
+                    buttons.push(self.button_named("loadsave", "NextButton", Click::SavePage(1)));
+                }
+                if self.save_keys.delete {
+                    buttons.push(self.button_named("loadsave", "DeleteButton", Click::DeleteSelection));
                 }
                 buttons.push(back());
                 buttons
@@ -828,8 +872,12 @@ impl Menu {
             );
         }
     }
+    /// The slot the save screen has selected, on its current page.
+    fn selected_slot(&self) -> Slot {
+        Slot::on_page(self.save_page, self.save_selected)
+    }
     fn refresh_saves(&mut self, store: &Store) {
-        for (index, slot) in Slot::ALL.into_iter().enumerate() {
+        for (index, slot) in (0..6).map(|i| (i, Slot::on_page(self.save_page, i))) {
             let loaded = store.read(slot);
             self.save_usable[index] = loaded.is_ok();
             self.save_previews[index] = loaded
@@ -846,7 +894,7 @@ impl Menu {
                         if s.backup { " (backup)" } else { "" }
                     )
                 })
-                .unwrap_or_else(|_| slot.title().into());
+                .unwrap_or_else(|_| slot.title().into_owned());
             self.save_labels[index] = loaded
                 .map(|s| {
                     format!(
@@ -1084,6 +1132,9 @@ impl Menu {
         }
         if page.layout() == "loadsave" {
             self.draw_save_details(canvas, page);
+        }
+        if let Page::ConfirmDelete(_) = page {
+            self.draw_delete_confirm(canvas, get_time());
         }
         if matches!(
             page,
@@ -1437,7 +1488,9 @@ impl Menu {
                         self.save_film.sound(audio, 1);
                     }
                     if let Some(click) = click {
-                        if page.layout() == "loadsave" && !matches!(click, Click::Slot(_)) {
+                        if page.layout() == "loadsave"
+                            && !matches!(click, Click::Slot(_) | Click::SavePage(_))
+                        {
                             self.save_film.sound(audio, 2);
                         }
                         match click {
@@ -1495,7 +1548,7 @@ impl Menu {
                             }
                             Click::LoadSelection => {
                                 if self.save_usable[self.save_selected] {
-                                    let slot = Slot::ALL[self.save_selected];
+                                    let slot = self.selected_slot();
                                     if self.frontend {
                                         action = Some(Action::Load(slot));
                                     } else {
@@ -1514,13 +1567,46 @@ impl Menu {
                                             .into();
                                     continue;
                                 }
-                                let slot = Slot::ALL[self.save_selected];
+                                let slot = self.selected_slot();
                                 if slot == Slot::Auto {
                                     self.message = "Choose a manual slot or the quick save.".into();
                                 } else if store.exists(slot) {
                                     self.open(Page::ConfirmSave(slot), prefs, audio.settings);
                                 } else {
                                     action = Some(Action::Save(slot));
+                                }
+                            }
+                            Click::SavePage(delta) => {
+                                let next = save_screen::turn_page(
+                                    self.save_page,
+                                    delta,
+                                    self.save_keys.pages,
+                                );
+                                if next != self.save_page {
+                                    // loadsave.urc: the projector sound, shutters close, page turns.
+                                    self.save_film.sound(audio, 0);
+                                    self.save_page = next;
+                                    self.refresh_saves(store);
+                                    self.save_film.open(self.save_selected, get_time());
+                                    self.message.clear();
+                                }
+                            }
+                            Click::DeleteSelection => {
+                                let slot = self.selected_slot();
+                                match save_screen::delete_request(slot, store.exists(slot)) {
+                                    Ok(()) => self.open(Page::ConfirmDelete(slot), prefs, audio.settings),
+                                    Err(message) => self.message = message.into(),
+                                }
+                            }
+                            Click::DeleteConfirmed => {
+                                if let Page::ConfirmDelete(slot) = page {
+                                    let result = store.delete(slot);
+                                    self.refresh_saves(store);
+                                    self.open(Page::LoadSave, prefs, audio.settings);
+                                    self.message = match result {
+                                        Ok(()) => format!("{} deleted", slot.title()),
+                                        Err(e) => format!("Delete failed: {e:#}"),
+                                    };
                                 }
                             }
                             Click::CreditScroll(delta) => {
