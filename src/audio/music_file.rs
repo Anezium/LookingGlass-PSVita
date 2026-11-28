@@ -25,6 +25,7 @@ pub(super) static MISSES: AtomicU32 = AtomicU32::new(0);
 struct Bytes {
     len: u64,
     pos: u64,
+    misses: u32,
     /// Sorted, disjoint `(start, bytes)` spans of the file.
     spans: Vec<(u64, Vec<u8>)>,
 }
@@ -59,7 +60,7 @@ pub(super) struct Reader(Arc<Mutex<Bytes>>);
 
 impl File {
     pub(super) fn new(bytes: Vec<u8>) -> (Self, Reader) {
-        let shared = Arc::new(Mutex::new(Bytes { len: bytes.len() as u64, pos: 0, spans: vec![(0, bytes)] }));
+        let shared = Arc::new(Mutex::new(Bytes { len: bytes.len() as u64, pos: 0, misses: 0, spans: vec![(0, bytes)] }));
         (Self(shared.clone()), Reader(shared))
     }
     /// A decoder still reads this file.
@@ -110,6 +111,10 @@ impl File {
     pub(super) fn held(&self) -> usize {
         self.0.lock().unwrap().held()
     }
+    #[cfg(test)]
+    fn misses(&self) -> u32 {
+        self.0.lock().unwrap().misses
+    }
 }
 
 impl Read for Reader {
@@ -120,6 +125,7 @@ impl Read for Reader {
         }
         let Some(span) = bytes.span_at(bytes.pos) else {
             MISSES.fetch_add(1, Ordering::Relaxed);
+            bytes.misses += 1;
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "music bytes released"));
         };
         let n = span.len().min(buf.len());
@@ -157,7 +163,7 @@ impl Seek for Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rodio::{Decoder, Source};
+    use rodio::{decoder::LoopedDecoder, Decoder, Source};
     use std::io::Cursor;
 
     fn pattern(len: usize) -> Vec<u8> {
@@ -213,9 +219,8 @@ mod tests {
         let mut buf = vec![0; 10_000];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(buf, data[40_000..50_000]);
-        let misses = MISSES.load(Ordering::Relaxed);
         assert!(reader.read(&mut buf).is_err());
-        assert!(MISSES.load(Ordering::Relaxed) > misses);
+        assert_eq!(file.misses(), 1);
         // Near the end the loop restart keeps the file start too.
         reader.seek(SeekFrom::Start(95_000)).unwrap();
         assert!(file.fill(data.clone()));
@@ -251,7 +256,6 @@ mod tests {
         }
         step(88_200 * 2, &mut whole, &mut kept);
         // Commit: the outgoing track plays at most the window after the trim.
-        let misses = MISSES.load(Ordering::Relaxed);
         file.trim(WINDOW);
         assert_eq!(file.held(), WINDOW);
         step(88_200, &mut whole, &mut kept);
@@ -262,7 +266,57 @@ mod tests {
         file.trim(WINDOW);
         assert!(file.held() < data.len());
         step(88_200 * 3 / 2, &mut whole, &mut kept);
-        assert_eq!(MISSES.load(Ordering::Relaxed), misses);
+        assert_eq!(file.misses(), 0);
         assert_eq!((whole.channels(), whole.sample_rate()), (kept.channels(), kept.sample_rate()));
+    }
+
+    /// Every game music track, as `mood` plays it: a looping decoder over the whole
+    /// file against one over a `Reader` trimmed after 30 s (5.74 s more must match),
+    /// filled back (rollback, 20 s more), then trimmed 3 s before the end (6 s more,
+    /// across the loop restart).
+    #[test]
+    #[ignore = "requires LOOKING_GLASS_TEST_DATA"]
+    fn game_music_is_sample_exact_through_trim_fill_and_loop() {
+        let root = std::path::PathBuf::from(std::env::var("LOOKING_GLASS_TEST_DATA").unwrap());
+        let mut assets = crate::assets::Assets::open(&root).unwrap();
+        let mut tracks = std::collections::BTreeSet::new();
+        for name in assets.maps() {
+            if let Ok(text) = assets.read(&format!("sound/music/{name}.mus")) {
+                for cue in super::super::music_cues(&String::from_utf8_lossy(&text)).unwrap().into_values() {
+                    tracks.insert(cue.path);
+                }
+            }
+        }
+        assert!(tracks.len() >= 20, "{tracks:?}");
+        for path in &tracks {
+            let data = assets.read(path).unwrap();
+            let mut whole = Decoder::new_looped(Cursor::new(data.clone())).unwrap();
+            let (file, reader) = File::new(data.clone());
+            let mut kept = Decoder::new_looped(reader).unwrap();
+            let rate = whole.sample_rate() as usize * whole.channels() as usize;
+            fn step(seconds: f32, rate: usize, played: &mut usize, path: &str,
+                    whole: &mut LoopedDecoder<Cursor<Vec<u8>>>, kept: &mut LoopedDecoder<Reader>) {
+                for _ in 0..(seconds * rate as f32) as usize {
+                    assert_eq!(whole.next(), kept.next(), "{path} sample {played}");
+                    *played += 1;
+                }
+            }
+            let mut played = 0usize;
+            step(30., rate, &mut played, path, &mut whole, &mut kept);
+            let (held, after) = file.trim(WINDOW);
+            assert!(after <= 2 * WINDOW && held == data.len(), "{path}");
+            step(5.74, rate, &mut played, path, &mut whole, &mut kept);
+            assert!(file.fill(data.clone()));
+            step(20., rate, &mut played, path, &mut whole, &mut kept);
+            let total = Decoder::new(Cursor::new(data.clone())).unwrap().count();
+            let left = total.saturating_sub(played) as f32 / rate as f32;
+            if left > 3. {
+                step(left - 3., rate, &mut played, path, &mut whole, &mut kept);
+            }
+            file.trim(WINDOW);
+            step(6., rate, &mut played, path, &mut whole, &mut kept);
+            assert_eq!(file.misses(), 0, "{path}");
+            println!("MUSIC_EXACT path={path} bytes={} samples={played} kept_after_trim={after}", data.len());
+        }
     }
 }
