@@ -202,13 +202,14 @@ const FOG_LIMIT: f32 = 8192.;
 /// CPU-skinned packets, the same assumption `cull_lights` makes. On a single-sample target
 /// (the key requires `msaa_samples=1`) a fragment's `worldPosition` is a convex combination of
 /// its triangle's vertices, and distance is convex, so no fragment is farther from the eye
-/// than the packet's farthest vertex. Every vertex is scanned. A GPU-skinned packet has only
-/// placeholder geometry on the CPU and is refused.
+/// than the packet's farthest vertex. Every vertex is tested, until one fails. A GPU-skinned
+/// packet has only placeholder geometry on the CPU and is refused.
 ///
 /// The threshold is `0.35*w` in f32 from the live word. `dist` is mediump (`render.rs`): a
-/// backend that keeps half precision rounds it by 0.25 at 630. The margin `2 + s/4096`
-/// (s: largest coordinate of the eye and the vertices) covers that and the f32 interpolation
-/// and `length` rounding, so a packet never sits on the cutoff.
+/// backend that keeps half precision rounds it by 0.25 at 630. The margin `2 + s/4096` covers
+/// that and the f32 interpolation and `length` rounding, so a packet never sits on the cutoff.
+/// `s = |eye| + 0.35w` (largest coordinate) bounds every coordinate of a vertex that passes.
+/// The CPU test compares squared f32 distances: its own rounding is below 0.01 unit here.
 pub(super) fn fog_free(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
     if p.gpu_skin.is_some() || u[..16] != Mat4::IDENTITY.to_cols_array() { return false; }
     if !(u[FOG_MODE] >= 0.) { return true; }
@@ -221,20 +222,16 @@ pub(super) fn fog_free(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
         return false;
     }
     let eye = Vec3::from_slice(&u[EYE..EYE + 3]);
-    let limit = f64::from(0.35f32 * w) - 2.;
-    let eye_d = eye.as_dvec3();
-    let mut scale = eye.abs().max_element();
-    let mut far = 0f64;
+    let radius = 0.35f32 * w;
+    let limit = radius - 2. - (eye.abs().max_element() + radius) / 4096.;
+    if !(limit > 0.) { return false; }
+    let limit2 = limit * limit;
     let vertices = &p.geometry().vertices;
-    for vertex in vertices {
-        let pos = vertex.position;
-        if !(pos.is_finite() && pos.abs().max_element() <= FOG_LIMIT) { return false; }
-        far = far.max(pos.as_dvec3().distance(eye_d));
-        // One vertex beyond the limit decides, whatever the final scale.
-        if !(far < limit) { return false; }
-        scale = scale.max(pos.abs().max_element());
-    }
-    !vertices.is_empty() && far + f64::from(scale) / 4096. < limit
+    // A non-finite position fails the comparison.
+    let far = vertices.iter().position(|v| { let d = v.position - eye; !(d.dot(d) < limit2) });
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    count("vita_actor_fog_free_vertices", far.map_or(vertices.len(), |i| i + 1) as u64);
+    !vertices.is_empty() && far.is_none()
 }
 
 /// Host census line for one actor draw: the payload facts the selector reads and the route.
@@ -486,7 +483,7 @@ mod tests {
         let at = |x: f32| fogged_payload(&p, Vec3::new(-x, 0., 0.), 1800.);
         // Zero-fog radius 630 (0.35f32*1800 rounds to exactly 630). Farthest vertex (10,0,0).
         assert_eq!(0.35f32 * 1800., 630.);
-        assert!(fog_free(&p, &at(617.)), "627 plus margin 2.15");
+        assert!(fog_free(&p, &at(617.)), "627 against 630 - 2 - 1247/4096");
         // Inside the radius, but not by the margin: the packet keeps its fog.
         assert!(!fog_free(&p, &at(618.)));
         assert!(!fog_free(&p, &at(640.)));
