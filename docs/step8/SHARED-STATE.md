@@ -171,11 +171,23 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/gpu_timing.rs:242` | `gxm_render_target` | diagnostic | Frame end or render-pass timing. Keep graphics hooks and frame completion on the owner. See line 283. |
 | `src/gpu_timing.rs:268` | `VERTEX` | diagnostic | Frame end or render-pass timing. Keep graphics hooks and frame completion on the owner. See line 302. |
 | `src/gpu_timing.rs:313` | `CAP_30` | diagnostic | The game thread sets the optional display queue interval before vitaGL starts. The Vita display callback reads it atomically. Simulation never accesses it. |
-| `src/display_timing.rs:12` | `ENABLED` | diagnostic | Owner enables the optional trace before vitaGL starts. Both queue hooks acquire it. |
-| `src/display_timing.rs:13` | `FAILED` | diagnostic | The queue hooks invalidate the trace on an API failure. The owner rejects the resulting measurements. |
-| `src/display_timing.rs:14` | `SUBMITTED` | diagnostic | Queue submissions assign FIFO tickets before entering GXM, including unmeasured swaps. |
-| `src/display_timing.rs:15` | `DISPLAYED` | diagnostic | The display callback advances one FIFO ticket per NEXTFRAME handoff. |
-| `src/display_timing.rs:16` | `STAMPS` | diagnostic | Owner arms and frees slots. The display callback publishes each matching timestamp with release ordering. |
+| `src/display_timing.rs:72` | `ENABLED` | diagnostic | Owner enables the optional trace before vitaGL starts. Both queue hooks acquire it. |
+| `src/display_timing.rs:73` | `FAILED` | diagnostic | The queue hooks invalidate the trace on an API failure. The owner rejects the resulting measurements. |
+| `src/display_timing.rs:74` | `SUBMITTED` | diagnostic | Queue submissions assign FIFO tickets before entering GXM, including unmeasured swaps. |
+| `src/display_timing.rs:75` | `DISPLAYED` | diagnostic | The display callback advances one FIFO ticket per NEXTFRAME handoff. |
+| `src/display_timing.rs:76` | `STAMPS` | diagnostic | Owner arms and frees slots. The display callback publishes each matching timestamp with release ordering. |
+| `src/display_timing.rs:83` | `GATE` | diagnostic | Owner enables the optional `cap_queue_depth: 1` queue gate before vitaGL starts; any thread clears it to fail open. Both queue hooks and the vblank wrapper acquire it. Simulation never accesses it. |
+| `src/display_timing.rs:84` | `GATE_OFF` | diagnostic | The first fail-open reason, set once by compare-exchange. Read for the off log line and the teardown report. |
+| `src/display_timing.rs:85` | `GATE_OFF_LOGGED` | diagnostic | The swapping thread prints the off reason once. |
+| `src/display_timing.rs:86` | `GATE_SEMA` | diagnostic | Owner stores the gate semaphore before vitaGL starts. The display callback signals it, the swapping thread waits on it with a bounded timeout. |
+| `src/display_timing.rs:87` | `DISPLAY_THREAD` | diagnostic | The display callback stores its thread id at each NEXTFRAME handoff so the vblank wrapper counts only callback returns. |
+| `src/display_timing.rs:90` | `GATE_SUBMITTED` | diagnostic | The swapping thread numbers each entry it offers to GXM while the gate is on, before the real AddEntry. |
+| `src/display_timing.rs:91` | `COMPLETED` | diagnostic | The display callback counts its returns with release ordering before it signals; the gate passes once it reaches `GATE_SUBMITTED - 1`. |
+| `src/display_timing.rs:92` | `WAITS` | counter | Gate waits on the swapping thread, reported at teardown. |
+| `src/display_timing.rs:93` | `TIMEOUTS` | counter | Gate waits that reached the 100 ms bound, reported at teardown. |
+| `src/display_timing.rs:94` | `TIMEOUT_RUN` | counter | Consecutive gate timeouts on the swapping thread; three turn the gate off. |
+| `src/display_timing.rs:95` | `MAX_WAIT_US` | counter | Longest gate wait on the swapping thread, reported at teardown. |
+| `src/display_timing.rs:100` | `vsync_interval` | diagnostic | Foreign vitaGL global (`vgl.c:112`), written by `vglWaitVblankStart` on the game thread. The gate reads it before each gated swap and fails open unless it is 1. |
 | `src/hud.rs:544` | `ENABLED` | cache | Owner HUD tracing reads the cached host switch. Share its immutable value. See line 545. |
 | `src/input.rs:134` | `KEYS` | cache | No free-step poll. Owner capture resolves scripted binding fixtures into StepInput. See line 135. |
 | `src/interaction/hooks.rs:681` | `REG` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 696. |

@@ -283,7 +283,7 @@ impl Trace {
             }
             if let Some(gate) = crate::display_timing::gate_stats() {
                 println!("SIM_W0_CAP_QUEUE {}", serde_json::json!({
-                    "depth": 1, "entries": gate.entries, "callbacks": gate.callbacks, "waits": gate.waits,
+                    "depth": 1, "submitted": gate.submitted, "completed": gate.completed, "waits": gate.waits,
                     "timeouts": gate.timeouts, "max_wait_us": gate.max_wait_us, "off": gate.off,
                 }));
             }
