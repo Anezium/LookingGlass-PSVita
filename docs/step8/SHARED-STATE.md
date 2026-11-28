@@ -612,6 +612,7 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/sim_maps/probe.rs:927` | `thread_local!` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
 | `src/sim_maps/probe.rs:927` | `BEST` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
 | `src/sim_maps/probe.rs:928` | `KEEP` | diagnostic | Host probes use thread-local rows and owner graphics state. Output paths and frame lists are immutable once initialized. |
+| `src/sim_maps/probe.rs:978` | `ON` | cache | Host fixture/probe accessor caches an immutable option. Read the initialized setting on both sides. See line 979. |
 | `src/sim_maps.rs:63` | `TEST_SWITCHES` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 68. |
 | `src/sim_maps.rs:63` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/sim_maps.rs:69` | `DEFAULTS` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 70. |
@@ -641,7 +642,9 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/sim_maps.rs:434` | `THINK_TEST` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 437. |
 | `src/sim_maps.rs:434` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/sim_maps.rs:217` | `MOVER_SHAPE_REUSE_TEST` | state | Test-only simulation switches are scoped to the test thread. |
-| `src/sim_maps.rs:475` | `thread_local!` | state | Test-only simulation switches are scoped to the test thread. |
+| `src/sim_maps.rs:498` | `thread_local!` | state | Test-only simulation switches are scoped to the test thread. |
+| `src/sim_maps.rs:238` | `thread_local!` | state | Test-only simulation switches are scoped to the test thread. |
+| `src/sim_maps.rs:238` | `MOVER_HULL_CACHE_TEST` | state | Test-only simulation switches are scoped to the test thread. |
 | `src/skin_worker.rs:145` | `SPIN_US` | state | Existing skin worker reads its spin policy. Keep with skin dispatch and worker configuration. See line 146. |
 | `src/skin_worker.rs:501` | `REPORTED` | diagnostic | No. Audio callback startup reports the CPU1 layout once (N1, Vita only). Audio callback thread; never reached from the step. |
 | `src/skin_worker.rs:477` | `APPLIED` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 478. |
