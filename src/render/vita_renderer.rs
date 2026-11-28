@@ -330,6 +330,12 @@ pub struct Config {
     /// kept. Alpha-tested and blended world layers are unchanged. Requires low_fog_per_vertex.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fortress1_sky_fade: bool,
+    /// With `fortress1_sky_fade`, picture-changing, default off: that program computes its fog
+    /// and the fade weight per fragment, as desktop does, instead of interpolating them from the
+    /// vertices; the interpolated weight leaves tall tower faces half visible. Costs the per-pixel
+    /// fog of every opaque low fortress1 fragment.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fortress1_sky_fade_pixel: bool,
     /// On a map with authored distance fog (`setfarplane`), draw the gradient sky flat in the fog
     /// colour, as the desktop renderer shows potears2 (its sky shader draws nothing over the fog
     /// colour clear). Off keeps the RC3 gradient from the fog colour up to 1.5 times it, which
@@ -772,6 +778,7 @@ impl Default for Config {
             low_fog_cheaper: false,
             low_fog_per_vertex: false,
             fortress1_sky_fade: false,
+            fortress1_sky_fade_pixel: false,
             fog_sky: false,
             exact_blends: false,
             detail_layers: false,
@@ -1019,6 +1026,8 @@ impl Config {
             "low_fog_per_vertex is a separate picture-changing option");
         ensure!(!self.fortress1_sky_fade || self.low_fog_per_vertex,
             "fortress1_sky_fade requires low_fog_per_vertex");
+        ensure!(!self.fortress1_sky_fade_pixel || self.fortress1_sky_fade,
+            "fortress1_sky_fade_pixel requires fortress1_sky_fade");
         ensure!(matches!(self.opaque_order.as_str(),"material"|"front_to_back"),"invalid opaque_order");
         ensure!(!self.world_list_submit || (self.world_state_cache && self.world_view_reuse && self.world_parameter_reuse && self.uniform_field_cache && !self.world_static_merge && !self.world_binding_cache && !self.world_gl_state_cache),
             "world_list_submit requires world_state_cache, world_view_reuse, world_parameter_reuse and uniform_field_cache, and excludes world_static_merge, world_binding_cache and world_gl_state_cache");
@@ -2015,9 +2024,14 @@ impl Renderer {
             let (vertex, fragment) = shader::low_fog_sources(c, volume_slots);
             // Desktop builds its `SkyFade` backdrop for fortress1 alone; `sky_backdrop` is that test.
             let (shader, pipelines) = if c.fortress1_sky_fade && scene.sky_backdrop.is_some() {
-                println!("[lg/vita-renderer] fortress1_sky_fade=on volumes={volume_slots}");
-                make_low("retained-world-low-sky-fade", &vertex, &shader::sky_fade_fragment(&fragment),
-                    alpha_fill::merge_blend())?
+                println!("[lg/vita-renderer] fortress1_sky_fade=on volumes={volume_slots} pixel={}", c.fortress1_sky_fade_pixel);
+                if c.fortress1_sky_fade_pixel {
+                    make_low("retained-world-low-sky-fade-pixel", &shader::vertex(c.water_normals),
+                        &shader::sky_fade_fragment(&shader::low_fragment(true)), alpha_fill::merge_blend())?
+                } else {
+                    make_low("retained-world-low-sky-fade", &vertex, &shader::sky_fade_fragment(&fragment),
+                        alpha_fill::merge_blend())?
+                }
             } else { make_low("retained-world-low", &vertex, &fragment, (None, None))? };
             if c.low_fog { println!("[lg/vita-renderer] low_fog=on"); }
             (Some(shader), pipelines)
@@ -4094,6 +4108,10 @@ mod tests {
         let ship = on(r#","quality":"low","low_fog":true,"low_fog_per_vertex":true"#);
         assert!(ship.fortress1_sky_fade && ship.validate().is_ok());
         assert_eq!(serde_json::to_value(&ship).unwrap()["fortress1_sky_fade"], true);
+        assert!(serde_json::to_value(&ship).unwrap().get("fortress1_sky_fade_pixel").is_none());
+        let pixel = |fade: bool| serde_json::from_str::<Config>(&format!(
+            r#"{{"fortress1_sky_fade":{fade},"fortress1_sky_fade_pixel":true,"quality":"low","low_fog":true,"low_fog_per_vertex":true}}"#)).unwrap();
+        assert!(pixel(true).validate().is_ok() && pixel(false).validate().is_err());
     }
     #[test]
     fn nav_sweep_cache_defaults_off_and_requires_a_boolean() {

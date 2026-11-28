@@ -126,13 +126,22 @@ pub fn low_fog_sources(c: &super::Config, volume_slots: usize) -> (std::borrow::
     }
 }
 
-/// `fortress1_sky_fade`: the per-vertex low fragment program writes the desktop `SkyFade`
-/// weight, 1-(1-a)(1-b) over the interpolated fog-volume factors, as its alpha. The pipeline
-/// blends One/SrcAlpha, so the target gets fogged(rgb) + room x weight, the desktop sum.
+/// `fortress1_sky_fade`: the low fragment program writes the desktop `SkyFade` weight,
+/// 1-(1-a)(1-b) over the two fog-volume factors, as its alpha. The pipeline blends One/SrcAlpha,
+/// so the target gets fogged(rgb) + room x weight, the desktop sum. The per-vertex program reads
+/// the interpolated factors; the per-fragment one (`fortress1_sky_fade_pixel`) evaluates them as
+/// desktop `render.rs` does.
 pub fn sky_fade_fragment(fragment: &str) -> String {
-    const OUT: &str = "gl_FragColor=vec4(fogged(rgb),a);";
-    assert_eq!(fragment.matches(OUT).count(), 1, "sky fade output anchor");
-    fragment.replace(OUT, "gl_FragColor=vec4(fogged(rgb),1.0-(1.0-FogFactors.y)*(1.0-FogFactors.z));")
+    const VERTEX_OUT: &str = "gl_FragColor=vec4(fogged(rgb),a);";
+    const PIXEL_OUT: &str = "gl_FragColor=vec4(fogged(rgb,Alpha.z),a);";
+    let (out, weight) = if fragment.contains(VERTEX_OUT) {
+        (VERTEX_OUT, "1.0-(1.0-FogFactors.y)*(1.0-FogFactors.z)")
+    } else {
+        (PIXEL_OUT, "1.0-(1.0-(FogA.w>0.0?clamp(fogLength(FogAMin,FogAMax)/FogA.w,0.0,1.0):0.0))\
+*(1.0-(FogB.w>0.0?clamp(fogLength(FogBMin,FogBMax)/FogB.w,0.0,1.0):0.0))")
+    };
+    assert_eq!(fragment.matches(out).count(), 1, "sky fade output anchor");
+    fragment.replace(out, &out.replace(",a);", &format!(",{weight});")))
 }
 
 #[repr(C)]
@@ -297,5 +306,10 @@ mod low_fog_tests {
             assert_eq!(faded.replace("1.0-(1.0-FogFactors.y)*(1.0-FogFactors.z));", "a);"), fragment);
             assert!(faded.contains("varying mediump vec4 FogFactors;") && vertex.contains("FogFactors=fogFactors();"));
         }
+        let pixel = low_fragment(true);
+        let faded = sky_fade_fragment(&pixel);
+        assert!(faded.contains("gl_FragColor=vec4(fogged(rgb,Alpha.z),1.0-(1.0-(FogA.w>0.0?clamp(fogLength(FogAMin,FogAMax)/FogA.w"));
+        assert_eq!(faded.split("gl_FragColor").next(), pixel.split("gl_FragColor").next());
+        assert!(!faded.contains("FogFactors"));
     }
 }
