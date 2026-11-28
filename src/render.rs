@@ -150,6 +150,10 @@ struct Batch {
     layers: Vec<Layer>,
     center: Vec3,
     model: Option<usize>,
+    /// The BSP shader of a brush-model batch, whose `parts` stay empty; world batches name
+    /// theirs per part. The retained world matches it against `extra_layer_shaders`.
+    #[cfg(feature = "vita_renderer")]
+    model_shader: Option<u16>,
 }
 pub struct Loaded {
     pub scene: Scene,
@@ -1948,6 +1952,8 @@ impl Scene {
                         layers,
                         center: Vec3::ZERO,
                         model: if model == 0 { None } else { Some(model) },
+                        #[cfg(feature = "vita_renderer")]
+                        model_shader: u16::try_from(surface.shader).ok().filter(|_| model != 0),
                     });
                     // Per-face sky overrides must never absorb later opaque
                     // faces that happen to use the same black material.
@@ -2035,6 +2041,8 @@ impl Scene {
                 }],
                 center: Vec3::ZERO,
                 model: Some(rope.model),
+                #[cfg(feature = "vita_renderer")]
+                model_shader: None,
             });
         }
         let mut sky_props = Vec::new();
@@ -2144,6 +2152,8 @@ impl Scene {
                     sky: false,
                     portal: false,
                     model: placement.parent,
+                    #[cfg(feature = "vita_renderer")]
+                    model_shader: None,
                 };
                 if placement.sky && sky_origin.is_some() {
                     sky_props.push(batch);
@@ -2906,6 +2916,8 @@ pub async fn check_layers(scene: &Scene) -> Result<()> {
             portal: sky,
             center: Vec3::ZERO,
             model: None,
+            #[cfg(feature = "vita_renderer")]
+            model_shader: None,
             mesh: Mesh { upload_identity: None, surface: None,
                 vertices,
                 indices: vec![0, 1, 2, 0, 2, 3],

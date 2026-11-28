@@ -65,6 +65,8 @@ fn batch(faces: &[usize]) -> Batch {
         portal: false,
         center: Vec3::ZERO,
         model: None,
+        #[cfg(feature = "vita_renderer")]
+        model_shader: None,
         // Transparency policy only needs the stage; no texture is created.
         layers: vec![Layer {
             spec: Stage::default(),

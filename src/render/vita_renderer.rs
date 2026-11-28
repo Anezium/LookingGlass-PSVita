@@ -342,6 +342,12 @@ pub struct Config {
     /// the world program applies the lightmap itself. Each kept stage is one more draw of its
     /// surface. Off keeps the RC3 world, which drops them. Default off.
     pub detail_layers: bool,
+    /// Picture-changing, default empty: world batches whose BSP shader is listed here
+    /// (case-insensitive) keep up to `EXTRA_LAYER_CAP` stages instead of `max_layers`, as the
+    /// desktop renderer draws them. Each extra stage is one more draw of its surface. Not
+    /// serialized when empty, so an unlisted config reads and publishes the same bytes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extra_layer_shaders: Vec<String>,
     /// Draw the authored sky from a cube map captured once from the sky camera, instead of the
     /// gradient: the sky room (portal maps) and the sky shader layers are drawn by the legacy path
     /// into six faces of one render target on the first frame, and the map's sky surfaces sample it
@@ -767,6 +773,7 @@ impl Default for Config {
             fog_sky: false,
             exact_blends: false,
             detail_layers: false,
+            extra_layer_shaders: Vec::new(),
             sky_cube: false,
             sky_cube_size: 256,
             sky_cube_refresh: 0,
@@ -979,6 +986,11 @@ impl Config {
         ensure!(
             (1..=2).contains(&self.max_layers),
             "max_layers must be 1 or 2"
+        );
+        ensure!(
+            self.extra_layer_shaders.len() <= 32
+                && self.extra_layer_shaders.iter().all(|s| (1..64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_graphic())),
+            "extra_layer_shaders takes at most 32 shader names of 1 to 63 printable ASCII bytes"
         );
         ensure!(
             (1..=2).contains(&self.actor_max_layers),
@@ -1589,6 +1601,8 @@ pub struct Renderer {
     sky_room: Option<sky_room::SkyRoom>,
     alpha_order: Vec<(f32, usize)>,
     prepared: Vec<Prepared>,
+    /// Some group draws a stage past `max_layers` (`extra_layer_shaders`).
+    extra_stages: bool,
     /// Boxed: `finish_fx` trades this field through a take/put-back pair every
     /// frame, and the box keeps those moves one pointer wide.
     fx_gpu: Option<Box<crate::render_fx::retained::Gpu>>,
@@ -1606,6 +1620,31 @@ pub struct Renderer {
 }
 /// Blend classes every world renderer has; `exact_blends` adds classes from here on.
 const WORLD_BLEND_CLASSES: usize = 5;
+/// Stages kept by a batch whose shader is listed in `extra_layer_shaders`. The deepest stage
+/// list among the shaders the list is for is four (`textures/effects/starshootertube`).
+const EXTRA_LAYER_CAP: usize = 4;
+/// The stage cap of one world batch, from the BSP shader names of its faces: `max_layers`, or
+/// `EXTRA_LAYER_CAP` when one of them is listed in `extra_layer_shaders`.
+fn layer_cap<'a>(c: &Config, mut shaders: impl Iterator<Item = &'a str>) -> usize {
+    if !c.extra_layer_shaders.is_empty()
+        && shaders.any(|name| c.extra_layer_shaders.iter().any(|s| s.eq_ignore_ascii_case(name)))
+    {
+        EXTRA_LAYER_CAP
+    } else {
+        c.max_layers
+    }
+}
+/// The ranks the retained world gives a batch's stages, `None` for a dropped stage. Invisible
+/// stages and, with `detail_layers` off, detail stages are dropped without taking a rank; a
+/// stage past `cap` ranks is dropped.
+fn stage_ranks<'a>(c: &'a Config, stages: impl Iterator<Item = &'a Stage> + 'a, cap: usize)
+    -> impl Iterator<Item = Option<usize>> + 'a {
+    stages.scan(0, move |rank, spec| {
+        let dropped = spec.blend == Blend::Invisible || (spec.detail && !c.detail_layers) || *rank == cap;
+        *rank += usize::from(!dropped);
+        Some((!dropped).then(|| *rank - 1))
+    })
+}
 /// Blends the five world classes draw with other factors (see `blend_class`).
 fn approximated_blend(blend: Blend) -> bool {
     matches!(blend, Blend::ColorAdd | Blend::AlphaColor | Blend::Factors(..))
@@ -1732,6 +1771,7 @@ impl Renderer {
         let mut touched: Vec<usize> = Vec::new();
         let mut recipes_ms=0.;let mut chunks_ms=0.;let mut source_chunks=0;
         let mut dropped_layers = 0;
+        let mut extra_layers = 0;
         let mut diagnostic_batches = 0;
         // `exact_blends`: the blends of pipeline classes WORLD_BLEND_CLASSES and up, in first-seen order.
         let mut exact_blends: Vec<Blend> = Vec::new();
@@ -1754,16 +1794,15 @@ impl Renderer {
             let batch_liquid = b.parts.iter().any(|part| {
                 scene.map.shaders[scene.map.surfaces[part.face].shader].contents & crate::collision::LIQUID_MASK != 0
             });
-            let mut rank = 0;
-            for layer in &b.layers {
-                if layer.spec.blend == Blend::Invisible || (layer.spec.detail && !c.detail_layers) {
+            let cap = layer_cap(c, b.parts.iter().map(|part| scene.map.surfaces[part.face].shader)
+                .chain(b.model_shader.map(usize::from))
+                .map(|s| scene.map.shaders[s].name.as_str()));
+            for (layer, rank) in b.layers.iter().zip(stage_ranks(c, b.layers.iter().map(|l| &l.spec), cap)) {
+                let Some(rank) = rank else {
                     dropped_layers += 1;
                     continue;
-                }
-                if rank == c.max_layers {
-                    dropped_layers += 1;
-                    continue;
-                }
+                };
+                extra_layers += usize::from(rank >= c.max_layers);
                 let recipe_started=std::time::Instant::now();
                 let deform = b
                     .deforms
@@ -1810,7 +1849,6 @@ impl Renderer {
                     deform,
                     wave_normal,
                 };
-                rank += 1;
                 let texture_keys = layer
                     .textures
                     .iter()
@@ -2251,6 +2289,10 @@ impl Renderer {
             "clusters":pvs.clusters.len(),"unique_cluster_lists":unique,"pipelines":16+low_pipelines.len(),"uniform_staging_capacity_bytes":groups.len()*std::mem::size_of::<Prepared>(),"dropped_layers":dropped_layers,
             "frozen_ambient_models":frozen_models,"frozen_deforms":frozen_deforms,"dynamic_world_lights":0,"geometry_uploads_per_frame":0,"load_groups_ms":groups_ms,"load_recipes_ms":recipes_ms,"load_chunks_ms":chunks_ms,"source_chunks":source_chunks,"load_pipelines_upload_ms":upload_ms,"load_pvs_ms":pvs_ms,"load_total_ms":started.elapsed().as_secs_f64()*1000.,"pvs_cache_status":cache_status,"pvs_method":c.pvs_method});
         println!("[lg/vita-renderer] loaded {inventory}");
+        let extra_groups = groups.iter().filter(|g| g.recipe.rank >= c.max_layers).count();
+        if !c.extra_layer_shaders.is_empty() {
+            println!("[lg/vita-renderer] extra_layer_shaders kept_layers={extra_layers} groups={extra_groups}");
+        }
         *INVENTORY.lock().unwrap() = Some(inventory);
         // PVS provenance is no longer needed after compilation.
         for g in &mut groups {
@@ -2275,6 +2317,7 @@ impl Renderer {
             field_uniforms: std::array::from_fn(|_| super::uniform_fields::Cache::new(shader::meta())),
             alpha_order: Vec::with_capacity(groups.len()),
             prepared: Vec::with_capacity(groups.len()),
+            extra_stages: extra_groups > 0,
             fx_gpu: None,
             visibility_key: None, visibility_generation: 0,
             visibility: vec![(0, None); groups.len()],
@@ -2703,6 +2746,11 @@ impl Renderer {
             count("vita_world_parameter_builds", builds);
             count("vita_world_parameter_time_updates", time_updates);
             count("vita_world_parameter_reuses", self.alpha_order.len() as u64 - builds);
+            if self.extra_stages {
+                let max_layers = config().max_layers;
+                let extra = self.alpha_order.iter().filter(|&&(_, id)| self.groups[id].recipe.rank >= max_layers).count();
+                counts(&[("vita_world_extra_stage_groups", extra as u64)]);
+            }
         }
         water_probe::add(|f| &mut f.parameter_time, probe_parameters);
         // Uniform values are program storage. These programs are private to
@@ -6158,6 +6206,63 @@ mod tests {
         assert_ne!(on, shader::VERTEX);
         assert!(on.contains("}else if(Deform.x>2.5&&Deform.x<3.5){") && on.contains("if(Deform.x>3.5){"));
         assert!(on.contains("vec3 n=(Model*vec4(rippled,0.0)).xyz;"), "the environment and dot terms read the rippled normal");
+    }
+    #[test]
+    fn extra_layer_shaders_default_empty_unpublished_and_validated() {
+        assert!(Config::default().extra_layer_shaders.is_empty());
+        assert!(serde_json::to_value(Config::default()).unwrap().get("extra_layer_shaders").is_none(),
+            "an empty list publishes the int7 bytes");
+        let listed: Config = serde_json::from_str(r#"{"extra_layer_shaders":["textures/effects/alicewall"]}"#).unwrap();
+        assert!(listed.validate().is_ok());
+        assert_eq!(serde_json::to_value(&listed).unwrap()["extra_layer_shaders"], serde_json::json!(["textures/effects/alicewall"]));
+        assert!(serde_json::from_str::<Config>(r#"{"extra_layer_shaders":"textures/effects/alicewall"}"#).is_err());
+        for bad in [vec![String::new()], vec!["a b".into()], vec!["a".repeat(64)], vec!["x".to_string(); 33]] {
+            assert!(Config { extra_layer_shaders: bad, ..Config::default() }.validate().is_err());
+        }
+        assert!(Config { extra_layer_shaders: vec!["a".repeat(63); 32], ..Config::default() }.validate().is_ok());
+    }
+    #[test]
+    fn extra_layer_cap_applies_to_listed_shaders_only() {
+        let c = Config { extra_layer_shaders: vec!["textures/effects/alicewall".into()], ..Config::default() };
+        assert_eq!(layer_cap(&c, ["textures/effects/ALICEWALL"].into_iter()), EXTRA_LAYER_CAP, "names match without case");
+        assert_eq!(layer_cap(&c, ["textures/wall/brk_out1", "textures/effects/alicewall"].into_iter()), EXTRA_LAYER_CAP);
+        assert_eq!(layer_cap(&c, ["textures/effects/alicewall2"].into_iter()), c.max_layers, "whole names only");
+        assert_eq!(layer_cap(&c, ["textures/chess/bw_window"].into_iter()), c.max_layers);
+        assert_eq!(layer_cap(&c, std::iter::empty()), c.max_layers, "a batch with no BSP shader keeps max_layers");
+        for max_layers in [1, 2] {
+            let off = Config { max_layers, ..Config::default() };
+            assert_eq!(layer_cap(&off, ["textures/effects/alicewall"].into_iter()), max_layers);
+        }
+    }
+    #[test]
+    fn stage_ranks_keep_extra_stages_and_skip_dropped_ones_without_a_rank() {
+        let stage = |blend, detail| Stage { blend, detail, ..Default::default() };
+        let stages = [stage(Blend::Opaque, false), stage(Blend::Filter, true), stage(Blend::Add, false),
+            stage(Blend::Invisible, false), stage(Blend::Add, false), stage(Blend::Filter, false),
+            stage(Blend::Add, false), stage(Blend::Add, false)];
+        let ranks = |c: &Config, cap| stage_ranks(c, stages.iter(), cap).collect::<Vec<_>>();
+        let off = Config::default();
+        // The int7 loop: base, the first non-detail stage, nothing past max_layers.
+        assert_eq!(ranks(&off, off.max_layers), [Some(0), None, Some(1), None, None, None, None, None]);
+        assert_eq!(ranks(&off, EXTRA_LAYER_CAP), [Some(0), None, Some(1), None, Some(2), Some(3), None, None]);
+        let detail = Config { detail_layers: true, ..Config::default() };
+        assert_eq!(ranks(&detail, EXTRA_LAYER_CAP), [Some(0), Some(1), Some(2), None, Some(3), None, None, None]);
+        assert_eq!(ranks(&Config { max_layers: 1, ..Config::default() }, 1), [Some(0), None, None, None, None, None, None, None]);
+    }
+    #[test]
+    fn extra_stages_ship_list_is_the_release_candidate_plus_the_census_shaders() {
+        let parse = |bytes: &[u8]| parse_runtime_config(bytes).unwrap().0;
+        let extra = parse(include_bytes!("../../configs/PL-v12-4-extra.json"));
+        let four = parse(include_bytes!("../../configs/PL-v11-4-cand.json"));
+        assert!(extra.validate().is_ok());
+        assert_eq!(extra.extra_layer_shaders, ["textures/effects/alicewall", "textures/effects/starshootertube",
+            "textures/special/teleporter2_1", "textures/special/teleporter2_1red", "textures/liquid/flowingwater1",
+            "textures/liquid/darkflowingwater1", "textures/detail/clockface4_1sh"]);
+        assert!(extra.extra_layer_shaders.iter().all(|s| !s.contains("bw_window")),
+            "bw_window adds 58 draws on wchess1, a heavy fight map");
+        let mut rest = serde_json::to_value(&extra).unwrap();
+        rest.as_object_mut().unwrap().remove("extra_layer_shaders");
+        assert_eq!(rest, serde_json::to_value(&four).unwrap(), "only the list differs from PL-v11-4-cand");
     }
     #[test]
     fn detail_layers_defaults_off_and_parses_as_a_bool() {
