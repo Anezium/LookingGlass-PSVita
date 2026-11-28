@@ -282,8 +282,9 @@ impl Gpu {
         let state=!c.fx_submit_state_cache || self.state.pipeline!=Some(key);
         let binding_key = (id, texture, index);
         let binding=state || self.state.bindings!=Some(binding_key);
-        if state {ctx.apply_pipeline(pipeline);unsafe{gl::glDepthMask(u8::from(depth_write));}count("gpu_skin_pipeline_sets",1);}
+        if state {let _pipe=Clock::new(4);ctx.apply_pipeline(pipeline);unsafe{gl::glDepthMask(u8::from(depth_write));}count("gpu_skin_pipeline_sets",1);}
         if binding {
+            let _bind=Clock::new(5);
             ctx.apply_bindings_from_slice(&bindings.vertex_buffers, index, &bindings.images);
             count("gpu_skin_binding_sets",1);
         }
@@ -297,7 +298,7 @@ impl Gpu {
             unsafe { if cull { gl::glEnable(0x0B44); gl::glCullFace(0x0404); } }
             if emit_actor_geometry(zero_glow && subset.is_none() && variant == 2) {
                 if let Some(subset) = subset { subset.record(true); }
-                if index_count != 0 { ctx.draw(0, index_count, 1); }
+                if index_count != 0 { let _draw=Clock::new(6); ctx.draw(0, index_count, 1); }
             }
             unsafe { if cull { gl::glDisable(0x0B44); } }
         }
@@ -350,15 +351,23 @@ impl Drop for Gpu {fn drop(&mut self) {
     for shader in self.shaders.iter().flatten() {ctx.delete_shader(*shader);}
 }}
 
-thread_local! {static CENSUS:Cell<[u64;4]>=const {Cell::new([0;4])};}
+/// Spike-log clocks (only while the spike log is on): 0 palette, 1 submit, 2 uniform upload,
+/// 3 draws; diagnostic split of the submit: 4 pipeline apply, 5 bindings apply, 6 the draw
+/// call (vitaGL), with 7 pipeline and 8 binding counts; 9 the GPU-skin eligibility check.
+thread_local! {static CENSUS:Cell<[u64;10]>=const {Cell::new([0;10])};}
 struct Clock(Option<std::time::Instant>,usize);
 impl Clock {fn new(i:usize)->Self {Self(crate::spike_log::on().then(std::time::Instant::now),i)}}
-impl Drop for Clock {fn drop(&mut self) {if let Some(t)=self.0 {CENSUS.with(|c| {let mut row=c.get();row[self.1]+=t.elapsed().as_nanos() as u64;if self.1==1 {row[3]+=1;}c.set(row);});}}}
-pub(crate) fn census_begin() {CENSUS.with(|v|v.set([0;4]));}
+impl Drop for Clock {fn drop(&mut self) {if let Some(t)=self.0 {CENSUS.with(|c| {let mut row=c.get();row[self.1]+=t.elapsed().as_nanos() as u64;
+    match self.1 {1=>row[3]+=1,4=>row[7]+=1,5=>row[8]+=1,_=>{}}c.set(row);});}}}
+/// Times the per-surface GPU-skin eligibility check (spike log only).
+pub(crate) fn check_clock()->impl Drop {Clock::new(9)}
+pub(crate) fn census_begin() {CENSUS.with(|v|v.set([0;10]));}
 pub(crate) fn census_append(out:&mut String) {
     let c=crate::render::vita_renderer::config();if !(c.gpu_skin_ants || c.gpu_skin_actors) {return;}
-    use std::fmt::Write;let [palette,submit,upload,draws]=CENSUS.with(Cell::get);
+    use std::fmt::Write;let [palette,submit,upload,draws,pipe,bind,draw,pipes,binds,check]=CENSUS.with(Cell::get);
     let _=write!(out," gpu_skin={draws}/{:.6}/{:.6}/{:.6}",palette as f64/1e6,upload as f64/1e6,submit as f64/1e6);
+    // Separate field so parsers of `gpu_skin=` keep working: pipeline/bindings/draw ms, counts, check ms.
+    let _=write!(out," gpu_skin_split={:.6}/{:.6}/{:.6}/{pipes}/{binds}/{:.6}",pipe as f64/1e6,bind as f64/1e6,draw as f64/1e6,check as f64/1e6);
 }
 /// Host-only coverage census (`LOOKING_GLASS_GPU_SKIN_CENSUS`): per actor family and
 /// reason, the skinned surface occurrences and vertices of each frame. Never on the Vita.
