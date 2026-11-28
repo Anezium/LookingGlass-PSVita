@@ -13,7 +13,7 @@ impl Probe {
             if config.diag_overlap { config.diag_overlap_burn_ms } else { 0 }
         };
         #[cfg(not(feature="vita_renderer"))]
-        let ms = 0;
+        let ms = 0u32;
         let worker = if ms == 0 { None } else {
             let (tx, rx) = mpsc::sync_channel(1);
             let (done, result) = mpsc::sync_channel(1);
