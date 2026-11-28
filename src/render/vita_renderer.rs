@@ -2117,13 +2117,15 @@ impl Renderer {
         // orders that break ties by id are unchanged.
         let is_sprite: Vec<bool> = pending.iter().map(|p| p.sprite.is_some()).collect();
         let pack_ids: Vec<usize> = (0..pending.len()).filter(|&i| !is_sprite[i]).collect();
-        let mut pack_input: Vec<(Option<(usize, usize)>, &mut Vec<WorldVertex>, &mut Vec<u16>)> =
-            Vec::with_capacity(pack_ids.len());
-        for &i in &pack_ids {
-            let p = &mut pending[i];
-            let key = (c.world_static_merge && submit::static_opaque(&p.recipe)).then_some((p.parameter,p.recipe.rank));
-            pack_input.push((key, &mut p.geometry.vertices, &mut p.geometry.indices));
-        }
+        // The items lend each pending's geometry: iterate, do not index, so the borrows
+        // stay disjoint.
+        let pack_input: Vec<(Option<(usize, usize)>, &mut Vec<WorldVertex>, &mut Vec<u16>)> =
+            pending.iter_mut().enumerate()
+            .filter(|(i, _)| !is_sprite[*i])
+            .map(|(_, p)| {
+                let key = (c.world_static_merge && submit::static_opaque(&p.recipe)).then_some((p.parameter,p.recipe.rank));
+                (key, &mut p.geometry.vertices, &mut p.geometry.indices)
+            }).collect();
         let (packed, packed_allocations) = world_list::pack(pack_input.into_iter(), c.world_shared_buffers);
         let (sprites, sprite_allocations) = sprite_stream::build(ctx, &mut resources, &mut pending)?;
         let mut allocations = vec![(usize::MAX, 0, 0); pending.len()];
