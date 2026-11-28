@@ -38,6 +38,7 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/audio/music.rs:34` | `RAW_UNDERRUNS` | counter | Decoder and playback count streams and underruns. Keep atomic counters with their existing producers. See line 127. |
 | `src/audio/music.rs:35` | `STATS` | counter | Decoder and playback count streams and underruns. Keep atomic counters with their existing producers. See line 118. |
 | `src/audio/music.rs:170` | `JOBS` | state | Music decode enqueues on the existing worker. Keep sender and decode order with audio. See line 177. |
+| `src/audio/music_file.rs:23` | `MISSES` | counter | Music decoders count reads outside the bytes kept at a release (`audio_release_early`); the release log reads it. Keep the atomic counter with its readers. See line 127. |
 | `src/audio/music.rs:313` | `TEST_COUNTER_LOCK` | state | No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/audio/proof.rs:16` | `thread_local!` | diagnostic | TLS block. Audio preparation feeds apply/mix/decode. Retain control writes on the audio owner and collect proof in producer order. |
 | `src/audio/proof.rs:17` | `MIX` | diagnostic | Audio preparation feeds apply/mix/decode. Retain control writes on the audio owner and collect proof in producer order. See line 30. |
