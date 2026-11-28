@@ -323,6 +323,13 @@ pub struct Config {
     pub low_fog_cheaper: bool,
     /// Interpolate fog factors from vertices. This changes the picture.
     pub low_fog_per_vertex: bool,
+    /// fortress1 only, picture-changing, default off: fogged opaque world walls fade into the
+    /// sky room instead of the fog colour, as the desktop `SkyFade` backdrop shows the towers.
+    /// The low world program writes the fog-volume weight 1-(1-a)(1-b) as its alpha and blends
+    /// One/SrcAlpha over the room the sky pass left in the colour target; destination alpha is
+    /// kept. Alpha-tested and blended world layers are unchanged. Requires low_fog_per_vertex.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fortress1_sky_fade: bool,
     /// On a map with authored distance fog (`setfarplane`), draw the gradient sky flat in the fog
     /// colour, as the desktop renderer shows potears2 (its sky shader draws nothing over the fog
     /// colour clear). Off keeps the RC3 gradient from the fog colour up to 1.5 times it, which
@@ -764,6 +771,7 @@ impl Default for Config {
             low_fog_skip: false,
             low_fog_cheaper: false,
             low_fog_per_vertex: false,
+            fortress1_sky_fade: false,
             fog_sky: false,
             exact_blends: false,
             detail_layers: false,
@@ -1009,6 +1017,8 @@ impl Config {
             "low_fog options require low_fog, quality low and simple_fog off");
         ensure!(!self.low_fog_per_vertex || !(self.low_fog_skip || self.low_fog_cheaper),
             "low_fog_per_vertex is a separate picture-changing option");
+        ensure!(!self.fortress1_sky_fade || self.low_fog_per_vertex,
+            "fortress1_sky_fade requires low_fog_per_vertex");
         ensure!(matches!(self.opaque_order.as_str(),"material"|"front_to_back"),"invalid opaque_order");
         ensure!(!self.world_list_submit || (self.world_state_cache && self.world_view_reuse && self.world_parameter_reuse && self.uniform_field_cache && !self.world_static_merge && !self.world_binding_cache && !self.world_gl_state_cache),
             "world_list_submit requires world_state_cache, world_view_reuse, world_parameter_reuse and uniform_field_cache, and excludes world_static_merge, world_binding_cache and world_gl_state_cache");
@@ -1979,7 +1989,7 @@ impl Renderer {
         }
         resources.pipelines.extend(pipelines.iter().copied());
         let volume_slots = scene.atmosphere.volumes.len();
-        let mut make_low = |name, vertex: &str, fragment: &str| -> Result<_> {
+        let mut make_low = |name, vertex: &str, fragment: &str, blend: (Option<BlendState>, Option<BlendState>)| -> Result<_> {
             crate::frame_profile::shader_creation();
             let shader_timing = crate::startup::WorkTimer::new(crate::startup::Work::ShaderCreation);
             let _shader_name = crate::shader_cache::Name::new(name);
@@ -1995,20 +2005,26 @@ impl Renderer {
                 crate::frame_profile::pipeline_creation();
                 ctx.new_pipeline(&[BufferLayout { stride: 52, ..Default::default() }], &attributes, low,
                     PipelineParams { depth_test: Comparison::LessOrEqual, depth_write: true,
-                        cull_face: cull, front_face_order: FrontFaceOrder::Clockwise, ..Default::default() })
+                        cull_face: cull, front_face_order: FrontFaceOrder::Clockwise,
+                        color_blend: blend.0, alpha_blend: blend.1, ..Default::default() })
             }).collect::<Vec<_>>();
             resources.pipelines.extend(pipelines.iter().copied());
             Ok((low, pipelines))
         };
         let (low_shader, low_pipelines) = if c.quality == "low" {
             let (vertex, fragment) = shader::low_fog_sources(c, volume_slots);
-            let (shader, pipelines) = make_low("retained-world-low", &vertex, &fragment)?;
+            // Desktop builds its `SkyFade` backdrop for fortress1 alone; `sky_backdrop` is that test.
+            let (shader, pipelines) = if c.fortress1_sky_fade && scene.sky_backdrop.is_some() {
+                println!("[lg/vita-renderer] fortress1_sky_fade=on volumes={volume_slots}");
+                make_low("retained-world-low-sky-fade", &vertex, &shader::sky_fade_fragment(&fragment),
+                    alpha_fill::merge_blend())?
+            } else { make_low("retained-world-low", &vertex, &fragment, (None, None))? };
             if c.low_fog { println!("[lg/vita-renderer] low_fog=on"); }
             (Some(shader), pipelines)
         } else { (None, Vec::new()) };
         let fog_free = if c.low_fog_skip {
             Some(make_low("retained-world-low-fog-free",
-                &shader::vertex(c.water_normals), &shader::low_fragment(false))?)
+                &shader::vertex(c.water_normals), &shader::low_fragment(false), (None, None))?)
         } else { None };
         // A key whose program does not build is turned off with a warning; the frame stays whole.
         let mut alpha_fill = alpha_fill::State::off();
@@ -4067,6 +4083,17 @@ mod tests {
             } else { assert_eq!(value, 0); }
         }
         assert!(serde_json::from_value::<Config>(serde_json::json!({"spike_log_first_frame":20,"spike_log_last_frame":10})).unwrap().validate().is_err());
+    }
+    #[test]
+    fn fortress1_sky_fade_defaults_off_unserialized_and_requires_per_vertex_fog() {
+        assert!(!Config::default().fortress1_sky_fade);
+        assert!(serde_json::to_value(Config::default()).unwrap().get("fortress1_sky_fade").is_none());
+        assert!(serde_json::from_str::<Config>(r#"{"fortress1_sky_fade":1}"#).is_err());
+        let on = |extra: &str| serde_json::from_str::<Config>(&format!(r#"{{"fortress1_sky_fade":true{extra}}}"#)).unwrap();
+        assert!(on("").validate().is_err());
+        let ship = on(r#","quality":"low","low_fog":true,"low_fog_per_vertex":true"#);
+        assert!(ship.fortress1_sky_fade && ship.validate().is_ok());
+        assert_eq!(serde_json::to_value(&ship).unwrap()["fortress1_sky_fade"], true);
     }
     #[test]
     fn nav_sweep_cache_defaults_off_and_requires_a_boolean() {

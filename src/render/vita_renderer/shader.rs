@@ -126,6 +126,15 @@ pub fn low_fog_sources(c: &super::Config, volume_slots: usize) -> (std::borrow::
     }
 }
 
+/// `fortress1_sky_fade`: the per-vertex low fragment program writes the desktop `SkyFade`
+/// weight, 1-(1-a)(1-b) over the interpolated fog-volume factors, as its alpha. The pipeline
+/// blends One/SrcAlpha, so the target gets fogged(rgb) + room x weight, the desktop sum.
+pub fn sky_fade_fragment(fragment: &str) -> String {
+    const OUT: &str = "gl_FragColor=vec4(fogged(rgb),a);";
+    assert_eq!(fragment.matches(OUT).count(), 1, "sky fade output anchor");
+    fragment.replace(OUT, "gl_FragColor=vec4(fogged(rgb),1.0-(1.0-FogFactors.y)*(1.0-FogFactors.z));")
+}
+
 #[repr(C)]
 pub struct Uniforms {
     pub mvp: [f32; 16],
@@ -276,6 +285,17 @@ mod low_fog_tests {
         for source in [&no_volume, &one_volume, &two_volumes] {
             assert!(source.contains("DistanceFog.w>0.0") && source.contains("LiquidFog.w>0.0"));
             assert!(!source.contains("additive"));
+        }
+    }
+
+    #[test]
+    fn sky_fade_changes_only_the_low_output_alpha() {
+        let config = Config { low_fog: true, low_fog_per_vertex: true, quality: "low".into(), ..Config::default() };
+        for slots in 0..=2 {
+            let (vertex, fragment) = low_fog_sources(&config, slots);
+            let faded = sky_fade_fragment(&fragment);
+            assert_eq!(faded.replace("1.0-(1.0-FogFactors.y)*(1.0-FogFactors.z));", "a);"), fragment);
+            assert!(faded.contains("varying mediump vec4 FogFactors;") && vertex.contains("FogFactors=fogFactors();"));
         }
     }
 }
