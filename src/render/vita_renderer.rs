@@ -233,6 +233,11 @@ pub struct Config {
     /// so one moving brush no longer rebuilds every unchanged brush in the same list (About
     /// Face). Exact reuse, invalidated by any pose change. Default off.
     pub mover_shape_reuse: bool,
+    /// Pale Realm and Pool of Tears movers place each changed collider from per-brush shapes
+    /// built once (corners and edge vectors) and re-oriented only when the rotation changes,
+    /// into reused storage. Bit-identical colliders. Default off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mover_hull_cache: bool,
     /// Two clock reads per world pass inside the survey window, one printed line after it. Diagnostic.
     pub world_pass_clock: bool,
     /// Opaque world pass from dense records. Same GL calls in the same order. Default off.
@@ -734,6 +739,7 @@ impl Default for Config {
             fx_attached_persist: false,
             mover_advance_reuse: false,
             mover_shape_reuse: false,
+            mover_hull_cache: false,
             world_pass_clock: false,
             world_list_submit: false,
             world_shared_buffers: false,
@@ -4680,6 +4686,21 @@ mod tests {
         assert_eq!(crate::render_fx::retained::specialized_program(true, true),
             Some(crate::render_fx::retained::Specialized::UnlitExact),
             "fx_unlit_exact takes precedence over fx_lite");
+    }
+    #[test]
+    fn mover_hull_cache_is_strict_default_off_and_unprinted_when_off() {
+        assert!(!Config::default().mover_hull_cache);
+        assert!(serde_json::to_value(Config::default()).unwrap().get("mover_hull_cache").is_none());
+        let on: Config = serde_json::from_str(r#"{"mover_hull_cache":true}"#).unwrap();
+        on.validate().unwrap();
+        assert_eq!(serde_json::to_value(&on).unwrap()["mover_hull_cache"], true);
+        for bad in [serde_json::json!(1), serde_json::json!("on"), serde_json::Value::Null] {
+            assert!(serde_json::from_value::<Config>(serde_json::json!({"mover_hull_cache": bad})).is_err());
+        }
+        for bytes in [&include_bytes!("../../configs/PL-release.json")[..],
+                      &include_bytes!("../../configs/PL-v11-2c-ship.json")[..]] {
+            assert!(!parse_runtime_config(bytes).unwrap().0.mover_hull_cache);
+        }
     }
     #[test]
     fn mover_shape_reuse_is_strict_default_off_and_printed() {

@@ -917,6 +917,58 @@ mod tests {
         ]);
         poses
     }
+    #[test]
+    fn model_from_is_bitwise_collider_model_across_poses_masks_and_errors() {
+        let map = brush_map();
+        let mut seed = 0x1D2C_3B4Au32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 100_000) as f32 / 100_000.
+        };
+        let (mut placed, mut refills) = (0, 0);
+        for model in 0..map.models.len() + 1 {
+            for solids in [true, false] {
+                // One slot across every pose: rotation changes re-orient, repeats do not. Some
+                // placements stay held (as the world holds published colliders), so both the
+                // in-place refill and a fresh allocation run, and a held one must never change.
+                let mut slot = None;
+                let mut held: Vec<(Vec<u32>, Collider)> = Vec::new();
+                let mut previous = [None, None];
+                for (step, (base, rotation)) in poses().into_iter().cycle().take(40).enumerate() {
+                    let mut origins = vec![base, -Vec3::ZERO, base + vec3(0., 0., -96.)];
+                    origins.extend((0..24).map(|_| base + vec3(next() * 9e3 - 4.5e3, next() * 0.7, -next() * 96.)));
+                    for (i, origin) in origins.into_iter().enumerate() {
+                        let old = Collider::model(&map, model, origin, rotation, solids);
+                        let new = Collider::model_from(&map, model, origin, rotation, solids, &mut slot);
+                        match (old, new) {
+                            (Ok(old), Ok(new)) => {
+                                assert_eq!(old.geometry_bits(), new.geometry_bits(), "model {model} {solids} {origin} {rotation}");
+                                placed += usize::from(slot.as_ref().is_some_and(|s: &ModelShape| s.fits(model, solids)));
+                                refills += usize::from(previous[0] == Some(new.hulls_location()));
+                                if (step + i) % 5 == 0 {
+                                    held.push((new.geometry_bits(), new.clone()));
+                                }
+                                previous = [previous[1], Some(new.hulls_location())];
+                            }
+                            (Err(old), Err(new)) => assert_eq!(old.to_string(), new.to_string()),
+                            (old, new) => panic!("model {model} {solids}: {:?} vs {:?}", old.is_ok(), new.is_ok()),
+                        }
+                    }
+                    // A slot built for another mask takes Collider::model.
+                    if let (Ok(old), Ok(new)) = (Collider::model(&map, model, base, rotation, !solids),
+                                                 Collider::model_from(&map, model, base, rotation, !solids, &mut slot)) {
+                        assert_eq!(old.geometry_bits(), new.geometry_bits());
+                    }
+                }
+                for (bits, collider) in &held {
+                    assert_eq!(*bits, collider.geometry_bits(), "a held placement changed");
+                }
+            }
+        }
+        assert!(placed > 1000 && refills > 100, "{placed} {refills}");
+    }
     // Independently recover the reference hull vertices from its world planes.
     fn vertices(planes: &[Plane]) -> Vec<Vec3> {
         let mut points = Vec::<Vec3>::new();

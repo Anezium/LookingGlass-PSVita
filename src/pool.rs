@@ -125,6 +125,8 @@ struct Object {
     base: Vec3,
     pose: (Vec3, Quat),
     collider: Collider,
+    /// `mover_hull_cache` shapes for `collider`, built at the first change.
+    shape: Option<crate::collision::ModelShape>,
 }
 struct Prop {
     model: String,
@@ -210,6 +212,7 @@ impl Pool {
                 base,
                 pose: (base, Quat::IDENTITY),
                 collider: Collider::model(map, model, base, Quat::IDENTITY, true)?,
+                shape: None,
             });
         }
         let mut props = Vec::new();
@@ -461,7 +464,13 @@ impl Pool {
         for (o, (p, r)) in self.objects.iter_mut().zip(poses) {
             if o.pose != (p, r) {
                 o.pose = (p, r);
-                o.collider = Collider::model(map, o.model, p, r, true)?;
+                #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                crate::sim_maps::probe::mover_pose(&o.name, p, r);
+                o.collider = if crate::sim_maps::mover_hull_cache() {
+                    Collider::model_from(map, o.model, p, r, true, &mut o.shape)?
+                } else {
+                    Collider::model(map, o.model, p, r, true)?
+                };
             }
         }
         Ok(())

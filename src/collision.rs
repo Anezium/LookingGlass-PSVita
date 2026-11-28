@@ -106,31 +106,7 @@ impl Hull {
         crate::sim_maps::count("brush_hulls_built", 1);
         #[cfg(target_os = "vita")]
         let _vertices_profile = crate::frame_profile::span("collider_vertices");
-        let mut vertices = Vec::<Vec3>::new();
-        for (i, a) in source.iter().enumerate() {
-            for (j, b) in source.iter().enumerate().skip(i + 1) {
-                for c in &source[j + 1..] {
-                    let determinant = a.normal.dot(b.normal.cross(c.normal));
-                    if determinant.abs() < 0.00001 {
-                        continue;
-                    }
-                    let v = (a.distance * b.normal.cross(c.normal)
-                        + b.distance * c.normal.cross(a.normal)
-                        + c.distance * a.normal.cross(b.normal))
-                        / determinant;
-                    if v.is_finite()
-                        && source.iter().all(|p| p.normal.dot(v) - p.distance <= 0.01)
-                        && !vertices.iter().any(|p| p.distance_squared(v) < 0.0001)
-                    {
-                        vertices.push(v);
-                    }
-                }
-            }
-        }
-        ensure!(
-            vertices.len() >= 4,
-            "Inline collision brush has no closed volume"
-        );
+        let vertices = local_vertices(source)?;
         #[cfg(target_os = "vita")]
         drop(_vertices_profile);
         #[cfg(target_os = "vita")]
@@ -151,30 +127,7 @@ impl Hull {
         ]);
         #[cfg(target_os = "vita")]
         let _edges_profile = crate::frame_profile::span("collider_edges");
-        let mut edges = Vec::<Vec3>::new();
-        for (i, a) in vertices.iter().enumerate() {
-            for b in &vertices[i + 1..] {
-                // Two shared supporting planes identify a hull edge. Do not add
-                // diagonals joining vertices across a face or the brush interior.
-                if source
-                    .iter()
-                    .filter(|p| {
-                        (p.normal.dot(*a) - p.distance).abs() <= 0.01
-                            && (p.normal.dot(*b) - p.distance).abs() <= 0.01
-                    })
-                    .count()
-                    >= 2
-                {
-                    let edge = (rotation * (*b - *a)).normalize();
-                    if !edges
-                        .iter()
-                        .any(|e| e.distance_squared(edge).min(e.distance_squared(-edge)) < 1e-10)
-                    {
-                        edges.push(edge);
-                    }
-                }
-            }
-        }
+        let edges = hull_edges(source, &vertices, rotation);
         #[cfg(target_os = "vita")]
         drop(_edges_profile);
         #[cfg(target_os = "vita")]
@@ -193,20 +146,7 @@ impl Hull {
                 }
             })
             .collect::<Vec<_>>();
-        let axes = [Vec3::X, Vec3::Y, Vec3::Z];
-        for axis in axes {
-            add_support(&mut planes, &points, axis);
-            add_support(&mut planes, &points, -axis);
-        }
-        for edge in edges {
-            for axis in axes {
-                let bevel = edge.cross(axis);
-                if bevel.length_squared() > 0.000001 {
-                    add_support(&mut planes, &points, bevel.normalize());
-                    add_support(&mut planes, &points, -bevel.normalize());
-                }
-            }
-        }
+        support_candidates(&edges, |normal| add_support(&mut planes, &points, normal));
         Ok(Self {
             planes,
             bounds: Bounds {
@@ -214,6 +154,212 @@ impl Hull {
                 max: points.iter().copied().reduce(Vec3::max).unwrap(),
             },
         })
+    }
+}
+/// The corners of a convex brush in its own frame: every plane triple's meeting point that
+/// lies inside all planes, without near duplicates.
+fn local_vertices(source: &[Plane]) -> Result<Vec<Vec3>> {
+    let mut vertices = Vec::<Vec3>::new();
+    for (i, a) in source.iter().enumerate() {
+        for (j, b) in source.iter().enumerate().skip(i + 1) {
+            for c in &source[j + 1..] {
+                let determinant = a.normal.dot(b.normal.cross(c.normal));
+                if determinant.abs() < 0.00001 {
+                    continue;
+                }
+                let v = (a.distance * b.normal.cross(c.normal)
+                    + b.distance * c.normal.cross(a.normal)
+                    + c.distance * a.normal.cross(b.normal))
+                    / determinant;
+                if v.is_finite()
+                    && source.iter().all(|p| p.normal.dot(v) - p.distance <= 0.01)
+                    && !vertices.iter().any(|p| p.distance_squared(v) < 0.0001)
+                {
+                    vertices.push(v);
+                }
+            }
+        }
+    }
+    ensure!(
+        vertices.len() >= 4,
+        "Inline collision brush has no closed volume"
+    );
+    Ok(vertices)
+}
+/// The brush's distinct edge directions after `rotation`, unit length, up to sign.
+fn hull_edges(source: &[Plane], vertices: &[Vec3], rotation: Quat) -> Vec<Vec3> {
+    let mut edges = Vec::<Vec3>::new();
+    edge_deltas(source, vertices, |delta| push_edge(&mut edges, (rotation * delta).normalize()));
+    edges
+}
+/// `b - a` for each vertex pair that spans a hull edge, in pair order.
+fn edge_deltas(source: &[Plane], vertices: &[Vec3], mut visit: impl FnMut(Vec3)) {
+    for (i, a) in vertices.iter().enumerate() {
+        for b in &vertices[i + 1..] {
+            // Two shared supporting planes identify a hull edge. Do not add
+            // diagonals joining vertices across a face or the brush interior.
+            if source
+                .iter()
+                .filter(|p| {
+                    (p.normal.dot(*a) - p.distance).abs() <= 0.01
+                        && (p.normal.dot(*b) - p.distance).abs() <= 0.01
+                })
+                .count()
+                >= 2
+            {
+                visit(*b - *a);
+            }
+        }
+    }
+}
+fn push_edge(edges: &mut Vec<Vec3>, edge: Vec3) {
+    if !edges
+        .iter()
+        .any(|e| e.distance_squared(edge).min(e.distance_squared(-edge)) < 1e-10)
+    {
+        edges.push(edge);
+    }
+}
+/// The support plane normals `Hull::transformed` offers `add_support`, in order: the world
+/// axes, then each edge crossed with each axis.
+fn support_candidates(edges: &[Vec3], mut offer: impl FnMut(Vec3)) {
+    let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+    for axis in axes {
+        offer(axis);
+        offer(-axis);
+    }
+    for edge in edges {
+        for axis in axes {
+            let bevel = edge.cross(axis);
+            if bevel.length_squared() > 0.000001 {
+                offer(bevel.normalize());
+                offer(-bevel.normalize());
+            }
+        }
+    }
+}
+/// `mover_hull_cache`: what `Hull::transformed` computes from one brush's local planes alone,
+/// kept across poses. The corners and edge vectors never change. The rotated corners, the
+/// rotated source normals and the support normals `add_support` keeps depend on the rotation
+/// only (its duplicate test reads normals, never distances), so they are redone only when the
+/// rotation bits change. `place` then runs the origin arithmetic with the same operations in the
+/// same order, so the hull is bit-identical to `Hull::transformed(source, origin, rotation)`.
+#[derive(Debug)]
+struct HullShape {
+    source: Vec<Plane>,
+    vertices: Vec<Vec3>,
+    deltas: Vec<Vec3>,
+    /// At the last rotation: the rotated vertices, and the plane normals in output order
+    /// (rotated source normals, then the support normals).
+    corners: Vec<Vec3>,
+    normals: Vec<Vec3>,
+    edges: Vec<Vec3>,
+}
+impl HullShape {
+    fn new(source: Vec<Plane>) -> Result<Self> {
+        let vertices = local_vertices(&source)?;
+        let mut deltas = Vec::new();
+        edge_deltas(&source, &vertices, |delta| deltas.push(delta));
+        Ok(Self { source, vertices, deltas, corners: Vec::new(), normals: Vec::new(), edges: Vec::new() })
+    }
+    fn orient(&mut self, rotation: Quat) {
+        self.edges.clear();
+        for delta in &self.deltas {
+            push_edge(&mut self.edges, (rotation * *delta).normalize());
+        }
+        self.corners.clear();
+        self.corners.extend(self.vertices.iter().map(|v| rotation * *v));
+        self.normals.clear();
+        self.normals.extend(self.source.iter().map(|p| rotation * p.normal));
+        let normals = &mut self.normals;
+        support_candidates(&self.edges, |normal| {
+            if !normals.iter().any(|n| n.distance_squared(normal) < 1e-10) {
+                normals.push(normal);
+            }
+        });
+    }
+    /// Writes the hull at `origin` into `out`, reusing its plane storage.
+    fn place(&self, origin: Vec3, points: &mut Vec<Vec3>, out: &mut Hull) {
+        crate::sim_maps::count("brush_hulls_built", 1);
+        points.clear();
+        points.extend(self.corners.iter().map(|v| origin + *v));
+        let (rotated, supports) = self.normals.split_at(self.source.len());
+        out.planes.clear();
+        out.planes.extend(rotated.iter().zip(&self.source).map(|(&normal, p)| Plane {
+            normal,
+            distance: p.distance + normal.dot(origin),
+        }));
+        out.planes.extend(supports.iter().map(|&normal| Plane {
+            normal,
+            distance: points.iter().map(|p| normal.dot(*p)).fold(f32::NEG_INFINITY, f32::max),
+        }));
+        out.bounds = Bounds {
+            min: points.iter().copied().reduce(Vec3::min).unwrap(),
+            max: points.iter().copied().reduce(Vec3::max).unwrap(),
+        };
+    }
+}
+/// One inline model's `HullShape`s for one solids mask, owned by the mover that places it
+/// (`Collider::model_from`). It keeps its last two placements: once nothing else holds the
+/// older one, the next placement is written into it, so a steady mover allocates nothing.
+#[derive(Debug)]
+pub struct ModelShape {
+    model: usize,
+    solids_only: bool,
+    rotation: Option<[u32; 4]>,
+    hulls: Vec<HullShape>,
+    points: Vec<Vec3>,
+    recent: [Option<std::sync::Arc<Vec<Hull>>>; 2],
+}
+impl ModelShape {
+    fn new(map: &Bsp, index: usize, solids_only: bool) -> Result<Self> {
+        let model = map
+            .models
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("Invalid inline model {index}"))?;
+        let mut hulls = Vec::new();
+        for i in model.brushes.clone() {
+            let brush = &map.brushes[i];
+            if solids_only && map.shaders[brush.shader].contents & PLAYER_MASK == 0 {
+                continue;
+            }
+            let planes = map.side_planes[brush.sides.clone()]
+                .iter()
+                .map(|&p| map.planes[p])
+                .collect::<Vec<_>>();
+            hulls.push(HullShape::new(planes)?);
+        }
+        let points = Vec::with_capacity(hulls.iter().map(|h| h.vertices.len()).max().unwrap_or(0));
+        Ok(Self { model: index, solids_only, rotation: None, hulls, points, recent: [None, None] })
+    }
+    /// Whether `Collider::model_from` places this model and mask from these shapes.
+    pub fn fits(&self, index: usize, solids_only: bool) -> bool {
+        self.model == index && self.solids_only == solids_only
+    }
+    fn place(&mut self, origin: Vec3, rotation: Quat) -> std::sync::Arc<Vec<Hull>> {
+        let key = Some(rotation.to_array().map(f32::to_bits));
+        if self.rotation != key {
+            for hull in &mut self.hulls {
+                hull.orient(rotation);
+            }
+            self.rotation = key;
+        }
+        let mut out = self.recent[0]
+            .take()
+            .filter(|a| std::sync::Arc::strong_count(a) == 1 && std::sync::Arc::weak_count(a) == 0)
+            .unwrap_or_else(|| {
+                let empty = Bounds { min: Vec3::ZERO, max: Vec3::ZERO };
+                std::sync::Arc::new(self.hulls.iter().map(|h| Hull {
+                    planes: Vec::with_capacity(h.normals.len()),
+                    bounds: empty,
+                }).collect())
+            });
+        let hulls = std::sync::Arc::get_mut(&mut out).expect("unshared placement");
+        for (shape, hull) in self.hulls.iter().zip(hulls.iter_mut()) {
+            shape.place(origin, &mut self.points, hull);
+        }
+        self.recent = [self.recent[1].take(), Some(out.clone())];
+        out
     }
 }
 fn add_support(planes: &mut Vec<Plane>, points: &[Vec3], normal: Vec3) {
@@ -443,6 +589,35 @@ impl Collider {
         #[cfg(target_os = "vita")]
         crate::frame_profile::counts(&[("collider_brushes_rebuilt", brushes_rebuilt)]);
         Ok(Self::from_hulls(hulls))
+    }
+    /// `Collider::model` bit for bit, placed from `shape` (`mover_hull_cache`). An empty slot is
+    /// filled with this model's shapes for this mask. A slot built for another model or mask,
+    /// or a model that fails to build, takes `Collider::model`, which gives the same error.
+    /// Counts as `Collider::model` does.
+    pub fn model_from(
+        map: &Bsp,
+        index: usize,
+        origin: Vec3,
+        rotation: Quat,
+        solids_only: bool,
+        shape: &mut Option<ModelShape>,
+    ) -> Result<Self> {
+        if shape.is_none() {
+            *shape = ModelShape::new(map, index, solids_only).ok();
+        }
+        let Some(shape) = shape.as_mut().filter(|s| s.fits(index, solids_only)) else {
+            return Self::model(map, index, origin, rotation, solids_only);
+        };
+        crate::sim_maps::count("collider_model_calls", 1);
+        #[cfg(target_os = "vita")]
+        {
+            crate::frame_profile::counts(&[("collider_model_calls", 1)]);
+            crate::frame_profile::record_model(index);
+            crate::frame_profile::counts(&[("collider_brushes_rebuilt", shape.hulls.len() as u64)]);
+        }
+        let hulls = shape.place(origin, rotation);
+        let bounds = hulls.iter().map(|h| h.bounds).reduce(Bounds::union);
+        Ok(Self { hulls, bounds, lazy: None })
     }
     pub fn trace(&self, start: Vec3, end: Vec3, half: Vec3) -> Trace {
         self.trace_query(start, end, half, &SweepBounds::new(start, end, half))
@@ -2217,6 +2392,121 @@ fn triangle_hull(a: Vec3, b: Vec3, c: Vec3) -> Option<Hull> {
 mod dynamic_tests;
 #[cfg(test)]
 mod tests {
+    /// `mover_hull_cache` on the real movers: wchess1 lesson spikes (translation only) and the
+    /// potears1 lily pads and branch (rotating every frame). `model_from` against
+    /// `Collider::model` bit for bit over their motion, host ns per collider build split by phase,
+    /// and allocator calls per build in steady state.
+    #[test]
+    #[ignore = "requires local assets (LOOKING_GLASS_TEST_DATA)"]
+    fn mover_hull_cache_cost_on_wchess1_and_potears1() -> anyhow::Result<()> {
+        use super::*;
+        use std::time::Instant;
+        let mut assets = crate::assets::Assets::open(std::path::Path::new(&std::env::var("LOOKING_GLASS_TEST_DATA")?))?;
+        let wobble = |a: Vec3| Quat::from_rotation_z(a.y.to_radians()) * Quat::from_rotation_y(a.x.to_radians())
+            * Quat::from_rotation_x(a.z.to_radians());
+        type PoseFn = fn(Vec3, u32, &dyn Fn(Vec3) -> Quat) -> (Vec3, Quat);
+        let spike: PoseFn = |start, k, _| (start - Vec3::Z * ((k % 193) as f32 * 0.5), Quat::IDENTITY);
+        let pool: PoseFn = |base, k, rot| {
+            let r = rot(vec3(2., 10., 2.) * (k as f32 * 0.05 * std::f32::consts::TAU / 5.).sin());
+            (base + r * vec3(16., -8., 4.), r)
+        };
+        let cases: [(&str, fn(&str) -> bool, PoseFn, bool); 2] = [
+            ("wchess1", |n| n.starts_with("bsspike") || n.starts_with("knspike"), spike, false),
+            ("potears1", |n| matches!(n, "woblily1obj" | "woblily2obj" | "swingingbranchobj"), pool, true),
+        ];
+        for (name, pick, pose, solids_only) in cases {
+            let map = Bsp::parse(&assets.read(&format!("maps/{name}.bsp"))?)?;
+            let origin_of = |e: &std::collections::BTreeMap<String, String>| e.get("origin").map(|o| {
+                let v: Vec<f32> = o.split_whitespace().map(|x| x.parse().unwrap()).collect();
+                Vec3::new(v[0], v[1], v[2])
+            });
+            let mut movers = Vec::new();
+            for e in &map.entities {
+                let Some(target) = e.get("targetname") else { continue };
+                if !pick(target) || !e.contains_key("model") { continue; }
+                let start = map.entities.iter().find(|s| s.get("targetname") == Some(&format!("{target}_start")))
+                    .and_then(origin_of).or_else(|| origin_of(e)).unwrap_or(Vec3::ZERO);
+                movers.push((e["model"].trim_start_matches('*').parse::<usize>()?, start));
+            }
+            assert!(!movers.is_empty(), "{name}");
+            const STEPS: u32 = 400;
+            let masks: &[bool] = if solids_only { &[true] } else { &[true, false] };
+            let (mut old_ns, mut new_ns, mut vert_ns, mut edge_ns, mut transformed_ns) = (0u128, 0u128, 0u128, 0u128, 0u128);
+            let (mut colliders, mut brushes, mut planes, mut corners, mut compared) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut old_alloc, mut new_alloc) = (0u64, 0u64);
+            for &(model, start) in &movers {
+                for &solids in masks {
+                    colliders += 1;
+                    let mut slot = None;
+                    // Exactness over the motion, with the previous collider held as the world holds it.
+                    let mut held = None;
+                    for k in 0..STEPS {
+                        let (at, r) = pose(start, k, &wobble);
+                        let a = Collider::model(&map, model, at, r, solids)?;
+                        let b = Collider::model_from(&map, model, at, r, solids, &mut slot)?;
+                        assert_eq!(a.geometry_bits(), b.geometry_bits(), "{name} model {model}");
+                        held = Some(b);
+                        compared += 1;
+                    }
+                    let (at, r) = pose(start, STEPS + 7, &wobble);
+                    crate::kernel_alloc::heap_begin();
+                    let _ = Collider::model(&map, model, at, r, solids)?;
+                    old_alloc += crate::kernel_alloc::heap_finish()[4];
+                    crate::kernel_alloc::heap_begin();
+                    held = Some(Collider::model_from(&map, model, at, r, solids, &mut slot)?);
+                    new_alloc += crate::kernel_alloc::heap_finish()[4];
+                    let t = Instant::now();
+                    for k in 0..STEPS {
+                        let (at, r) = pose(start, k, &wobble);
+                        held = Some(std::hint::black_box(Collider::model(&map, model, at, r, solids)?));
+                    }
+                    old_ns += t.elapsed().as_nanos();
+                    let t = Instant::now();
+                    for k in 0..STEPS {
+                        let (at, r) = pose(start, k, &wobble);
+                        held = Some(std::hint::black_box(Collider::model_from(&map, model, at, r, solids, &mut slot)?));
+                    }
+                    new_ns += t.elapsed().as_nanos();
+                    drop(held);
+                    for i in map.models[model].brushes.clone() {
+                        let brush = &map.brushes[i];
+                        if solids && map.shaders[brush.shader].contents & PLAYER_MASK == 0 { continue; }
+                        let source = map.side_planes[brush.sides.clone()].iter().map(|&p| map.planes[p]).collect::<Vec<_>>();
+                        let vertices = local_vertices(&source)?;
+                        brushes += 1;
+                        planes += source.len() as u64;
+                        corners += vertices.len() as u64;
+                        let t = Instant::now();
+                        for _ in 0..STEPS { std::hint::black_box(local_vertices(std::hint::black_box(&source))?); }
+                        vert_ns += t.elapsed().as_nanos();
+                        let t = Instant::now();
+                        for k in 0..STEPS { std::hint::black_box(hull_edges(&source, std::hint::black_box(&vertices), pose(start, k, &wobble).1)); }
+                        edge_ns += t.elapsed().as_nanos();
+                        let t = Instant::now();
+                        for k in 0..STEPS {
+                            let (at, r) = pose(start, k, &wobble);
+                            std::hint::black_box(Hull::transformed(std::hint::black_box(&source), at, r)?);
+                        }
+                        transformed_ns += t.elapsed().as_nanos();
+                    }
+                }
+            }
+            let per = |ns: u128| (ns as f64 / (colliders * u64::from(STEPS)) as f64).round();
+            println!("MOVER_HULL_BENCH {}", serde_json::json!({
+                "map": name, "movers": movers.len(), "colliders": colliders, "steps": STEPS,
+                "colliders_compared_bit_exact": compared,
+                "brushes_per_collider": brushes as f64 / colliders as f64,
+                "planes_per_brush": planes as f64 / brushes as f64, "corners_per_brush": corners as f64 / brushes as f64,
+                "collider_model_ns": per(old_ns), "model_from_ns": per(new_ns),
+                "phase_vertices_ns": per(vert_ns), "phase_edges_ns": per(edge_ns),
+                "phase_transform_rest_ns": per(transformed_ns.saturating_sub(vert_ns + edge_ns)),
+                "phase_outside_hulls_ns": per(old_ns.saturating_sub(transformed_ns)),
+                "allocator_calls_per_collider_model": old_alloc as f64 / colliders as f64,
+                "allocator_calls_per_model_from": new_alloc as f64 / colliders as f64,
+            }));
+        }
+        Ok(())
+    }
     #[test]
     fn acoustic_view_preserves_trace_bits_across_republication() {
         use super::*;

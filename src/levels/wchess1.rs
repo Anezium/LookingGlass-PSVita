@@ -4,6 +4,8 @@ mod cast;
 mod check;
 pub(crate) use check::drive as drive_route;
 mod data;
+#[cfg(test)]
+mod fast_tests;
 mod graph;
 mod motion;
 mod save;

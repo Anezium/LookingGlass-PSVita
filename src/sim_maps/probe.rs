@@ -972,3 +972,14 @@ fn pixel_diff(directory:&std::path::Path,frame:u64,rgba:&[u8],width:u32,height:u
     for name in names { out.save(format!("pixel-review-{name}.png"))?; }
     Ok(())
 }
+/// `LOOKING_GLASS_MOVER_POSE_PROBE`: one stderr line per mover collider rebuild with the exact
+/// pose bits, to count how often a mover's poses recur (v1.2 `mover_hull_cache` study).
+pub fn mover_pose(name: &str, t: glam::Vec3, r: glam::Quat) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if enabled() && *ON.get_or_init(|| std::env::var_os("LOOKING_GLASS_MOVER_POSE_PROBE").is_some()) {
+        let t = t.to_array().map(f32::to_bits);
+        let r = r.to_array().map(f32::to_bits);
+        eprintln!("[lg/mover-pose] name={name} t={:08x},{:08x},{:08x} r={:08x},{:08x},{:08x},{:08x}",
+            t[0], t[1], t[2], r[0], r[1], r[2], r[3]);
+    }
+}

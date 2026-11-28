@@ -102,6 +102,8 @@ pub(super) struct Object {
     pub hazard: bool,
     pub collider: Collider,
     pub volume: Collider,
+    /// `mover_hull_cache` shapes for `collider` and `volume`, built at the first change.
+    pub shapes: [Option<crate::collision::ModelShape>; 2],
 }
 pub(super) fn owns(e: &super::super::Entity) -> bool {
     e.get("classname")
@@ -132,6 +134,7 @@ pub(super) fn load(map: &Bsp) -> Result<Vec<Object>> {
                 hazard: false,
                 collider: Collider::model(map, model, base.translation, base.rotation, true)?,
                 volume: Collider::model(map, model, base.translation, base.rotation, false)?,
+                shapes: [None, None],
             })
         })
         .collect()
@@ -386,10 +389,19 @@ impl Realm {
                         crate::sim_maps::count("mover_build_unchanged", 2);
                     }
                 }
-                o.collider =
-                    Collider::model(map, o.model, o.pose.translation, o.pose.rotation, true)?;
-                o.volume =
-                    Collider::model(map, o.model, o.pose.translation, o.pose.rotation, false)?;
+                #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+                crate::sim_maps::probe::mover_pose(&o.name, o.pose.translation, o.pose.rotation);
+                if crate::sim_maps::mover_hull_cache() {
+                    let [solid, volume] = &mut o.shapes;
+                    let (at, rotation) = (o.pose.translation, o.pose.rotation);
+                    o.collider = Collider::model_from(map, o.model, at, rotation, true, solid)?;
+                    o.volume = Collider::model_from(map, o.model, at, rotation, false, volume)?;
+                } else {
+                    o.collider =
+                        Collider::model(map, o.model, o.pose.translation, o.pose.rotation, true)?;
+                    o.volume =
+                        Collider::model(map, o.model, o.pose.translation, o.pose.rotation, false)?;
+                }
             } else {
                 crate::sim_maps::count("mover_pose_rows_unchanged", 1);
             }

@@ -233,16 +233,39 @@ pub fn mover_shape_reuse() -> bool {
     #[cfg(all(not(test), not(feature="vita_renderer")))]
     { false }
 }
+#[cfg(test)]
+// Scoped test override for the `mover_hull_cache` lever documented below.
+thread_local! { static MOVER_HULL_CACHE_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn with_mover_hull_cache<T>(on: bool, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset { fn drop(&mut self) { MOVER_HULL_CACHE_TEST.with(|s| s.set(self.0)); } }
+    let _reset = Reset(MOVER_HULL_CACHE_TEST.with(|s| s.replace(Some(on))));
+    run()
+}
+/// `mover_hull_cache`: the Pale Realm and Pool of Tears movers place changed colliders from
+/// cached per-brush shapes (`Collider::model_from`). Default off. Tests: a scoped override, else off;
+/// LOOKING_GLASS_TEST_MOVER_HULL_CACHE=on runs the whole suite with the lever on.
+pub fn mover_hull_cache() -> bool {
+    #[cfg(test)]
+    { MOVER_HULL_CACHE_TEST.with(|s| s.get()).unwrap_or_else(|| test_lever_env("LOOKING_GLASS_TEST_MOVER_HULL_CACHE")) }
+    #[cfg(all(not(test), feature="vita_renderer"))]
+    { crate::render::vita_renderer::config().mover_hull_cache }
+    #[cfg(all(not(test), not(feature="vita_renderer")))]
+    { false }
+}
 /// Off unless the variable says on. Read once per lever: allocation tests run with a lever on,
 /// and reading the environment allocates.
 #[cfg(test)]
 fn test_lever_env(name: &'static str) -> bool {
     static SEEN: std::sync::Mutex<Vec<(&'static str, bool)>> = std::sync::Mutex::new(Vec::new());
-    thread_local! { static LOCAL: std::cell::Cell<[Option<bool>; 3]> = const { std::cell::Cell::new([None; 3]) }; }
+    thread_local! { static LOCAL: std::cell::Cell<[Option<bool>; 4]> = const { std::cell::Cell::new([None; 4]) }; }
     let slot = if name.ends_with("FX_ATTACHED_PERSIST") {
         0
     } else if name.ends_with("MOVER_ADVANCE_REUSE") {
         1
+    } else if name.ends_with("MOVER_HULL_CACHE") {
+        3
     } else {
         2
     };
