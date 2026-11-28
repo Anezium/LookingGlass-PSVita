@@ -3,14 +3,14 @@ use super::*;
 use macroquad::camera::Camera;
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
+mod gamma;
+
 struct Target {
     rt: RenderTarget,
     depth: Option<TextureId>,
     width: u32,
     height: u32,
     upscale: Material,
-    gamma_upscale: Option<Material>,
-    invert: bool,
 }
 // Macroquad's context is process-lived. Miniquad's host GL library/context is
 // already gone when main-thread TLS destructors run, so the final target must
@@ -122,7 +122,7 @@ pub(super) fn prewarm() {
             #[cfg(target_os = "vita")]
             let depth: Option<TextureId> = None;
             // The Vita copy inverts V; `direct_flip` inverts that choice.
-            let invert = cfg!(target_os = "vita") != (config().scaled_target == "direct_flip");
+            let invert = invert_copy_v();
             let upscale = crate::frame_profile::load_material(
                 ShaderSource::Glsl {
                     vertex: UPSCALE_VERTEX,
@@ -144,8 +144,6 @@ pub(super) fn prewarm() {
                 width: w,
                 height: h,
                 upscale,
-                gamma_upscale: None,
-                invert,
             });
             println!(
                 "[lg/vita-renderer] 3d target {w}x{h} RGBA8/depth32 samples={} scale={} copy_v_inverted={invert} scaled_target={} resolve_blit={}",
@@ -215,21 +213,14 @@ pub(super) fn present(gamma: f32) {
     crate::render_tail::begin();
     let _timer = crate::light_profile::render_timer(crate::light_profile::RenderPhase::Present);
     TARGET.with(|t| {
-        let mut t = t.borrow_mut();
-        if let Some(target) = t.as_mut() {
+        let t = t.borrow();
+        if let Some(target) = t.as_ref() {
             let texture = &target.rt.texture;
             // The bridge has finished all 3D packets; queue a single upscale before HUD.
             set_default_camera();
-            // Keep the original shader for the neutral setting, including when the row is enabled.
-            let material = if gamma != 1. && gamma_available() {
-                let material = target.gamma_upscale.get_or_insert_with(gamma_material);
-                material.set_uniform("Gamma", gamma);
-                material.set_uniform("FlipV", if target.invert { 1_f32 } else { 0_f32 });
-                material
-            } else {
-                &target.upscale
-            };
-            gl_use_material(material);
+            gamma::with_material(gamma, |material| {
+                gl_use_material(material.unwrap_or(&target.upscale));
+            });
             draw_texture_ex(
                 texture,
                 0.,
@@ -246,26 +237,14 @@ pub(super) fn present(gamma: f32) {
         }
     });
 }
-fn gamma_material() -> Material {
-    crate::frame_profile::load_material(
-        ShaderSource::Glsl {
-            vertex: UPSCALE_VERTEX,
-            fragment: GAMMA_FRAGMENT,
-        },
-        MaterialParams {
-            pipeline_params: PipelineParams {
-                color_blend: None,
-                alpha_blend: None,
-                ..Default::default()
-            },
-            uniforms: vec![
-                UniformDesc::new("Gamma", UniformType::Float1),
-                UniformDesc::new("FlipV", UniformType::Float1),
-            ],
-            ..Default::default()
-        },
-    )
-    .expect("gamma upscale shader")
+fn invert_copy_v() -> bool {
+    cfg!(target_os = "vita") != (config().scaled_target == "direct_flip")
+}
+
+pub(super) fn prepare_gamma(value: f32) {
+    if value != 1. && gamma_available() {
+        gamma::prepare(invert_copy_v());
+    }
 }
 
 fn log_framebuffer() {
@@ -277,10 +256,18 @@ fn log_framebuffer() {
     });
 }
 
-const UPSCALE_VERTEX: &str = r#"#version 100
+macro_rules! upscale_vertex {
+    ($suffix:literal) => {
+        concat!(r#"#version 100
 attribute vec3 position; attribute vec2 texcoord; attribute vec4 color0; attribute vec4 normal;
 varying mediump vec2 uv; uniform mat4 Model; uniform mat4 Projection;
-void main(){gl_Position=Projection*Model*vec4(position,1.);uv=texcoord;}"#;
+void main(){gl_Position=Projection*Model*vec4(position,1.);uv=texcoord;}"#, $suffix)
+    };
+}
+#[cfg(target_os = "vita")]
+use upscale_vertex;
+
+const UPSCALE_VERTEX: &str = upscale_vertex!("");
 const UPSCALE_FRAGMENT: &str = r#"#version 100
 varying mediump vec2 uv; uniform sampler2D Texture;
 void main(){gl_FragColor=vec4(texture2D(Texture,uv).rgb,1.);}"#;
@@ -291,17 +278,6 @@ void main(){gl_FragColor=vec4(texture2D(Texture,uv).rgb,1.);}"#;
 const UPSCALE_FRAGMENT_INVERT_V: &str = r#"#version 100
 varying mediump vec2 uv; uniform sampler2D Texture;
 void main(){gl_FragColor=vec4(texture2D(Texture,vec2(uv.x,1.-uv.y)).rgb,1.);}"#;
-
-const GAMMA_FRAGMENT: &str = r#"#version 100
-precision mediump float;
-varying mediump vec2 uv;
-uniform sampler2D Texture;
-uniform mediump float Gamma;
-uniform mediump float FlipV;
-void main() {
-    vec3 rgb = texture2D(Texture, vec2(uv.x, mix(uv.y, 1. - uv.y, FlipV))).rgb;
-    gl_FragColor = vec4(pow(rgb, vec3(1. / Gamma)), 1.);
-}"#;
 
 pub(super) fn log_depth(opaque: bool) {
     static OPAQUE: OnceLock<()> = OnceLock::new();

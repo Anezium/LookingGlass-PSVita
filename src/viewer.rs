@@ -1365,6 +1365,8 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     #[cfg(not(all(feature = "sim_maps_probe", not(target_os = "vita"))))]
     let keep_window = false;
     if !keep_window { preferences.display(); }
+    #[cfg(feature = "vita_renderer")]
+    crate::render::vita_renderer::prepare_gamma(preferences.gamma);
     escape_menu.backdrop();
     ui.toast("Opening Wonderland...", screen_height() - 70.);
     next_frame().await;

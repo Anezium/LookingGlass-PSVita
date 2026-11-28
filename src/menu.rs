@@ -1564,6 +1564,8 @@ impl Menu {
                                         if display_changed {
                                             prefs.display();
                                         }
+                                        #[cfg(feature = "vita_renderer")]
+                                        crate::render::vita_renderer::prepare_gamma(prefs.gamma);
                                         self.open(Page::Settings, prefs, audio.settings);
                                         self.message = "Settings saved".into();
                                     }

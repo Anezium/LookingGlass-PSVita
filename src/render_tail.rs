@@ -8,6 +8,7 @@ struct State {
     owner: Option<RenderPhase>,
     program: u32,
     present: u32,
+    present_gamma: u32,
     pending: RenderMetrics,
     start: Option<Instant>,
 }
@@ -19,7 +20,11 @@ impl State {
         m.draws=1; m.pipelines=1; m.bindings=1;
         m.uniform_uploads=u64::from(m.uniform_gl_calls>0);
         m.cpu_ns=elapsed; m.deferred_cpu_ns=if outside_cpu {elapsed} else {0};
-        Some((if self.present!=0 && self.program==self.present {RenderPhase::Present} else {RenderPhase::Hud},m))
+        Some((if self.program != 0 && (self.program == self.present || self.program == self.present_gamma) {
+            RenderPhase::Present
+        } else {
+            RenderPhase::Hud
+        }, m))
     }
 }
 thread_local! { static SUBMIT: RefCell<crate::render::submit_gl::Cache> = RefCell::default(); }
@@ -50,11 +55,25 @@ pub(crate) fn end() {
 }
 pub(crate) fn register(program:u32, name:&str) {
     SUBMIT.with(|s|s.borrow_mut().invalidate(program));
-    if name.ends_with("render/vita_renderer/scale.rs") { STATE.with(|s| s.borrow_mut().present=program); }
+    STATE.with(|s| {
+        if name.ends_with("render/vita_renderer/scale.rs") {
+            s.borrow_mut().present = program;
+        } else if name.ends_with("render/vita_renderer/scale/gamma.rs") {
+            s.borrow_mut().present_gamma = program;
+        }
+    });
 }
 pub(crate) fn unregister(program:u32) {
     SUBMIT.with(|s|s.borrow_mut().invalidate(program));
-    STATE.with(|s| { let mut s=s.borrow_mut(); if s.present==program {s.present=0;} });
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.present == program {
+            s.present = 0;
+        }
+        if s.present_gamma == program {
+            s.present_gamma = 0;
+        }
+    });
 }
 fn event(update: impl FnOnce(&mut RenderMetrics)) {
     if !crate::light_profile::render_active() { return; }
@@ -320,6 +339,34 @@ pub(crate) fn configure() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn both_upscale_programs_are_present_across_target_replacement() {
+        const NEUTRAL: &str = "src/render/vita_renderer/scale.rs";
+        const GAMMA: &str = "src/render/vita_renderer/scale/gamma.rs";
+        register(7, NEUTRAL);
+        register(8, GAMMA);
+        begin();
+        for id in [7, 8, 7] {
+            program(id);
+            STATE.with(|s| {
+                let (phase, _) = s.borrow_mut().complete(Instant::now(), false).unwrap();
+                assert!(matches!(phase, RenderPhase::Present));
+            });
+        }
+        register(9, NEUTRAL);
+        unregister(7);
+        for (id, is_present) in [(7, false), (8, true), (9, true)] {
+            program(id);
+            STATE.with(|s| {
+                let (phase, _) = s.borrow_mut().complete(Instant::now(), false).unwrap();
+                assert_eq!(matches!(phase, RenderPhase::Present), is_present);
+            });
+        }
+        end();
+        unregister(8);
+        unregister(9);
+    }
+
     #[test]
     fn deferred_packets_drain_at_draw_and_separate_upscale_hud_and_running_cpu() {
         let start=Instant::now();

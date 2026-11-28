@@ -27,6 +27,7 @@ mod api {
         pub fn sceGxmProgramGetParameterCount(program:*const c_void)->u32;
         pub fn sceGxmProgramGetType(program:*const c_void)->u32;
         pub static glsl_sema_mode:u32;
+        pub fn vglSetSemanticBindingMode(mode:u32);
         #[link_name="__real_vglGetProcAddress"]
         pub fn get_proc(name:*const c_char)->*mut c_void;
     }
@@ -48,6 +49,47 @@ struct State {
 thread_local! { static STATE: RefCell<State> = RefCell::default(); }
 #[cfg(test)]
 thread_local! { static TEST_ROOT: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) }; }
+#[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+pub(crate) struct EagerGlsl {
+    previous_mode: u32,
+    previous_pending: Vec<u32>,
+}
+
+// VGL_MODE_GLOBAL translates and compiles each stage in glCompileShader.
+// POSTPONED can enter the uniform-link code with a missing compiled stage.
+#[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+const GLOBAL_SEMANTICS: u32 = 1;
+
+#[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+impl EagerGlsl {
+    pub(crate) fn new() -> Self {
+        let previous_pending = STATE.with(|s| std::mem::take(&mut s.borrow_mut().pending));
+        let previous_mode = unsafe {
+            let mode = api::glsl_sema_mode;
+            api::vglSetSemanticBindingMode(GLOBAL_SEMANTICS);
+            mode
+        };
+        Self { previous_mode, previous_pending }
+    }
+}
+
+#[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+impl Drop for EagerGlsl {
+    fn drop(&mut self) {
+        let pending = STATE.with(|s| {
+            std::mem::replace(&mut s.borrow_mut().pending, std::mem::take(&mut self.previous_pending))
+        });
+        // Miniquad returns early on a stage refusal without deleting that
+        // shader or the earlier stage. No program owns these handles yet.
+        unsafe {
+            for shader in pending {
+                delete_shader(shader);
+            }
+            api::vglSetSemanticBindingMode(self.previous_mode);
+        }
+    }
+}
+
 fn identity()-> &'static str {
     #[cfg(target_os="vita")] { env!("LG_VITAGL_ID") }
     #[cfg(test)] { "mock-vitaGL" }
@@ -159,7 +201,18 @@ unsafe extern "C" fn attach(program:u32,shader:u32) {
 }
 unsafe extern "C" fn link(program:u32) {
     let p=STATE.with(|s|s.borrow_mut().programs.remove(&program));
-    let Some(p)=p else {api::glLinkProgram(program);return;};
+    let Some(p) = p else {
+        api::glLinkProgram(program);
+        #[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+        if api::glsl_sema_mode == GLOBAL_SEMANTICS {
+            let mut status = 0;
+            api::glGetProgramiv(program, LINK_STATUS, &mut status);
+            if status != 0 {
+                crate::render_tail::register(program, name());
+            }
+        }
+        return;
+    };
     let start=Instant::now();
     if p.hit=="compile" {api::glLinkProgram(program);}
     let ms=start.elapsed().as_secs_f64()*1000.;

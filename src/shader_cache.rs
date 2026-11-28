@@ -6,6 +6,8 @@ use std::{cell::RefCell, fs, io::{Read, Write}, path::Path};
 #[cfg(any(target_os = "vita", test))]
 #[path="shader_cache/native.rs"]
 mod native;
+#[cfg(all(target_os = "vita", feature = "vita_renderer"))]
+pub(crate) use native::EagerGlsl;
 
 pub(crate) const MAX_BINARY: usize = 4 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"LGCACHE1";

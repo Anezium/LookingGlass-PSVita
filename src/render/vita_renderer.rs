@@ -1275,6 +1275,8 @@ pub(crate) fn set_3d_camera(camera:&Camera3D){scale::camera(camera);}
 pub(crate) fn present_3d() { scale::present(1.); }
 pub(crate) fn present_3d_with_gamma(gamma: f32) { scale::present(gamma); }
 
+pub(crate) fn prepare_gamma(gamma: f32) { scale::prepare_gamma(gamma); }
+
 pub(crate) fn gamma_available() -> bool {
     config().gamma_option && config().render_scale < 1.
 }
