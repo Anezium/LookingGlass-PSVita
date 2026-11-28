@@ -252,7 +252,15 @@ fn settings_path() -> PathBuf {
 // Decoded mono effects only. Music and dialogue keep their compressed sources
 // and decode incrementally through rodio; never predecode those into this cache.
 const CACHE_SAMPLES: usize = 24 * 1024 * 1024 / std::mem::size_of::<f32>();
-fn audio_memory(event: &str, cache_samples: usize, player: Option<PlayerPcm>) {
+fn audio_memory(event: &str, cache_samples: usize, player: Option<PlayerPcm>, in_play: bool) {
+    // Audio installation can finish after the transition's resource phase has closed.
+    let log = |args| {
+        if in_play {
+            crate::spike_log::play_line(crate::spike_log::Stream::Err, args);
+        } else {
+            eprintln!("{args}");
+        }
+    };
     let time_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis();
     // Key off: `player` is None and the line keeps its earlier bytes.
@@ -267,11 +275,11 @@ fn audio_memory(event: &str, cache_samples: usize, player: Option<PlayerPcm>) {
             fordblks: usize, keepcost: usize }
         extern "C" { fn mallinfo() -> MallInfo; }
         let heap = unsafe { mallinfo() };
-        crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used={} heap_free_arena={} heap_arena={}{player}",
+        log(format_args!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used={} heap_free_arena={} heap_arena={}{player}",
             cache_samples * 4, CACHE_SAMPLES * 4, heap.uordblks, heap.fordblks, heap.arena));
     }
     #[cfg(not(target_os = "vita"))]
-    crate::spike_log::play_line(crate::spike_log::Stream::Err, format_args!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used=unavailable heap_free_arena=unavailable{player}",
+    log(format_args!("[lg/audio-memory] time_ms={time_ms} event={event} cache_samples={cache_samples} cache_bytes={} cap_bytes={} heap_used=unavailable heap_free_arena=unavailable{player}",
         cache_samples * 4, CACHE_SAMPLES * 4));
 }
 #[cfg(test)]
@@ -915,7 +923,7 @@ impl NamedPrefetch {
                 proof::decode("named", path, &clip.samples);
                 cache.insert(path.to_owned(), Some(clip));
                 audio_memory(&format!("named:{path}"), *cache_samples,
-                    player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))));
+                    player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))), false);
             }
         }
         let allowance: usize = self.cues.iter().map(|cues| cues.limit).sum();
@@ -998,7 +1006,7 @@ fn prefetch_level_clips(
         let _ = from_player;
         cache.insert(path.to_owned(), Some(clip));
         audio_memory(&format!("prefetch:{path}"), *cache_samples,
-            player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))));
+            player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))), false);
     };
     for path in &candidates {
         admit(path);
@@ -1341,7 +1349,7 @@ fn looping_clip(
         *cache_samples += clip.samples.len();
         world_clips.insert(path.to_owned(), clip.clone());
         audio_memory(&format!("loop:{path}"), *cache_samples,
-            player_cache.pcm(|p| world_clips.contains_key(p)));
+            player_cache.pcm(|p| world_clips.contains_key(p)), true);
     }
     #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
     proof::decode("loop", path, &clip.samples);
@@ -1851,14 +1859,14 @@ impl Audio {
         self.release_level();
         let started = std::time::Instant::now();
         if self.playback.is_none() {
-            audio_memory(&format!("level:{name}:disabled"), self.cache_samples, self.player_pcm());
+            audio_memory(&format!("level:{name}:disabled"), self.cache_samples, self.player_pcm(), false);
             return;
         }
         if let Err(e) = self.load_inner(assets, name, map, knife_available) {
             eprintln!("Audio level error in {name}: {e:#}");
             self.status = "Some level audio could not be loaded".into();
         }
-        audio_memory(&format!("level:{name}"), self.cache_samples, self.player_pcm());
+        audio_memory(&format!("level:{name}"), self.cache_samples, self.player_pcm(), false);
         eprintln!("[lg/audio-load] level={name} elapsed_ms={:.3}", started.elapsed().as_secs_f64() * 1000.);
     }
     /// The same level boundary as load(), before destination scene construction.
@@ -1939,7 +1947,7 @@ impl Audio {
                 );
                 cache_samples += clip.samples.len();
                 audio_memory(&format!("preload:{path}"), cache_samples,
-                    self.player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))));
+                    self.player_cache.pcm(|p| matches!(cache.get(p), Some(Some(_)))), false);
                 Ok(clip)
             });
             match result {
@@ -2281,7 +2289,7 @@ impl Audio {
                         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
                         proof::decode("runtime", &request.path, &clip.samples);
                         self.world_clips.insert(request.path.clone(), clip);
-                        audio_memory(&format!("runtime:{}", request.path), self.cache_samples, self.player_pcm());
+                        audio_memory(&format!("runtime:{}", request.path), self.cache_samples, self.player_pcm(), true);
                     }
                     Err(error) => {
                         eprintln!("Requested audio unavailable: {}: {error:#}", request.path);

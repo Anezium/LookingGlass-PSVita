@@ -651,8 +651,8 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/spike_log.rs:94` | `OUT` | diagnostic | Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. See line 240. |
 | `src/spike_log.rs:94` | `thread_local!` | diagnostic | TLS block. Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. |
 | `src/spike_log.rs:139` | `thread_local!` | diagnostic | TLS block. `play_log_buffer` deferred diagnostic lines. Written and flushed on the thread that formats them; no cross-thread access. |
-| `src/spike_log.rs:140` | `PLAY` | diagnostic | `play_log_buffer` lines formatted on the game thread during an open frame, written at that thread's spike flush points. |
-| `src/spike_log.rs:142` | `PLAY_OPEN` | diagnostic | Game-thread flag set by `begin_frame` and cleared by `end_play` with `play_log_buffer` on; other threads read their own false copy and print at once. |
+| `src/spike_log.rs:156` | `PLAY` | diagnostic | `play_log_buffer` lines formatted on the game thread during an open frame, written at that thread's spike flush points, on buffer pressure, or by the panic hook. |
+| `src/spike_log.rs:158` | `PLAY_OPEN` | diagnostic | Game-thread flag set by `begin_frame` and cleared by `end_play` with `play_log_buffer` on; other threads read their own false copy and print at once. |
 | `src/startup.rs:6` | `STATE` | state | Death retry or chapter transition enters loading and recovery. Fence all control mutations and yields on owner. See line 24. |
 | `src/startup.rs:6` | `thread_local!` | state | TLS block. Death retry or chapter transition enters loading and recovery. Fence all control mutations and yields on owner. |
 | `src/story/registry.rs:59` | `LEGACY` | state | Campaign progression, story dispatch or save/restore reads authored visit data. Share immutable tables. See line 345. |

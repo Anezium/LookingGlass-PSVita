@@ -245,6 +245,7 @@ fn app_main() {
     #[cfg(feature = "vita_renderer")]
     {
         let c = render::vita_renderer::config();
+        if c.play_log_buffer { spike_log::install_play_panic_hook(); }
         tls_count::start_fast(tls_count::FastMode::parse(&c.tls_fast).unwrap_or(tls_count::FastMode::Off));
         #[cfg(target_os="vita")]
         light_profile::set_mode(frame_profile::Mode::read());

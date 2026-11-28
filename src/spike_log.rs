@@ -31,7 +31,8 @@
 //! line of a clip admitted during play. While a gameplay frame is open on the game thread and no
 //! load phase is, `play_line` keeps them in their own buffer and writes them at the same flush
 //! points, each to its own stream, in the order they came, then one `[lg/play-log] flushed` line.
-//! A line that would not fit first writes the buffer at once, so no line is dropped or reordered.
+//! A line that would not fit writes the oldest whole lines until it fits. A Rust panic on the
+//! game thread also drains the play log before the normal panic message.
 use std::{cell::{Cell, RefCell}, fmt::Write as _, time::Instant};
 
 pub(crate) const KINDS: [&str; 7] = ["texture_read", "texture_decode", "texture_upload", "shader", "asset_read",
@@ -128,43 +129,101 @@ impl Out {
 /// The stream a deferred diagnostic line belongs to.
 #[derive(Clone, Copy)]
 pub(crate) enum Stream { Out, Err }
-/// Lines deferred by `play_log_buffer`, each led by its stream tag and ended by a newline.
+impl Stream {
+    fn write(self, line: &[u8]) {
+        use std::io::{self, Write};
+        // Best effort: this path also runs inside the panic hook.
+        let _ = match self {
+            Self::Out => io::stdout().write_all(line),
+            Self::Err => io::stderr().write_all(line),
+        };
+    }
+}
+
+/// Each deferred record has a two-byte body length, a stream tag, and the formatted bytes.
 #[derive(Default)]
-struct Play { text: String, lines: u32, bytes: usize, early: u32 }
+struct Play {
+    text: Vec<u8>,
+    early_writes: usize,
+    early_lines: usize,
+    early_bytes: usize,
+}
 /// Reserved on the first deferred line. The first frame after a load defers about 2.7 KB, a clip
 /// admitted in play about 265 B.
 const PLAY_CAP: usize = 64 << 10;
-const TAG_OUT: char = '\u{1}';
-const TAG_ERR: char = '\u{2}';
+const PLAY_HEADER: usize = 3;
 thread_local! {
     static PLAY: RefCell<Play> = RefCell::default();
     /// Between `begin_frame` and `end_play` on the game thread, with `play_log_buffer` on.
     static PLAY_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 impl Play {
-    fn push(&mut self, stream: Stream, args: std::fmt::Arguments<'_>) {
-        if self.text.capacity() == 0 { self.text.reserve_exact(PLAY_CAP); }
-        if self.text.len() + LINE_MAX > PLAY_CAP {
-            self.write();
-            self.early += 1;
+    fn push(&mut self, stream: Stream, args: std::fmt::Arguments<'_>, mut emit: impl FnMut(Stream, &[u8])) {
+        use std::io::{Cursor, Write};
+
+        // Format ahead of the admission decision so we only drain as much as the new line needs.
+        let mut scratch = [0; LINE_MAX];
+        let mut line = Cursor::new(scratch.as_mut_slice());
+        if writeln!(line, "{args}").is_ok() {
+            let len = line.position() as usize;
+            self.push_line(stream, &scratch[..len], &mut emit);
+        } else {
+            // An oversized line is rare. Write the backlog first, then the complete new line.
+            self.write_early(self.text.len(), &mut emit);
+            let oversized = format!("{args}\n");
+            emit(stream, oversized.as_bytes());
+            self.early_lines += 1;
+            self.early_bytes += oversized.len();
         }
-        let mark = self.text.len();
-        self.text.push(match stream { Stream::Out => TAG_OUT, Stream::Err => TAG_ERR });
-        let _ = writeln!(self.text, "{args}");
-        self.lines += 1;
-        self.bytes += self.text.len() - mark - 1;
     }
-    /// Writes the buffered lines in order, each to its stream, and keeps the reservation.
-    fn write(&mut self) {
-        for line in self.text.lines() {
-            match line.strip_prefix(TAG_OUT) {
-                Some(body) => println!("{body}"),
-                None => eprintln!("{}", line.strip_prefix(TAG_ERR).unwrap_or(line)),
-            }
+
+    fn push_line(&mut self, stream: Stream, line: &[u8], emit: &mut impl FnMut(Stream, &[u8])) {
+        if self.text.capacity() == 0 { self.text.reserve_exact(PLAY_CAP); }
+        let needed = (self.text.len() + PLAY_HEADER + line.len()).saturating_sub(PLAY_CAP);
+        if needed > 0 { self.write_early(needed, emit); }
+        self.text.extend_from_slice(&(line.len() as u16).to_le_bytes());
+        self.text.push(match stream { Stream::Out => 0, Stream::Err => 1 });
+        self.text.extend_from_slice(line);
+    }
+
+    fn write_early(&mut self, needed: usize, emit: &mut impl FnMut(Stream, &[u8])) {
+        let (lines, bytes) = self.write_prefix(needed, emit);
+        self.early_writes += 1;
+        self.early_lines += lines;
+        self.early_bytes += bytes;
+    }
+
+    /// Writes the smallest prefix of whole records covering `needed` bytes of buffer space.
+    fn write_prefix(&mut self, needed: usize, emit: &mut impl FnMut(Stream, &[u8])) -> (usize, usize) {
+        let mut end = 0;
+        let mut lines = 0;
+        while end < needed {
+            let start = end;
+            let len = u16::from_le_bytes([self.text[start], self.text[start + 1]]) as usize;
+            let stream = if self.text[start + 2] == 0 { Stream::Out } else { Stream::Err };
+            end = start + PLAY_HEADER + len;
+            emit(stream, &self.text[start + PLAY_HEADER..end]);
+            lines += 1;
         }
-        self.text.clear();
+        self.text.drain(..end);
+        (lines, end - lines * PLAY_HEADER)
     }
 }
+
+#[cfg(feature = "vita_renderer")]
+pub(crate) fn install_play_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = PLAY.try_with(|play| {
+            if let Ok(mut play) = play.try_borrow_mut() {
+                let len = play.text.len();
+                play.write_prefix(len, &mut Stream::write);
+            }
+        });
+        previous(info);
+    }));
+}
+
 #[inline]
 fn play_buffer() -> bool {
     #[cfg(feature = "vita_renderer")]
@@ -176,7 +235,7 @@ fn play_buffer() -> bool {
 /// is open on this thread outside a load phase, at the next flush point.
 pub(crate) fn play_line(stream: Stream, args: std::fmt::Arguments<'_>) {
     if play_buffer() && PLAY_OPEN.with(Cell::get) && !crate::startup::in_phase() {
-        PLAY.with(|p| p.borrow_mut().push(stream, args));
+        PLAY.with(|p| p.borrow_mut().push(stream, args, Stream::write));
         return;
     }
     match stream {
@@ -188,12 +247,13 @@ fn flush_play(at: &str) {
     if !play_buffer() { return; }
     PLAY.with(|p| {
         let mut p = p.borrow_mut();
-        if p.lines == 0 { return; }
+        let len = p.text.len();
+        if len == 0 && p.early_writes == 0 { return; }
         let start = Instant::now();
-        p.write();
-        eprintln!("[lg/play-log] flushed at={at} lines={} early_writes={} bytes={} ms={:.1}", p.lines, p.early,
-            p.bytes, start.elapsed().as_secs_f64() * 1000.);
-        (p.lines, p.bytes, p.early) = (0, 0, 0);
+        let (lines, bytes) = p.write_prefix(len, &mut Stream::write);
+        eprintln!("[lg/play-log] flushed at={at} lines={lines} early_writes={} bytes={bytes} ms={:.1} early_lines={} early_bytes={}",
+            p.early_writes, start.elapsed().as_secs_f64() * 1000., p.early_lines, p.early_bytes);
+        (p.early_writes, p.early_lines, p.early_bytes) = (0, 0, 0);
     });
 }
 
@@ -607,20 +667,75 @@ mod tests {
         begin_frame();
         assert!(!PLAY_OPEN.with(Cell::get));
         play_line(Stream::Err, format_args!("[lg/audio-memory] event=runtime:x"));
-        PLAY.with(|p| assert!(p.borrow().text.capacity() == 0 && p.borrow().lines == 0));
+        PLAY.with(|p| assert_eq!(p.borrow().text.capacity(), 0));
     }
+
     #[test]
-    fn play_buffer_keeps_streams_and_order_and_never_grows() {
+    fn play_buffer_keeps_streams_and_order_with_bounded_early_writes() {
+        use std::collections::VecDeque;
+
         let mut play = Play::default();
-        play.push(Stream::Out, format_args!("[lg/vita-renderer] framebuffer {}", 1));
-        play.push(Stream::Err, format_args!("[lg/load-diagnostic] stage={}", "world-begin"));
-        assert_eq!(play.text, "\u{1}[lg/vita-renderer] framebuffer 1\n\u{2}[lg/load-diagnostic] stage=world-begin\n");
-        assert_eq!((play.lines, play.bytes, play.early), (2, 72, 0));
+        let mut pending = VecDeque::new();
+        let mut largest_write = 0;
+        // Fill exactly: the first record is one byte smaller than the next required space.
+        // This makes the first overflow write two records, one almost full and one full.
+        let tail = PLAY_CAP - 15 * (PLAY_HEADER + LINE_MAX) + 1 - PLAY_HEADER;
+        for i in 0..10_000 {
+            let len = match i {
+                0 => LINE_MAX - 1,
+                1..=14 | 16 => LINE_MAX,
+                15 => tail,
+                _ => 7 + (i * 647) % (LINE_MAX - 6),
+            };
+            let stream = if i % 2 == 0 { Stream::Out } else { Stream::Err };
+            let prefix = format!("{i:05}:");
+            let body = format!("{prefix}{}", "x".repeat(len - prefix.len() - 1));
+            pending.push_back((stream as u8, format!("{body}\n")));
+            let mut written = 0;
+            let mut last_record = 0;
+            let mut emitted = 0;
+            let needed = (play.text.len() + PLAY_HEADER + len).saturating_sub(PLAY_CAP);
+            play.push(stream, format_args!("{body}"), |stream, line| {
+                let (expected_stream, expected_line) = pending.pop_front().unwrap();
+                assert_eq!(stream as u8, expected_stream);
+                assert_eq!(line, expected_line.as_bytes());
+                emitted += line.len();
+                written += line.len() + PLAY_HEADER;
+                last_record = line.len() + PLAY_HEADER;
+            });
+            if needed == 0 {
+                assert_eq!(written, 0);
+            } else {
+                assert!(written >= needed && written - last_record < needed);
+            }
+            if i == 15 { assert_eq!(play.text.len(), PLAY_CAP); }
+            assert_eq!(play.text.capacity(), PLAY_CAP);
+            largest_write = largest_write.max(emitted);
+        }
+        assert_eq!(largest_write, 2 * LINE_MAX - 1);
+        let remaining = play.text.len();
+        play.write_prefix(remaining, &mut |stream, line| {
+            let (expected_stream, expected_line) = pending.pop_front().unwrap();
+            assert_eq!(stream as u8, expected_stream);
+            assert_eq!(line, expected_line.as_bytes());
+        });
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn oversized_play_line_writes_after_the_backlog_without_growing_it() {
+        let mut play = Play::default();
+        play.push(Stream::Out, format_args!("first"), |_, _| panic!("expected no writes"));
+        let oversized = "é\n".repeat(LINE_MAX);
+        let mut output = Vec::new();
+        play.push(Stream::Err, format_args!("{oversized}"), |stream, line| {
+            output.push((stream as u8, line.to_vec()));
+        });
+        assert_eq!(output, [(Stream::Out as u8, b"first\n".to_vec()),
+                           (Stream::Err as u8, format!("{oversized}\n").into_bytes())]);
+        assert_eq!((play.early_writes, play.early_lines, play.early_bytes), (1, 2, 6 + oversized.len() + 1));
+        assert!(play.text.is_empty());
         assert_eq!(play.text.capacity(), PLAY_CAP);
-        let long = "x".repeat(1000);
-        while play.early == 0 { play.push(Stream::Err, format_args!("{long}")); }
-        assert_eq!(play.text, format!("\u{2}{long}\n"), "a full buffer is written, then the new line kept");
-        assert_eq!(play.text.capacity(), PLAY_CAP, "the buffer never grows during play");
     }
     #[test]
     fn log_field_reports_the_previous_line_cost() {
