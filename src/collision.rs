@@ -103,6 +103,10 @@ impl Hull {
     /// the BSP's precomputed bevels alone leaves phantom solid corners outside
     /// the model bounds, so a downward trace can report start-solid at clear feet.
     fn transformed(source: &[Plane], origin: Vec3, rotation: Quat) -> Result<Self> {
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        if hull_topology_probe::enabled() {
+            return Self::transformed_cached(source, origin, rotation);
+        }
         crate::sim_maps::count("brush_hulls_built", 1);
         #[cfg(target_os = "vita")]
         let _vertices_profile = crate::frame_profile::span("collider_vertices");
@@ -207,6 +211,133 @@ impl Hull {
                 }
             }
         }
+        Ok(Self {
+            planes,
+            bounds: Bounds {
+                min: points.iter().copied().reduce(Vec3::min).unwrap(),
+                max: points.iter().copied().reduce(Vec3::max).unwrap(),
+            },
+        })
+    }
+}
+/// I08 diagnostic prototype (host probe builds only, off unless LOOKING_GLASS_HULL_TOPOLOGY_CACHE=1):
+/// the vertex enumeration and the edge-membership test of `Hull::transformed` read only the
+/// brush's local planes, so they are cached per plane set. The pose-dependent tail (edge rotation
+/// and dedupe, point and plane transform, support planes) runs unchanged, in the same order.
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+mod hull_topology_probe {
+    use super::{Plane, Vec3};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::OnceLock};
+    pub(super) struct Topology { pub vertices: Vec<Vec3>, pub pairs: Vec<(u32, u32)> }
+    thread_local! {
+        static CACHE: RefCell<HashMap<Vec<[u32; 4]>, Rc<Topology>>> = RefCell::new(HashMap::new());
+    }
+    pub(super) fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("LOOKING_GLASS_HULL_TOPOLOGY_CACHE").as_deref() == Ok("1"))
+    }
+    pub(super) fn get(source: &[Plane]) -> Rc<Topology> {
+        let key = source.iter().map(|p| [p.normal.x.to_bits(), p.normal.y.to_bits(), p.normal.z.to_bits(),
+            p.distance.to_bits()]).collect::<Vec<_>>();
+        if let Some(t) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+            crate::sim_maps::count("hull_topology_hits", 1);
+            return t;
+        }
+        crate::sim_maps::count("hull_topology_misses", 1);
+        let mut vertices = Vec::<Vec3>::new();
+        for (i, a) in source.iter().enumerate() {
+            for (j, b) in source.iter().enumerate().skip(i + 1) {
+                for c in &source[j + 1..] {
+                    let determinant = a.normal.dot(b.normal.cross(c.normal));
+                    if determinant.abs() < 0.00001 {
+                        continue;
+                    }
+                    let v = (a.distance * b.normal.cross(c.normal)
+                        + b.distance * c.normal.cross(a.normal)
+                        + c.distance * a.normal.cross(b.normal))
+                        / determinant;
+                    if v.is_finite()
+                        && source.iter().all(|p| p.normal.dot(v) - p.distance <= 0.01)
+                        && !vertices.iter().any(|p| p.distance_squared(v) < 0.0001)
+                    {
+                        vertices.push(v);
+                    }
+                }
+            }
+        }
+        let mut pairs = Vec::new();
+        for (i, a) in vertices.iter().enumerate() {
+            for (j, b) in vertices.iter().enumerate().skip(i + 1) {
+                if source
+                    .iter()
+                    .filter(|p| {
+                        (p.normal.dot(*a) - p.distance).abs() <= 0.01
+                            && (p.normal.dot(*b) - p.distance).abs() <= 0.01
+                    })
+                    .count()
+                    >= 2
+                {
+                    pairs.push((i as u32, j as u32));
+                }
+            }
+        }
+        crate::sim_maps::count("hull_topology_planes", source.len() as u64);
+        crate::sim_maps::count("hull_topology_vertices", vertices.len() as u64);
+        let t = Rc::new(Topology { vertices, pairs });
+        CACHE.with(|c| c.borrow_mut().insert(key, t.clone()));
+        t
+    }
+}
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+impl Hull {
+    fn transformed_cached(source: &[Plane], origin: Vec3, rotation: Quat) -> Result<Self> {
+        crate::sim_maps::count("brush_hulls_built", 1);
+        let topology = hull_topology_probe::get(source);
+        let vertices = &topology.vertices;
+        ensure!(
+            vertices.len() >= 4,
+            "Inline collision brush has no closed volume"
+        );
+        let mut edges = Vec::<Vec3>::new();
+        for &(i, j) in &topology.pairs {
+            let (a, b) = (vertices[i as usize], vertices[j as usize]);
+            let edge = (rotation * (b - a)).normalize();
+            if !edges
+                .iter()
+                .any(|e| e.distance_squared(edge).min(e.distance_squared(-edge)) < 1e-10)
+            {
+                edges.push(edge);
+            }
+        }
+        let points = vertices
+            .iter()
+            .map(|v| origin + rotation * *v)
+            .collect::<Vec<_>>();
+        let mut planes = source
+            .iter()
+            .map(|p| {
+                let normal = rotation * p.normal;
+                Plane {
+                    normal,
+                    distance: p.distance + normal.dot(origin),
+                }
+            })
+            .collect::<Vec<_>>();
+        let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+        for axis in axes {
+            add_support(&mut planes, &points, axis);
+            add_support(&mut planes, &points, -axis);
+        }
+        for edge in edges {
+            for axis in axes {
+                let bevel = edge.cross(axis);
+                if bevel.length_squared() > 0.000001 {
+                    add_support(&mut planes, &points, bevel.normalize());
+                    add_support(&mut planes, &points, -bevel.normalize());
+                }
+            }
+        }
+        crate::sim_maps::count("hull_planes_out", planes.len() as u64);
         Ok(Self {
             planes,
             bounds: Bounds {

@@ -457,6 +457,21 @@ impl Creature {
     }
     fn move_ground(&mut self, world: &World, delta: Vec3) {
         let _npc_work = crate::npc::profile::work(crate::npc::profile::Phase::Movement);
+        // I08 diagnostic (host probe builds only): how often a zero-delta walk moves a body, and an
+        // env-gated skip (LOOKING_GLASS_I08_ZERO_WALK_SKIP=1) to test whether skipping it is exact.
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        if delta == Vec3::ZERO {
+            static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            crate::sim_maps::count("i08_zero_walks", 1);
+            if *SKIP.get_or_init(|| std::env::var("LOOKING_GLASS_I08_ZERO_WALK_SKIP").as_deref() == Ok("1")) {
+                return;
+            }
+            let next = combat::walk_body(world, self.feet, delta, self.target(0).half);
+            let bits = |v: Vec3| v.to_array().map(f32::to_bits);
+            crate::sim_maps::count("i08_zero_walks_moved", u64::from(bits(next) != bits(self.feet)));
+            self.feet = next;
+            return;
+        }
         self.feet = combat::walk_body(world, self.feet, delta, self.target(0).half);
     }
     fn move_fly(&mut self, world: &World, delta: Vec3) {
