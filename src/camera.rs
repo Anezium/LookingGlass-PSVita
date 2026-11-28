@@ -15,6 +15,16 @@ pub struct Follow {
     arm: f32,
     release: f32,
     visible: bool,
+    last: Solve,
+}
+
+/// The last arm solve, kept for the off-by-default camera log only.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Solve {
+    pub length: f32,
+    pub limit: f32,
+    pub normal: Vec3,
+    pub start_solid: bool,
 }
 
 impl Follow {
@@ -103,6 +113,12 @@ impl Follow {
         let length = offset.length();
         let hit = world.camera_sweep(target, target + offset, HALF);
         let limit = length * if hit.start_solid { 0. } else { hit.fraction };
+        self.last = Solve {
+            length,
+            limit,
+            normal: hit.normal,
+            start_solid: hit.start_solid,
+        };
         let preferred = limit.min(anticipated);
         if fresh {
             self.arm = preferred;
@@ -130,6 +146,121 @@ impl Follow {
         };
         (eye, look_at, self.visible)
     }
+}
+
+impl Follow {
+    pub fn arm(&self) -> f32 {
+        self.arm
+    }
+    pub fn last_solve(&self) -> Solve {
+        self.last
+    }
+}
+
+/// Diagnostic camera log, silent unless `LOOKING_GLASS_CAMERA_LOG` is set.
+/// One `[lg/camera]` line per gameplay step; it never changes the camera.
+pub fn log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LOOKING_GLASS_CAMERA_LOG").is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn log_step(
+    map: &str,
+    follow: &Follow,
+    feet: Vec3,
+    direction: Vec3,
+    eye: Vec3,
+    target: Vec3,
+    gameplay_alice: bool,
+    show_alice: bool,
+    scripted: bool,
+) {
+    static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let step = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let s = follow.last;
+    let v = |v: Vec3| format!("{:.3},{:.3},{:.3}", v.x, v.y, v.z);
+    println!(
+        "[lg/camera] step={step} map={map} feet={} dir={} eye={} target={} arm={:.3} length={:.3} limit={:.3} normal={} start_solid={} gameplay_alice={gameplay_alice} show_alice={show_alice} scripted={scripted}",
+        v(feet), v(direction), v(eye), v(target), follow.arm, s.length, s.limit, v(s.normal), s.start_solid
+    );
+}
+
+/// Host diagnostic (`--camera-entry-probe MAP [--entry NAME]`): solve the follow camera at the
+/// map entrance for 60 steps at the spawn yaw and every 15 degrees, and name the world brush
+/// that stops the arm. Reads game data only; it changes no game state.
+pub fn entry_probe(
+    assets: &mut crate::assets::Assets,
+    name: &str,
+    entry: Option<&str>,
+) -> anyhow::Result<()> {
+    use crate::{bsp::Bsp, interaction, movement::Player};
+    let map = Bsp::parse(&assets.read(&format!("maps/{name}.bsp"))?)?;
+    let mut world = World::from_bsp(&map)?;
+    let mut interactions = interaction::Interactions::load(&map)?;
+    interactions.set_entry(assets, &map, name, entry)?;
+    interactions.sync(&mut world);
+    let (eye, yaw) = interaction::spawn(&map, entry);
+    let player = Player::spawn(&world, eye).ok_or_else(|| anyhow::anyhow!("no clear spawn"))?;
+    let distance = crate::preferences::Preferences::default().camera_distance;
+    println!(
+        "[lg/camera-probe] map={name} entry={entry:?} spawn_eye={:.3},{:.3},{:.3} feet={:.3},{:.3},{:.3} spawn_yaw_deg={:.3} distance={distance}",
+        eye.x, eye.y, eye.z, player.feet.x, player.feet.y, player.feet.z, yaw.to_degrees()
+    );
+    let mut yaws = vec![yaw.to_degrees()];
+    yaws.extend((0..24).map(|i| i as f32 * 15.));
+    for (row, deg) in yaws.into_iter().enumerate() {
+        let r = deg.to_radians();
+        let direction = vec3(r.cos(), r.sin(), 0.);
+        let mut camera = Follow::default();
+        let mut first = None;
+        let mut out = (Vec3::ZERO, Vec3::ZERO, false);
+        for step in 0..60 {
+            out = camera.update(&world, player.feet, direction, distance, 1. / 30.);
+            if step == 0 {
+                first = Some((camera.arm, out.2));
+            }
+        }
+        let (eye, target, visible) = out;
+        let s = camera.last;
+        let show = visible && eye.distance(player.feet + Vec3::Z * 32.) > 30.;
+        // The world brush whose 4-unit expansion contains the stop point.
+        let stop = target + (eye - target).normalize_or_zero() * (s.limit + 0.05);
+        let mut brushes = Vec::new();
+        for b in map.world_brushes.clone() {
+            let brush = &map.brushes[b];
+            if map.shaders.get(brush.shader).is_none_or(|sh| sh.contents & 1 == 0) {
+                continue;
+            }
+            let mut worst = (f32::NEG_INFINITY, 0usize);
+            for side in brush.sides.clone() {
+                let plane = map.planes[map.side_planes[side]];
+                let reach = HALF.dot(plane.normal.abs());
+                let d = plane.normal.dot(stop) - plane.distance - reach;
+                if d > worst.0 {
+                    worst = (d, map.side_planes[side]);
+                }
+            }
+            if worst.0 <= 0.5 {
+                let plane = map.planes[worst.1];
+                brushes.push(format!(
+                    "brush{b}/plane{}({:.3},{:.3},{:.3} d={:.1})/{}",
+                    worst.1,
+                    plane.normal.x,
+                    plane.normal.y,
+                    plane.normal.z,
+                    plane.distance,
+                    map.shaders[brush.shader].name
+                ));
+            }
+        }
+        println!(
+            "[lg/camera-probe] row={row} yaw_deg={deg:.3} first_arm={:.3} first_visible={} arm={:.3} length={:.3} limit={:.3} fraction={:.6} normal={:.3},{:.3},{:.3} start_solid={} visible={visible} show_alice={show} eye={:.3},{:.3},{:.3} stop_brushes=[{}]",
+            first.unwrap().0, first.unwrap().1, camera.arm, s.length, s.limit, s.limit / s.length.max(0.001),
+            s.normal.x, s.normal.y, s.normal.z, s.start_solid, eye.x, eye.y, eye.z, brushes.join(" ")
+        );
+    }
+    Ok(())
 }
 
 /// Exercise real map corners, doorways and moving-model collision from supported feet.

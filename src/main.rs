@@ -491,6 +491,10 @@ fn run() -> Result<()> {
             "--hud-check" => mode = "hud",
             "--loadout-check" => mode = "loadout",
             "--camera-check" => mode = "camera",
+            "--camera-entry-probe" => {
+                mode = "camera-entry-probe";
+                movie_name = args.next().context("--camera-entry-probe requires a map")?;
+            }
             "--npc-check" => mode = "npc",
             "--npc-placement-check" => mode = "npc-placement",
             "--npc-placement-render-check" => mode = "npc-placement-render",
@@ -815,6 +819,9 @@ fn run() -> Result<()> {
     }
     if mode == "camera" {
         return camera::check(&mut assets);
+    }
+    if mode == "camera-entry-probe" {
+        return camera::entry_probe(&mut assets, &movie_name, o.entry.as_deref());
     }
     if mode == "duchess" {
         return duchess_check::check(&mut assets);

@@ -1864,6 +1864,19 @@ pub(super) fn step_b_in_place(
             gameplay_alice && camera.distance(sim.player.feet + Vec3::Z * 32.) > 30.
         };
     drop(census_leaf);
+    if crate::camera::log_enabled() {
+        crate::camera::log_step(
+            &map_name.to_string(),
+            sim.follow_camera,
+            sim.player.feet,
+            direction,
+            camera,
+            target,
+            gameplay_alice,
+            show_alice,
+            scripted_camera.is_some(),
+        );
+    }
     let liquid_contents = if simulate {
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         {
