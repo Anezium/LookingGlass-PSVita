@@ -568,6 +568,15 @@ pub struct Config {
     /// Buffer stamped simulation and presentation timings until viewer teardown.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub diag_sim_timing: bool,
+    /// Diagnostic (v1.2 I04, off by default). With sim_overlap_normal, start the skin workers on the
+    /// unlisted-map masks and spawn sim-pipeline at the first listed install instead of at viewer
+    /// start, so a cold unlisted entry keeps the lag-off threads and heap sequence.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sim_overlap_lazy_layout: bool,
+    /// Diagnostic (v1.2 I04): hold this many heap bytes from the point where the lag config spawns
+    /// sim-pipeline until the viewer ends. Tests whether a heap offset alone moves frame time. 0: off.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub diag_heap_pad_bytes: u32,
     /// Replay this tape file instead of the pad. Empty: off.
     pub replay_play: String,
     /// Where a recording or opted-in live diagnostic starts: "save:<slot>" or "chapter:<map>[$<entrance>][@<difficulty>]".
@@ -835,6 +844,8 @@ impl Default for Config {
             sim_overlap_live: false,
             sim_overlap_cap_30: false,
             diag_sim_timing: false,
+            sim_overlap_lazy_layout: false,
+            diag_heap_pad_bytes: 0,
             replay_play: String::new(),
             replay_start: String::new(),
             replay_check_every: 30,
@@ -961,6 +972,8 @@ impl Config {
             "sim_overlap excludes skin_worker_bench and its timed allocation scopes");
         ensure!(!self.skin_worker_bench || self.skin_workers == 0, "skin_worker_bench requires skin_workers=0 to isolate overlap");
         ensure!(self.diag_overlap_burn_ms <= 20, "diag_overlap_burn_ms must be 0..20");
+        ensure!(!self.sim_overlap_lazy_layout || self.sim_overlap_normal, "sim_overlap_lazy_layout requires sim_overlap_normal");
+        ensure!(self.diag_heap_pad_bytes <= 1 << 20, "diag_heap_pad_bytes must be 0..1048576");
         ensure!(self.diag_overlap || self.diag_overlap_burn_ms == 0, "burn requires diag_overlap");
         ensure!(!self.cpu1_reserved() || (self.skin_workers == 1 && self.skin_overlap && self.audio_pcm_worker && self.audio_producer_affinity == 0x40000),
             "CPU1 reservation requires one overlapping skin worker, buffered audio and audio on CPU2");
@@ -1058,6 +1071,7 @@ fn config_log_lines(c: &Config) -> [String; 2] {
         format!("[lg/vita-renderer] report_cadence effective_log_frame_time_every={}", report_cadence(c)),
     ]
 }
+fn is_zero_u32(value: &u32) -> bool { *value == 0 }
 fn optional_bool<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<bool>, D::Error> {
     <bool as serde::Deserialize>::deserialize(deserializer).map(Some)
 }

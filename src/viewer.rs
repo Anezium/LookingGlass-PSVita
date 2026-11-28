@@ -1564,7 +1564,18 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
     #[cfg(not(feature = "vita_renderer"))]
     let sim_overlap = false;
     let mut sim_audit = sim_audit::Audit::new();
-    let mut sim_worker = sim_overlap.then(|| blocked_step::Worker::new(&sim_audit)).transpose()?;
+    #[cfg(feature = "vita_renderer")]
+    let lazy_sim_worker = crate::render::vita_renderer::config().sim_overlap_lazy_layout;
+    #[cfg(not(feature = "vita_renderer"))]
+    let lazy_sim_worker = false;
+    let mut sim_worker = (sim_overlap && !lazy_sim_worker)
+        .then(|| blocked_step::Worker::new(&sim_audit)).transpose()?;
+    // Diagnostic heap offset at the same point (I04); held until the viewer returns.
+    #[cfg(feature = "vita_renderer")]
+    let _heap_pad = match crate::render::vita_renderer::config().diag_heap_pad_bytes as usize {
+        0 => None,
+        bytes => Some(std::hint::black_box(vec![0x5au8; bytes].into_boxed_slice())),
+    };
     let mut pending: Option<lag_frame::Frame> = None;
     #[cfg(feature = "vita_renderer")]
     let layout_config = crate::render::vita_renderer::config();
@@ -1575,10 +1586,15 @@ pub async fn run(mut assets: Assets, mut options: Options) -> Result<()> {
             #[cfg(feature = "vita_renderer")]
             if layout_config.sim_overlap_normal {
                 assert!(pending.is_none(), "layout switch before retained presentation drained");
-                assert!(sim_worker.as_ref().is_some_and(blocked_step::Worker::idle));
                 let map = $map;
                 let visit = $visit.id();
                 let reserved = layout_config.sim_overlap_maps.iter().any(|name| name == map);
+                if reserved && sim_worker.is_none() {
+                    assert!(lazy_sim_worker, "lag layout without its sim worker");
+                    sim_worker = Some(blocked_step::Worker::new(&sim_audit)?);
+                    eprintln!("[lg/sim-worker] map={map} visit={visit} spawned=lazy");
+                }
+                assert!(sim_worker.as_ref().map_or(lazy_sim_worker, blocked_step::Worker::idle));
                 let ([skin0, skin1], repinned) = crate::character::skinning::overlap::park_cpu1(reserved);
                 reserved_visit = reserved.then_some(visit);
                 let workers = if reserved { 1 } else { 2 };
