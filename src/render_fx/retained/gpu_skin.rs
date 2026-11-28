@@ -231,8 +231,9 @@ impl Gpu {
             self.active = true;
         }
     }
+    /// A variant past the six skin programs (a CPU-only route) is unsupported, never a panic.
     pub(super) fn supports(&self, variant: usize) -> bool {
-        self.shaders[variant].is_some()
+        self.shaders.get(variant).is_some_and(Option::is_some)
     }
 
     /// Another program, pipeline, binding or depth mask may have been applied since the
