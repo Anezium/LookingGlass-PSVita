@@ -651,14 +651,15 @@ impl Renderer {
                 // `autosprite_live`: this frame's facings, posed to world, faced to the
                 // camera, posed back, as the desktop portal transform did before its billboard.
                 if !set.sprite_quads.is_empty() {
+                    let started = MetricInstant::now();
                     let inverse = pose.inverse();
                     for quad in &set.sprite_quads {
-                        let uvs = quad.ids.map(|id| Vec2::from_array(stream.template[id as usize].uv));
                         for (id, position) in quad.ids.iter().zip(
-                            sprite_stream::reface_through(quad, &uvs, eye, pose, inverse)) {
+                            sprite_stream::reface_through(quad, eye, pose, inverse)) {
                             stream.template[*id as usize].position = position.to_array();
                         }
                     }
+                    count("vita_sky_autosprite_rewrite_ns", started.elapsed().as_nanos() as u64);
                 }
                 ctx.buffer_update(stream.vertex, BufferSource::slice(&stream.template));
                 counts.upload_bytes += (stream.template.len() * std::mem::size_of::<WorldVertex>()) as u64;

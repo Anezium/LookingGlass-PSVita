@@ -26,6 +26,7 @@ pub(super) struct Quad {
     pub ids: [u16; 4],
     pub corners: [Vec3; 4],
     pub locked: bool,
+    pub uvs: [Vec2; 4],
 }
 /// Per-pending quad collection while the retained world gathers sprite geometry. The ids
 /// are local to that pending's geometry until the stream packs them with an offset.
@@ -72,8 +73,7 @@ impl SpriteStream {
         self.camera = bits;
         self.time = time.to_bits();
         for quad in &self.quads {
-            let uvs = quad.ids.map(|id| Vec2::from_array(self.template[id as usize].uv));
-            for (id, position) in quad.ids.iter().zip(reface(quad, &uvs, camera)) {
+            for (id, position) in quad.ids.iter().zip(reface(quad, camera)) {
                 self.template[*id as usize].position = position.to_array();
             }
         }
@@ -86,21 +86,21 @@ impl SpriteStream {
     }
 }
 /// The quad's new world-space positions: the desktop math, locked or free.
-pub(super) fn reface(quad: &Quad, uvs: &[Vec2; 4], camera: Vec3) -> [Vec3; 4] {
+pub(super) fn reface(quad: &Quad, camera: Vec3) -> [Vec3; 4] {
     if quad.locked {
         crate::render::axial_positions(&quad.corners, camera)
     } else {
-        crate::render::facing_positions(&quad.corners, uvs, camera)
+        crate::render::facing_positions(&quad.corners, &quad.uvs, camera)
     }
 }
 /// The same through the sky portal: posed to world space, faced to the world camera,
 /// posed back to the room the stream stores. `inverse` is `pose` inverted, taken once.
-pub(super) fn reface_through(quad: &Quad, uvs: &[Vec2; 4], camera: Vec3, pose: Mat4, inverse: Mat4) -> [Vec3; 4] {
+pub(super) fn reface_through(quad: &Quad, camera: Vec3, pose: Mat4, inverse: Mat4) -> [Vec3; 4] {
     let corners = quad.corners.map(|corner| pose.transform_point3(corner));
     let faced = if quad.locked {
         crate::render::axial_positions(&corners, camera)
     } else {
-        crate::render::facing_positions(&corners, uvs, camera)
+        crate::render::facing_positions(&corners, &quad.uvs, camera)
     };
     faced.map(|position| inverse.transform_point3(position))
 }
@@ -108,8 +108,7 @@ pub(super) fn reface_through(quad: &Quad, uvs: &[Vec2; 4], camera: Vec3, pose: M
 /// center, sized by the farthest authored corner, with the axial midpoints' excursions
 /// included and a margin for skewed quads. The authored box when nothing re-faces.
 pub(super) fn covering_bounds(quads: &[Quad], fallback: (Vec3, Vec3)) -> (Vec3, Vec3) {
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let (mut min, mut max) = fallback;
     for quad in quads {
         let center = quad.corners.iter().map(|&corner| corner).sum::<Vec3>() / 4.;
         let mut radius = quad.corners.iter().map(|corner| corner.distance(center)).fold(0., f32::max);
@@ -124,12 +123,16 @@ pub(super) fn covering_bounds(quads: &[Quad], fallback: (Vec3, Vec3)) -> (Vec3, 
             let high_radius = c.distance(d) * 0.5;
             radius = radius.max(((lower - center).length_squared() + low_radius * low_radius).sqrt());
             radius = radius.max(((upper - center).length_squared() + high_radius * high_radius).sqrt());
+        } else {
+            let scale = quad.corners[0].distance(center) * 2. * 0.70710677;
+            let uv_radius = quad.uvs.iter().map(|uv| (*uv - Vec2::splat(0.5)).length()).fold(0., f32::max);
+            radius = radius.max(scale * uv_radius);
         }
         radius += 1.;
         min = min.min(center - Vec3::splat(radius));
         max = max.max(center + Vec3::splat(radius));
     }
-    if quads.is_empty() { fallback } else { (min, max) }
+    (min, max)
 }
 /// Quads of one part just appended to a sprite pending: the distinct source vertices in
 /// authored order (a face's vertices sit contiguous in `base`, so ascending is authored
@@ -147,6 +150,7 @@ pub(super) fn record_part(quads: &mut Vec<Quad>, geometry: &Geometry, batch: usi
             ids,
             corners: face.map(|src| b.base[src as usize].position),
             locked,
+            uvs: face.map(|src| b.base[src as usize].uv),
         });
     }
 }
@@ -161,7 +165,8 @@ pub(super) fn quads_of_batch(b: &crate::render::Batch, locked: bool, first: usiz
         let ids = face.map(|src| {
             (first + source.iter().position(|&s| s == src).expect("a packed source vertex")) as u16
         });
-        Quad { ids, corners: face.map(|src| b.base[src as usize].position), locked }
+        Quad { ids, corners: face.map(|src| b.base[src as usize].position), locked,
+            uvs: face.map(|src| b.base[src as usize].uv) }
     }).collect()
 }
 /// Pack every sprite pending's geometry into one stream, in pending order. Returns the
@@ -185,7 +190,7 @@ pub(super) fn build(ctx: &mut dyn RenderingBackend, resources: &mut Construction
         let bounds = covering_bounds(&batch_quads, (p.geometry.min, p.geometry.max));
         template.append(&mut p.geometry.vertices);
         let base = indices.len() as i32;
-        indices.append(&mut p.geometry.indices);
+        indices.extend(p.geometry.indices.drain(..).map(|id| id + offset as u16));
         for quad in batch_quads {
             quads.push(Quad { ids: quad.ids.map(|id| (id as usize + offset) as u16), ..quad });
         }
@@ -202,7 +207,7 @@ pub(super) fn build(ctx: &mut dyn RenderingBackend, resources: &mut Construction
 mod tests {
     use super::*;
     fn quad_batch(positions: [Vec3; 4], indices: &[u16]) -> crate::render::Batch {
-        let mut b = crate::render::Batch {
+        crate::render::Batch {
             #[cfg(target_os = "vita")]
             static_offset: None,
             face_side: crate::materials::FaceSide::Both,
@@ -215,21 +220,20 @@ mod tests {
             animation: None,
             mesh: crate::mesh::Mesh { upload_identity: None, surface: None, vertices: Vec::new(),
                 indices: Vec::new(), texture: None },
-            base: positions.iter().map(|&position| Vertex {
+            base: positions.into_iter().zip([vec2(0., 1.), vec2(1., 1.), vec2(1., 0.), vec2(0., 0.)]).map(|(position, uv)| Vertex {
                 position,
-                uv: vec2(0.25, 0.75),
+                uv,
                 color: [255; 4],
                 normal: Vec4::ZERO,
             }).collect(),
-            normals: Vec::new(),
+            normals: vec![Vec3::Z; positions.len()],
             deforms: vec![crate::materials::Deform::Sprite(false)],
             sky: false,
             portal: false,
             layers: Vec::new(),
             center: Vec3::ZERO,
             model: None,
-        };
-        b
+        }
     }
     /// One four-vertex face packs to one quad in authored order, and the shared desktop
     /// math places each new corner at the free billboard's exact radius from the center.
@@ -246,15 +250,14 @@ mod tests {
         assert_eq!(quad.ids, [0, 1, 2, 3], "authored face order");
         assert_eq!(quad.corners, [b.base[0].position, b.base[1].position,
             b.base[2].position, b.base[3].position]);
-        let uvs = quad.ids.map(|id| b.base[id as usize].uv);
         let center = quad.corners.iter().map(|&c| c).sum::<Vec3>() / 4.;
         let radius = quad.corners[0].distance(center) * 0.70710677;
-        for position in reface(quad, &uvs, vec3(500., -70., 42.)) {
+        for position in reface(quad, vec3(500., -70., 42.)) {
             assert!((position.distance(center) - radius * std::f32::consts::SQRT_2).abs() < 1e-4,
                 "the free billboard keeps the authored corner radius");
         }
         // Facing the camera: the quad plane's normal points at it.
-        let faced = reface(quad, &uvs, vec3(500., -70., 42.));
+        let faced = reface(quad, vec3(500., -70., 42.));
         let normal = (faced[1] - faced[0]).cross(faced[2] - faced[1]);
         assert!(normal.dot(vec3(500., -70., 42.) - center) > 0.);
     }
@@ -272,8 +275,8 @@ mod tests {
         let source = [3_u16, 2, 1, 0, 5, 6, 7, 4]; // first-seen order, two rotations
         let quads = quads_of_batch(&b, true, 100, &source);
         assert_eq!(quads.len(), 2, "one quad per face");
-        assert_eq!(quads[0].ids, [100, 101, 102, 103], "face one in authored order");
-        assert_eq!(quads[1].ids, [104, 105, 106, 107], "face two in authored order");
+        assert_eq!(quads[0].ids, [103, 102, 101, 100], "face one in authored order");
+        assert_eq!(quads[1].ids, [107, 104, 105, 106], "face two in authored order");
         assert_eq!(quads[0].corners, [positions[0], positions[1], positions[2], positions[3]]);
         assert_eq!(quads[1].corners, [positions[4], positions[5], positions[6], positions[7]]);
         assert!(quads.iter().all(|q| q.locked));
@@ -288,8 +291,8 @@ mod tests {
             corners: [vec3(-2372., 2586., -470.), vec3(-2372., 2586., -400.),
                 vec3(-2372., 2658., -400.), vec3(-2372., 2658., -470.)],
             locked: true,
+            uvs: [vec2(1.99, 1.99), vec2(1.99, 0.99), vec2(0.99, 0.99), vec2(0.99, 1.99)],
         };
-        let uvs = [vec2(1.99, 1.99), vec2(1.99, 0.99), vec2(0.99, 0.99), vec2(0.99, 1.99)];
         for locked in [true, false] {
             let mut quad = quad;
             quad.locked = locked;
@@ -297,7 +300,7 @@ mod tests {
             for step in 0..24 {
                 let angle = step as f32 * std::f32::consts::TAU / 24.;
                 let camera = vec3(angle.cos(), angle.sin(), 0.3) * 250. + vec3(-2372., 2622., -435.);
-                for position in reface(&quad, &uvs, camera) {
+                for position in reface(&quad, camera) {
                     assert!(min.cmple(position).all() && position.cmple(max).all(),
                         "locked={locked} faced corner {position:?} outside {min:?}..{max:?}");
                 }
@@ -305,7 +308,7 @@ mod tests {
                 // bounds: the pose is a rotation about the origin plus a translation.
                 let pose = Mat4::from_translation(vec3(80., -20., 4.))
                     * Mat4::from_quat(Quat::from_rotation_z(0.7)) * Mat4::from_translation(-Vec3::ONE);
-                let room = reface_through(&quad, &uvs, camera, pose, pose.inverse());
+                let room = reface_through(&quad, camera, pose, pose.inverse());
                 for position in room {
                     assert!(min.cmple(position).all() && position.cmple(max).all(),
                         "locked={locked} posed corner {position:?} outside {min:?}..{max:?}");
