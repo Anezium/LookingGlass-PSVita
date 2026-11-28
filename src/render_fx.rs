@@ -1968,8 +1968,10 @@ fn gpu_skin_payload(c:&crate::render::vita_renderer::Config,source:&crate::skele
     let layer_ok=|s:&Stage| actor_cache::simple(s) || s.environment && s.vector_uv.is_none() && s.dot_alpha.is_none() && s.mods.is_empty();
     if surface.transparent || surface.layers.iter().take(actor_max_layers(c)).any(|l|!layer_ok(&l.stage)) {return Err(Reason::Material);}
     let input=retained::gpu_skin::input(source.cpu())?;
+    let check=retained::gpu_skin::check_clock();
     if source.vertices.len()!=mesh.vertices.len() || source.indices!=mesh.indices
         || source.vertices.iter().zip(&mesh.vertices).any(|(a,b)|a.uv.to_array().map(f32::to_bits)!=b.uv.to_array().map(f32::to_bits)) {return Err(Reason::Topology);}
+    drop(check);
     let eye=FRAME.with(|f|f.borrow().camera);
     let payload=retained::gpu_skin::occurrence(input,share,pose,scales,transform,scale,fullbright,alpha,eye)?;
     Ok((surface.clone(),payload))
