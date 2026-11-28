@@ -431,14 +431,27 @@ impl Story {
     }
 
     pub(crate) fn load_with_voices(assets: &mut Assets, map: &str, _install_voices: bool) -> Self {
+        Self::load_with_voice_cache(
+            assets,
+            map,
+            #[cfg(feature = "vita_renderer")]
+            (_install_voices && crate::render::vita_renderer::config().audio_voice_prefetch)
+                .then(crate::audio::voice::Cache::configured),
+        )
+    }
+
+    fn load_with_voice_cache(
+        assets: &mut Assets,
+        map: &str,
+        #[cfg(feature = "vita_renderer")] cache: Option<crate::audio::voice::Cache>,
+    ) -> Self {
         let _r13_memory = crate::allocation_census::Scope::new(5);
         let mut s = Self {
             map: map.into(),
             ..Self::default()
         };
         #[cfg(feature = "vita_renderer")]
-        let mut cache = (_install_voices && crate::render::vita_renderer::config().audio_voice_prefetch)
-            .then(crate::audio::voice::Cache::default);
+        let mut cache = cache;
         let mut prefetch = |_path: &str, _wav: Vec<u8>, _first_line: bool| {
             #[cfg(feature = "vita_renderer")]
             if let Some(cache) = &mut cache {
@@ -1482,6 +1495,47 @@ mod tests {
             assert!(s.progress("b").is_some());
             s.trigger("a");
             assert_eq!(s.queue.len(), 0);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "vita_renderer"))]
+mod voice_cap_census {
+    use super::*;
+
+    /// Every registered voice map at the 1 MiB and the 1.25 MiB WAV cap: PCM bytes, first lines
+    /// cached, and the lines whose WAV is over 1 MiB. No map may lose a cached first line.
+    #[test]
+    #[ignore = "requires LOOKING_GLASS_TEST_DATA; story-voice cache census at both WAV caps"]
+    fn voice_wav_cap_keeps_every_first_line() {
+        let data = std::env::var("LOOKING_GLASS_TEST_DATA").expect("LOOKING_GLASS_TEST_DATA");
+        let mut assets = Assets::open(std::path::Path::new(&data)).unwrap();
+        let mut maps: Vec<&str> = registry::maps().into_iter().collect();
+        maps.push("skool2");
+        maps.sort_unstable();
+        maps.dedup();
+        for map in maps {
+            let [off, on] = [false, true].map(|raised| {
+                let story = Story::load_with_voice_cache(&mut assets, map, Some(crate::audio::voice::Cache::for_cap(raised)));
+                let firsts: BTreeSet<String> = story.available.values()
+                    .filter_map(|sequence| sequence.lines.first().map(|line| line.path.clone())).collect();
+                let lines: BTreeSet<String> = story.available.values()
+                    .flat_map(|sequence| sequence.lines.iter().map(|line| line.path.clone())).collect();
+                let (bytes, first_lines, clips) = story.prefetched_voices.as_ref().unwrap().census();
+                let clips: BTreeSet<String> = clips.into_iter().map(str::to_owned).collect();
+                (bytes, first_lines, clips, firsts, lines)
+            });
+            let large: Vec<String> = on.4.iter().filter_map(|path| {
+                let size = assets.read(path).ok()?.len();
+                (size > 1024 * 1024).then(|| format!("{path}:{size}"))
+            }).collect();
+            let lost: Vec<&String> = off.3.iter().filter(|p| off.2.contains(*p) && !on.2.contains(*p)).collect();
+            let evicted: Vec<&String> = off.2.difference(&on.2).collect();
+            let added: Vec<&String> = on.2.difference(&off.2).collect();
+            println!("VOICE_CAP map={map} off_bytes={} off_first={}/{} on_bytes={} on_first={}/{} delta_bytes={} \
+                added={added:?} evicted={evicted:?} over_1mib={large:?}",
+                off.0, off.1 .0, off.1 .1, on.0, on.1 .0, on.1 .1, on.0 as i64 - off.0 as i64);
+            assert!(lost.is_empty(), "{map} loses cached first lines {lost:?}");
         }
     }
 }

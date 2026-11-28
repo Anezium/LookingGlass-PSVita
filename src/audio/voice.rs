@@ -49,6 +49,9 @@ use std::{collections::BTreeMap, io::Cursor};
 const PCM_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(feature = "vita_renderer")]
 const WAV_BYTES: usize = 1024 * 1024;
+/// With `voice_wav_cap_1_25`: jlair2's `jabberwock/vo/jbwk004.wav` is 1,060,974 B.
+#[cfg(feature = "vita_renderer")]
+const WAV_BYTES_1_25: usize = 1280 * 1024;
 
 #[cfg(feature = "vita_renderer")]
 fn decode(bytes: Vec<u8>, reserve: impl FnOnce(usize) -> bool) -> Option<Pcm> {
@@ -85,17 +88,50 @@ fn decode(bytes: Vec<u8>, reserve: impl FnOnce(usize) -> bool) -> Option<Pcm> {
 }
 
 #[cfg(feature = "vita_renderer")]
-#[derive(Default)]
 pub(crate) struct Cache {
     clips: BTreeMap<String, Pcm>,
     replies: Vec<String>,
     bytes: usize,
     decode_time: Duration,
     first_lines: (usize, usize),
+    wav_cap: usize,
+}
+
+#[cfg(feature = "vita_renderer")]
+impl Default for Cache {
+    fn default() -> Self {
+        Self::with_wav_cap(WAV_BYTES)
+    }
 }
 
 #[cfg(feature = "vita_renderer")]
 impl Cache {
+    fn with_wav_cap(wav_cap: usize) -> Self {
+        Self {
+            clips: BTreeMap::new(),
+            replies: Vec::new(),
+            bytes: 0,
+            decode_time: Duration::ZERO,
+            first_lines: (0, 0),
+            wav_cap,
+        }
+    }
+
+    /// The cache for this run's config: `voice_wav_cap_1_25` raises the largest admitted WAV.
+    pub(crate) fn configured() -> Self {
+        Self::for_cap(crate::render::vita_renderer::config().voice_wav_cap_1_25)
+    }
+
+    pub(crate) fn for_cap(raised: bool) -> Self {
+        Self::with_wav_cap(if raised { WAV_BYTES_1_25 } else { WAV_BYTES })
+    }
+
+    /// PCM bytes, first lines cached of total, and the cached paths.
+    #[cfg(test)]
+    pub(crate) fn census(&self) -> (usize, (usize, usize), Vec<&str>) {
+        (self.bytes, self.first_lines, self.clips.keys().map(String::as_str).collect())
+    }
+
     pub(crate) fn add(&mut self, path: &str, wav: Vec<u8>, first_line: bool) {
         if self.clips.contains_key(path) {
             if first_line {
@@ -103,7 +139,7 @@ impl Cache {
             }
             return;
         }
-        if wav.len() > WAV_BYTES || (!first_line && self.bytes == PCM_BYTES) {
+        if wav.len() > self.wav_cap || (!first_line && self.bytes == PCM_BYTES) {
             return;
         }
         let started = std::time::Instant::now();
@@ -204,6 +240,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn raised_cap_admits_a_wav_between_one_and_one_and_a_quarter_mib() {
+        let mut bytes = Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(
+            &mut bytes,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 22050,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        // jbwk004.wav is 1,060,974 B: 44 B of header and 530,465 samples.
+        for i in 0..530_465_u32 {
+            writer.write_sample((i % 251) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let bytes = bytes.into_inner();
+        assert_eq!(bytes.len(), 1_060_974);
+        for (mut cache, admitted) in [(Cache::default(), false), (Cache::for_cap(false), false), (Cache::for_cap(true), true)] {
+            cache.add("jbwk004", bytes.clone(), true);
+            assert_eq!(cache.clips.contains_key("jbwk004"), admitted);
+            assert_eq!(cache.bytes, if admitted { 1_060_930 } else { 0 });
+        }
+        let mut over = bytes.clone();
+        over.resize(WAV_BYTES_1_25 + 1, 0);
+        let mut cache = Cache::for_cap(true);
+        cache.add("over", over, true);
+        assert!(cache.clips.is_empty(), "the raised cap still refuses a WAV over 1.25 MiB");
     }
 
     #[test]
