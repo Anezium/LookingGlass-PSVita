@@ -134,6 +134,13 @@ pub(super) fn covering_bounds(quads: &[Quad], fallback: (Vec3, Vec3)) -> (Vec3, 
     }
     (min, max)
 }
+/// Match the desktop's four-vertex chunks in the entire authored vertex array.
+fn authored_faces(distinct: &[u16]) -> impl Iterator<Item = [u16; 4]> + '_ {
+    distinct.windows(4).filter_map(|chunk| {
+        let first = chunk[0];
+        (first % 4 == 0 && chunk[3] == first + 3).then_some([first, chunk[1], chunk[2], chunk[3]])
+    })
+}
 /// Quads of one part just appended to a sprite pending: the distinct source vertices in
 /// authored order (a face's vertices sit contiguous in `base`, so ascending is authored
 /// order), chunked in fours exactly where the desktop whole-array chunks line up with
@@ -143,8 +150,7 @@ pub(super) fn record_part(quads: &mut Vec<Quad>, geometry: &Geometry, batch: usi
     let mut distinct = source.to_vec();
     distinct.sort_unstable();
     distinct.dedup();
-    for chunk in distinct.chunks_exact(4) {
-        let face = [chunk[0], chunk[1], chunk[2], chunk[3]];
+    for face in authored_faces(&distinct) {
         let ids = face.map(|src| geometry.packed(batch, src).expect("an appended source vertex"));
         quads.push(Quad {
             ids,
@@ -160,8 +166,7 @@ pub(super) fn quads_of_batch(b: &crate::render::Batch, locked: bool, first: usiz
     let mut distinct = source.to_vec();
     distinct.sort_unstable();
     distinct.dedup();
-    distinct.chunks_exact(4).map(|chunk| {
-        let face = [chunk[0], chunk[1], chunk[2], chunk[3]];
+    authored_faces(&distinct).map(|face| {
         let ids = face.map(|src| {
             (first + source.iter().position(|&s| s == src).expect("a packed source vertex")) as u16
         });
@@ -281,7 +286,7 @@ mod tests {
         assert_eq!(quads[1].corners, [positions[4], positions[5], positions[6], positions[7]]);
         assert!(quads.iter().all(|q| q.locked));
         // A trailing partial chunk keeps its load facing, as the desktop remainder does.
-        assert!(quads_of_batch(&b, false, 0, &[0, 1, 2]).is_empty());
+        assert!(quads_of_batch(&b, false, 0, &[1, 2, 3, 4]).is_empty());
     }
     /// The covering bounds hold every facing, locked and free, from many camera angles.
     #[test]

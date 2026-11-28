@@ -400,7 +400,7 @@ pub struct Config {
     /// desktop billboard math. A picture change (owner approval 2026-11-28). Batches whose
     /// deforms also move vertices, or that ride a model matrix, scripted motion or vertex
     /// animation, stay frozen and are counted at load. Default off.
-    #[serde(skip_serializing_if = "bool_is_false")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub autosprite_live: bool,
     pub cell_size: f32,
     /// Compare grouped actor/world alpha to the milestone-2 bridge.
@@ -639,8 +639,6 @@ impl<'de> serde::Deserialize<'de> for Config {
         Ok(c)
     }
 }
-fn bool_is_false(value: &bool) -> bool { !value }
-
 // A malformed name is local to its entry; serde still rejects unknown keys/types.
 fn deserialize_maps<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<String>, D::Error> {
     let mut maps = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
