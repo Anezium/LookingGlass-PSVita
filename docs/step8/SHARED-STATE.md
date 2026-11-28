@@ -325,6 +325,8 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/render/vita_renderer/gxm.rs:378` | `ARMED` | state | World/HUD submit, graphics setup or swap instrumentation. Keep GL dispatch, render targets and mutable view state on graphics owner. See line 386. |
 | `src/render/vita_renderer/gxm.rs:380` | `ERRORS` | state | World/HUD submit, graphics setup or swap instrumentation. Keep GL dispatch, render targets and mutable view state on graphics owner. See line 381. |
 | `src/render/vita_renderer/gxm.rs:384` | `CAPTURED` | state | World/HUD submit, graphics setup or swap instrumentation. Keep GL dispatch, render targets and mutable view state on graphics owner. See line 385. |
+| `src/render/vita_renderer/scale/gamma.rs:6` | `thread_local!` | cache | The render owner prepares the gamma material at startup or when applying settings. Presentation only reads the result. |
+| `src/render/vita_renderer/scale/gamma.rs:10` | `MATERIAL` | cache | The render thread owns the process-lived material and remembers a shader refusal for the rest of the session. |
 | `src/render/vita_renderer/scale.rs:17` | `TARGET` | state | World/HUD submit, graphics setup or swap instrumentation. Keep GL dispatch, render targets and mutable view state on graphics owner. See line 28. |
 | `src/render/vita_renderer/scale.rs:17` | `thread_local!` | state | TLS block. World/HUD submit, graphics setup or swap instrumentation. Keep GL dispatch, render targets and mutable view state on graphics owner. |
 | `src/render/vita_renderer/scale.rs:208` | `ONCE` | cache | World/HUD submit, graphics setup or swap instrumentation. Keep GL dispatch, render targets and mutable view state on graphics owner. See line 209. |
