@@ -209,7 +209,8 @@ const FOG_LIMIT: f32 = 8192.;
 ///
 /// The threshold is `0.35*w` in f32 from the live word. `dist` is mediump (`render.rs`): a
 /// backend that keeps half precision rounds it by 0.25 at 630. The margin `2 + s/4096` covers
-/// that and the f32 interpolation and `length` rounding, so a packet never sits on the cutoff.
+/// f32 interpolation and `length` rounding and allows for half-precision rounding near the
+/// cutoff up to about `w = 6000`. The Vita shader compiler uses f32 here.
 /// `s = |eye| + 0.35w` (largest coordinate) bounds every coordinate of a vertex that passes.
 /// The CPU test compares squared f32 distances: its own rounding is below 0.01 unit here.
 pub(super) fn fog_free(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
@@ -294,6 +295,11 @@ mod tests {
         assert_eq!(end("FxAppearance"), APPEARANCE + 4);
         assert_eq!(end("FxAppearance"), LIGHTS);
         assert_eq!(end("Lights"), LIGHTS + 64);
+        assert_eq!(end("FogEye"), EYE + 3);
+        assert_eq!(end("DistanceFog"), DISTANCE + 4);
+        assert_eq!(end("LiquidFog"), LIQUID_W + 1);
+        assert_eq!(end("FogA"), FOG_A_W + 1);
+        assert_eq!(end("FogB"), FOG_B_W + 1);
         // `lighting::packed` writes position+radius then colour+1 per light: the on flag is word 7.
         assert_eq!(crate::lighting::uniforms().len(), 16);
     }
@@ -457,7 +463,7 @@ mod tests {
         u
     }
     #[test]
-    fn the_fog_free_sources_are_the_unlit_lean_sources_without_the_fog_call() {
+    fn the_fog_free_sources_keep_the_call_and_replace_the_fog_body() {
         let full = crate::environment::fragment(crate::render::FRAGMENT);
         let varyings = |source: &str| source.split(';').map(str::trim).filter(|d| d.contains("varying "))
             .map(|d| d.rsplit(' ').next().unwrap().to_owned()).collect::<Vec<_>>();
@@ -523,7 +529,7 @@ mod tests {
         q.mesh.vertices[1].position.y = f32::NAN;
         assert!(!fog_free(&q, &fogged_payload(&q, Vec3::new(-100., 0., 0.), 1800.)), "non-finite vertex");
         q.mesh.vertices[1].position.y = 9000.;
-        assert!(!fog_free(&q, &fogged_payload(&q, Vec3::new(-100., 0., 0.), 1800.)), "unbounded vertex");
+        assert!(!fog_free(&q, &fogged_payload(&q, Vec3::new(-100., 0., 0.), 1800.)), "vertex beyond the fog radius");
         q.mesh.vertices.clear();
         assert!(!fog_free(&q, &fogged_payload(&q, Vec3::new(-100., 0., 0.), 1800.)), "no vertex");
         // `fogged` changes nothing when no term is on, or is not called: no bound is needed.

@@ -412,7 +412,7 @@ impl Route {
     }
 
     fn is_cutout_lean(self) -> bool {
-        matches!(self, Self::ActorLean | Self::ActorLeanLit)
+        matches!(self, Self::ActorLean | Self::ActorLeanLit | Self::ActorLeanFogFree)
     }
 }
 /// `actor_lean_shader`: the lean program that replaces the full program (`programs[0]`) or the
@@ -849,7 +849,7 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     fn draw(&mut self, p: &Pass, slot: usize, u: &[f32; UNIFORM_FLOATS], depth_write: bool,
         ant_dead: Option<bool>, zero_glow: bool, culled_to_zero: bool,
-        subset: Option<(Route, &zero_glow::Subset)>) -> Option<Route> {
+        previous_lean: Option<Route>, subset: Option<&zero_glow::Subset>) -> Option<Route> {
         let _owner = crate::render_tail::owner(if p.effect { crate::light_profile::RenderPhase::Fx } else { crate::light_profile::RenderPhase::Actors });
         let started = crate::render::vita_renderer::config().render_draw_timing
             .then(MetricInstant::now);
@@ -910,10 +910,10 @@ impl Gpu {
         if !p.effect && c.spike_log_ms > 0. {
             crate::spike_log::actor_routes(culled_to_zero, actual.is_lean_lit(), actual == Route::Full);
         }
-        let subset = subset.and_then(|(previous, subset)| (actual == previous).then_some(subset));
-        // `actor_fogfree_route` changes only the program that draws: counters, the glow
-        // decisions and the route returned for the next layer keep the lean route.
-        let drawn = if c.actor_fogfree_route && p.gpu_skin.is_none() && !zero_glow && subset.is_none() {
+        // A glow optimization needs the base layer's linked program. When the
+        // base used the twin, certify the glow payload for that twin as well.
+        let drawn = if c.actor_fogfree_route && p.gpu_skin.is_none()
+            && ((!zero_glow && subset.is_none()) || previous_lean == Some(Route::ActorLeanFogFree)) {
             #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
             let test_started = std::time::Instant::now();
             let drawn = fog_free_route(actual, [lean[4], lean[5]], || actor_lean::fog_free(p, u));
@@ -924,6 +924,9 @@ impl Gpu {
             }
             drawn
         } else { actual };
+        let same_lean_program = previous_lean == Some(drawn);
+        let subset = subset.filter(|_| same_lean_program);
+        let zero_glow = zero_glow && (!c.actor_fogfree_route || same_lean_program);
         if drawn != actual { count("vita_actor_lean_fog_free_draws", 1); }
         #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
         actor_lean::census(p, u, depth_write, drawn, culled_to_zero);
@@ -987,7 +990,6 @@ impl Gpu {
         let ctx = unsafe { get_internal_gl() }.quad_context;
         let c = crate::render::vita_renderer::config();
         let b = &self.buffers[slot].bindings;
-        let subset = subset.filter(|_| program.is_cutout_lean());
         let (index, index_count) = subset.map_or((b.index_buffer, p.geometry().indices.len() as i32),
             |subset| subset.draw_count(b.index_buffer));
         let apply = if c.fx_submit_state_cache {
@@ -1112,7 +1114,7 @@ impl Gpu {
                 apply[0],apply[1],traffic.calls,traffic.bytes,started.map_or(0,|t|t.elapsed().as_nanos()));
         }
         if let Some(started) = started { metrics.cpu_ns += started.elapsed().as_nanos() as u64; }
-        program.is_cutout_lean().then_some(program)
+        drawn.is_cutout_lean().then_some(drawn)
     }
 }
 fn ring_slot(slot: usize, frame: usize, phase: usize, safe: bool) -> usize {
@@ -1963,10 +1965,9 @@ pub(crate) fn finish_world(
                 if base_group != group || *base_pass != 0 { return None; }
                 zero_glow::subset(&groups[*base_group].passes[*base_pass], base_uniforms, p, u,
                     base_slot == b, groups[id].glow_cpu_bounded, previous.is_lean_lit())
-                    .map(|subset| (previous, subset))
             });
             previous_lean = gpu.draw(p, *b, u, !groups[id].transparent, groups[id].ant_dead,
-                zero_glow, *culled_to_zero, subset);
+                zero_glow, *culled_to_zero, previous_lean, subset);
         }
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         if crate::character::skinning::census::active() && groups[id].passes.iter().any(|p|!p.effect) {
