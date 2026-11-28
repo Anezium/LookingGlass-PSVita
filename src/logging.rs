@@ -16,8 +16,12 @@ impl<S: Sink> Logger<S> {
         // format fragments or a separate newline to either sink.
         let mut record = fmt::format(args);
         record.push('\n');
+        self.record(stream, record.as_bytes())
+    }
+
+    fn record(&self, stream: Stream, record: &[u8]) -> io::Result<()> {
         let mut sink = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        sink.line(stream, record.as_bytes())
+        sink.line(stream, record)
     }
 }
 
@@ -49,6 +53,11 @@ pub(crate) fn line(stream: Stream, args: fmt::Arguments<'_>) {
     if let Err(error) = LOGGER.line(stream, args) {
         panic!("failed writing engine log: {error}");
     }
+}
+
+/// Writes an already formatted record through the shared sink, including during a panic.
+pub(crate) fn write_record(stream: Stream, record: &[u8]) {
+    let _ = LOGGER.record(stream, record);
 }
 
 // Host command output keeps its test harness capture behavior. The host tests

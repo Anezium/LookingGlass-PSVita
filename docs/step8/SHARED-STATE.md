@@ -264,7 +264,7 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/loading_screen.rs:42` | `thread_local!` | state | TLS block. No. Test fixture or override. Keep scoped to its test thread or harness. |
 | `src/loading_screen.rs:49` | `TEST_NO_SWAP` | state | No. Test fixture or override. Keep scoped to its test thread or harness. See line 51. |
 | `src/loading_screen.rs:49` | `thread_local!` | state | TLS block. Death retry or chapter transition enters loading and recovery. Fence all control mutations and yields on owner. |
-| `src/logging.rs:44` | `LOGGER` | state | Engine output uses the stdio logger. Buffer worker and head messages in step order for owner emission. See line 49. |
+| `src/logging.rs:48` | `LOGGER` | state | Engine output uses the stdio logger. Buffer worker and head messages in step order for owner emission. See line 49. |
 | `src/loot_art.rs:185` | `thread_local!` | cache | TLS block. Level art load, draw or HUD lookup uses graphics resources. Keep creation, upload and release on the owner. |
 | `src/loot_art.rs:187` | `MATERIALS` | cache | Level art load, draw or HUD lookup uses graphics resources. Keep creation, upload and release on the owner. See line 190. |
 | `src/main.rs:207` | `SCE_USER_MAIN_THREAD_STACK_SIZE` | state | No. Vita loader reads process stack/heap constants at startup. Leave at process scope. |
@@ -651,8 +651,8 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/spike_log.rs:94` | `OUT` | diagnostic | Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. See line 240. |
 | `src/spike_log.rs:94` | `thread_local!` | diagnostic | TLS block. Step movement, NPC, camera or presentation instrumentation. Stamp samples on their measuring thread and join at the owner tail. |
 | `src/spike_log.rs:139` | `thread_local!` | diagnostic | TLS block. `play_log_buffer` deferred diagnostic lines. Written and flushed on the thread that formats them; no cross-thread access. |
-| `src/spike_log.rs:156` | `PLAY` | diagnostic | `play_log_buffer` lines formatted on the game thread during an open frame, written at that thread's spike flush points, on buffer pressure, or by the panic hook. |
-| `src/spike_log.rs:158` | `PLAY_OPEN` | diagnostic | Game-thread flag set by `begin_frame` and cleared by `end_play` with `play_log_buffer` on; other threads read their own false copy and print at once. |
+| `src/spike_log.rs:145` | `PLAY` | diagnostic | `play_log_buffer` lines formatted on the game thread during an open frame, written at that thread's spike flush points, on buffer pressure, or by the panic hook. |
+| `src/spike_log.rs:147` | `PLAY_OPEN` | diagnostic | Game-thread flag set by `begin_frame` and cleared by `end_play` with `play_log_buffer` on; other threads read their own false copy and print at once. |
 | `src/startup.rs:6` | `STATE` | state | Death retry or chapter transition enters loading and recovery. Fence all control mutations and yields on owner. See line 24. |
 | `src/startup.rs:6` | `thread_local!` | state | TLS block. Death retry or chapter transition enters loading and recovery. Fence all control mutations and yields on owner. |
 | `src/story/registry.rs:59` | `LEGACY` | state | Campaign progression, story dispatch or save/restore reads authored visit data. Share immutable tables. See line 345. |

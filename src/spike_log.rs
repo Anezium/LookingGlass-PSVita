@@ -126,19 +126,8 @@ impl Out {
 
 }
 
-/// The stream a deferred diagnostic line belongs to.
-#[derive(Clone, Copy)]
-pub(crate) enum Stream { Out, Err }
-impl Stream {
-    fn write(self, line: &[u8]) {
-        use std::io::{self, Write};
-        // Best effort: this path also runs inside the panic hook.
-        let _ = match self {
-            Self::Out => io::stdout().write_all(line),
-            Self::Err => io::stderr().write_all(line),
-        };
-    }
-}
+pub(crate) use crate::logging::Stream;
+use crate::logging::write_record;
 
 /// Each deferred record has a two-byte body length, a stream tag, and the formatted bytes.
 #[derive(Default)]
@@ -217,7 +206,7 @@ pub(crate) fn install_play_panic_hook() {
         let _ = PLAY.try_with(|play| {
             if let Ok(mut play) = play.try_borrow_mut() {
                 let len = play.text.len();
-                play.write_prefix(len, &mut Stream::write);
+                play.write_prefix(len, &mut write_record);
             }
         });
         previous(info);
@@ -235,7 +224,7 @@ fn play_buffer() -> bool {
 /// is open on this thread outside a load phase, at the next flush point.
 pub(crate) fn play_line(stream: Stream, args: std::fmt::Arguments<'_>) {
     if play_buffer() && PLAY_OPEN.with(Cell::get) && !crate::startup::in_phase() {
-        PLAY.with(|p| p.borrow_mut().push(stream, args, Stream::write));
+        PLAY.with(|p| p.borrow_mut().push(stream, args, write_record));
         return;
     }
     match stream {
@@ -250,7 +239,7 @@ fn flush_play(at: &str) {
         let len = p.text.len();
         if len == 0 && p.early_writes == 0 { return; }
         let start = Instant::now();
-        let (lines, bytes) = p.write_prefix(len, &mut Stream::write);
+        let (lines, bytes) = p.write_prefix(len, &mut write_record);
         eprintln!("[lg/play-log] flushed at={at} lines={lines} early_writes={} bytes={bytes} ms={:.1} early_lines={} early_bytes={}",
             p.early_writes, start.elapsed().as_secs_f64() * 1000., p.early_lines, p.early_bytes);
         (p.early_writes, p.early_lines, p.early_bytes) = (0, 0, 0);
