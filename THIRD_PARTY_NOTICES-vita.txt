@@ -98,7 +98,7 @@ The PS Vita port changed the files below (A added, M modified, D deleted). Each 
   M src/quad_gl.rs
   M src/texture.rs
 
-miniquad 0.4.8: fork https://github.com/Anezium/miniquad?rev=b753b73c6030e6a39943342587d7efe97aef300d at b753b73
+miniquad 0.4.8: fork https://github.com/Anezium/miniquad?rev=d6924db096705ca108749244c872463367ab4cc2 at d6924db
 Based on not-fl3/miniquad 0.4.8 (commit cc6f8d1). Declared license: MIT OR Apache-2.0.
 The PS Vita port changed the files below (A added, M modified, D deleted). Each changed file is in the fork at the revision above; its history records every change.
   A VITA-CHANGES.md
@@ -107,6 +107,7 @@ The PS Vita port changed the files below (A added, M modified, D deleted). Each 
   M src/graphics/gl/cache.rs
   M src/lib.rs
   M src/native.rs
+  M src/native/macos.rs
   A src/native/vita/gl_loader.rs
   A src/native/vita/input.rs
   A src/native/vita/mod.rs
@@ -11855,7 +11856,7 @@ For more information, please refer to <http://unlicense.org/>
 
 miniquad-0.4.8
 Declared license: MIT OR Apache-2.0
-Source: https://github.com/Anezium/miniquad?rev=b753b73c6030e6a39943342587d7efe97aef300d
+Source: https://github.com/Anezium/miniquad?rev=d6924db096705ca108749244c872463367ab4cc2
 
 --- licenses/miniquad-0.4.8/LICENSE-APACHE ---
                               Apache License
