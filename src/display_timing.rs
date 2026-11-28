@@ -7,19 +7,17 @@
 //! `GATE_TIMEOUT_US`. The gate fails open, off for the rest of the run, on a vsync interval
 //! other than 1 (no wait, so no signal), any kernel or GXM error, counts out of step, or three
 //! timeouts in a row.
+use crate::display_gate::{wait_for_callbacks, Timeouts};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::{Acquire, Relaxed, Release}};
 
 const SLOT_COUNT: usize = 16;
 const NEXT_FRAME: i32 = 1;
 
-const GATE_TIMEOUT_US: u32 = 100_000;
-const GATE_TIMEOUTS_TO_DISABLE: u32 = 3;
 const GATE_STATE_ON: u32 = 0x100;
 const GATE_STATE_TIMEOUT: u32 = 0x200;
-const SCE_KERNEL_ERROR_WAIT_TIMEOUT: i32 = 0x8002_8005_u32 as i32;
 const SCE_KERNEL_ERROR_SEMA_OVF: i32 = 0x8002_8103_u32 as i32;
 
-/// Why the gate turned itself off; 0 while it is on or was never on.
+/// Why the gate turned itself off. Reason codes fit below GATE_ON.
 #[derive(Clone, Copy)]
 #[repr(u32)]
 enum Off {
@@ -80,9 +78,11 @@ static STAMPS: [Slot; SLOT_COUNT] = [const {
     }
 }; SLOT_COUNT];
 
-static GATE: AtomicBool = AtomicBool::new(false);
-static GATE_OFF: AtomicU32 = AtomicU32::new(0);
-static GATE_OFF_LOGGED: AtomicBool = AtomicBool::new(false);
+// Zero means unused. A bare Off reason has already been logged. Only active and
+// unlogged states are >= GATE_ON, so depth 2 can bypass the gate with one load.
+const GATE_ON: u32 = 0x100;
+const GATE_OFF_UNLOGGED: u32 = 0x200;
+static GATE: AtomicU32 = AtomicU32::new(0);
 static GATE_SEMA: AtomicI32 = AtomicI32::new(-1);
 static DISPLAY_THREAD: AtomicI32 = AtomicI32::new(0);
 /// Entries offered to the real AddEntry while the gate is on, the current one included, and
@@ -90,8 +90,7 @@ static DISPLAY_THREAD: AtomicI32 = AtomicI32::new(0);
 static GATE_SUBMITTED: AtomicU32 = AtomicU32::new(0);
 static COMPLETED: AtomicU32 = AtomicU32::new(0);
 static WAITS: AtomicU32 = AtomicU32::new(0);
-static TIMEOUTS: AtomicU32 = AtomicU32::new(0);
-static TIMEOUT_RUN: AtomicU32 = AtomicU32::new(0);
+static TIMEOUTS: Timeouts = Timeouts::new();
 static MAX_WAIT_US: AtomicU32 = AtomicU32::new(0);
 
 type Void = core::ffi::c_void;
@@ -117,23 +116,29 @@ pub(crate) fn enable_gate() -> i32 {
     let id = unsafe { sceKernelCreateSema(b"lg-cap-queue\0".as_ptr(), 0, 0, 1, core::ptr::null()) };
     if id >= 0 {
         GATE_SEMA.store(id, Relaxed);
-        GATE.store(true, Release);
+        GATE.store(GATE_ON, Release);
     } else {
-        disable(Off::Sema);
+        // No callbacks can run yet. Publish the failure even though the gate never came on.
+        GATE.store(GATE_OFF_UNLOGGED | Off::Sema as u32, Release);
+        log_off();
     }
     id
 }
 
 /// Fail open: the queue keeps vitaGL's two pending entries from here on. Any thread.
 fn disable(reason: Off) {
-    GATE.store(false, Release);
-    let _ = GATE_OFF.compare_exchange(0, reason as u32, Relaxed, Relaxed);
+    // Publish the first reason in the same transition that turns the gate off.
+    let _ = GATE.compare_exchange(GATE_ON, GATE_OFF_UNLOGGED | reason as u32, Release, Relaxed);
 }
 
 /// The first time the swapping thread sees the gate off, it logs why (never the display thread).
 fn log_off() {
-    if let Some(reason) = off_name(GATE_OFF.load(Relaxed)) {
-        if !GATE_OFF_LOGGED.swap(true, Relaxed) {
+    let gate = GATE.load(Acquire);
+    if gate & GATE_OFF_UNLOGGED != 0 {
+        let code = gate & !GATE_OFF_UNLOGGED;
+        // Only the swapping thread logs, and disable() can only replace GATE_ON.
+        GATE.store(code, Release);
+        if let Some(reason) = off_name(code) {
             println!("[lg/display] cap_queue_gate off reason={reason} submitted={} completed={}",
                 GATE_SUBMITTED.load(Relaxed), COMPLETED.load(Relaxed));
         }
@@ -141,12 +146,13 @@ fn log_off() {
 }
 
 pub(crate) fn gate_stats() -> Option<GateStats> {
-    let off = off_name(GATE_OFF.load(Relaxed));
-    (GATE.load(Acquire) || off.is_some()).then(|| GateStats {
+    let gate = GATE.load(Acquire);
+    let off = off_name(gate & !GATE_OFF_UNLOGGED);
+    (gate != 0).then(|| GateStats {
         submitted: GATE_SUBMITTED.load(Relaxed),
         completed: COMPLETED.load(Relaxed),
         waits: WAITS.load(Relaxed),
-        timeouts: TIMEOUTS.load(Relaxed),
+        timeouts: TIMEOUTS.total(),
         max_wait_us: MAX_WAIT_US.load(Relaxed),
         off,
     })
@@ -155,7 +161,7 @@ pub(crate) fn gate_stats() -> Option<GateStats> {
 /// From the capped vblank wait wrapper, after the real wait: the display callback is returning.
 #[inline]
 pub(crate) fn callback_returned() {
-    if !GATE.load(Relaxed) || unsafe { sceKernelGetThreadId() } != DISPLAY_THREAD.load(Relaxed) {
+    if GATE.load(Relaxed) != GATE_ON || unsafe { sceKernelGetThreadId() } != DISPLAY_THREAD.load(Relaxed) {
         return;
     }
     // Count first, then signal: a waiter woken by this signal, or by its own timeout, sees the count.
@@ -181,6 +187,7 @@ unsafe fn gate_wait() -> (u32, u32, bool) {
     }
     let before = pending(submitted);
     if before == 0 {
+        TIMEOUTS.record(false);
         return (0, 0, false);
     }
     if before > 2 {
@@ -190,32 +197,19 @@ unsafe fn gate_wait() -> (u32, u32, bool) {
     }
     let start = now();
     let sema = GATE_SEMA.load(Relaxed);
-    let timed_out = loop {
-        // Re-check before every timeout decision and after every wakeup, real or spare.
-        if pending(submitted) == 0 {
-            break false;
-        }
-        let elapsed = now().wrapping_sub(start);
-        if elapsed >= GATE_TIMEOUT_US {
-            break true;
-        }
-        let mut left = GATE_TIMEOUT_US - elapsed;
-        let result = sceKernelWaitSema(sema, 1, &mut left);
-        if result < 0 && result != SCE_KERNEL_ERROR_WAIT_TIMEOUT {
-            disable(Off::Wait);
-            break pending(submitted) != 0;
-        }
-    };
+    let timed_out = wait_for_callbacks(
+        || pending(submitted),
+        || now().wrapping_sub(start),
+        |mut left| sceKernelWaitSema(sema, 1, &mut left),
+    ).unwrap_or_else(|_| {
+        disable(Off::Wait);
+        false
+    });
     let waited = now().wrapping_sub(start);
     WAITS.fetch_add(1, Relaxed);
     MAX_WAIT_US.fetch_max(waited, Relaxed);
-    if timed_out {
-        TIMEOUTS.fetch_add(1, Relaxed);
-        if TIMEOUT_RUN.fetch_add(1, Relaxed) + 1 >= GATE_TIMEOUTS_TO_DISABLE {
-            disable(Off::Timeouts);
-        }
-    } else {
-        TIMEOUT_RUN.store(0, Relaxed);
+    if TIMEOUTS.record(timed_out) {
+        disable(Off::Timeouts);
     }
     (waited, before, timed_out)
 }
@@ -282,10 +276,11 @@ pub unsafe extern "C" fn __wrap_sceGxmDisplayQueueAddEntry(
 ) -> i32 {
     let enabled = ENABLED.load(Acquire);
     // The gate keys on CAP_30 and cap_queue_depth alone (enable_gate), not on the timing trace.
-    let gated = GATE.load(Acquire);
-    if !enabled && !gated {
+    let gate = GATE.load(Acquire);
+    if !enabled && gate < GATE_ON {
         return __real_sceGxmDisplayQueueAddEntry(old, new, data);
     }
+    let gated = gate == GATE_ON;
     // Gate before the real AddEntry, which then finds at most one entry pending.
     let (wait_us, pending, timed_out) = if gated { gate_wait() } else { (0, 0, false) };
     // Include swaps outside the viewer's measurement window, including loading.
@@ -317,7 +312,7 @@ pub unsafe extern "C" fn __wrap_sceGxmDisplayQueueAddEntry(
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_sceDisplaySetFrameBuf(buf: *const Void, sync: i32) -> i32 {
     let result = __real_sceDisplaySetFrameBuf(buf, sync);
-    if sync == NEXT_FRAME && GATE.load(Relaxed) {
+    if sync == NEXT_FRAME && GATE.load(Relaxed) == GATE_ON {
         DISPLAY_THREAD.store(sceKernelGetThreadId(), Relaxed);
     }
     // vitaGL calls NEXTFRAME once per display queue entry, before waiting.

@@ -176,16 +176,13 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/display_timing.rs:74` | `SUBMITTED` | diagnostic | Queue submissions assign FIFO tickets before entering GXM, including unmeasured swaps. |
 | `src/display_timing.rs:75` | `DISPLAYED` | diagnostic | The display callback advances one FIFO ticket per NEXTFRAME handoff. |
 | `src/display_timing.rs:76` | `STAMPS` | diagnostic | Owner arms and frees slots. The display callback publishes each matching timestamp with release ordering. |
-| `src/display_timing.rs:83` | `GATE` | diagnostic | Owner enables the optional `cap_queue_depth: 1` queue gate before vitaGL starts; any thread clears it to fail open. Both queue hooks and the vblank wrapper acquire it. Simulation never accesses it. |
-| `src/display_timing.rs:84` | `GATE_OFF` | diagnostic | The first fail-open reason, set once by compare-exchange. Read for the off log line and the teardown report. |
-| `src/display_timing.rs:85` | `GATE_OFF_LOGGED` | diagnostic | The swapping thread prints the off reason once. |
+| `src/display_timing.rs:85` | `GATE` | diagnostic | Owner enables the optional `cap_queue_depth: 1` gate before vitaGL starts. A single atomic transition publishes the first fail-open reason, and the swapping thread marks it logged. The queue hooks and vblank wrapper read the state; simulation never accesses it. |
 | `src/display_timing.rs:86` | `GATE_SEMA` | diagnostic | Owner stores the gate semaphore before vitaGL starts. The display callback signals it, the swapping thread waits on it with a bounded timeout. |
 | `src/display_timing.rs:87` | `DISPLAY_THREAD` | diagnostic | The display callback stores its thread id at each NEXTFRAME handoff so the vblank wrapper counts only callback returns. |
 | `src/display_timing.rs:90` | `GATE_SUBMITTED` | diagnostic | The swapping thread numbers each entry it offers to GXM while the gate is on, before the real AddEntry. |
 | `src/display_timing.rs:91` | `COMPLETED` | diagnostic | The display callback counts its returns with release ordering before it signals; the gate passes once it reaches `GATE_SUBMITTED - 1`. |
 | `src/display_timing.rs:92` | `WAITS` | counter | Gate waits on the swapping thread, reported at teardown. |
-| `src/display_timing.rs:93` | `TIMEOUTS` | counter | Gate waits that reached the 100 ms bound, reported at teardown. |
-| `src/display_timing.rs:94` | `TIMEOUT_RUN` | counter | Consecutive gate timeouts on the swapping thread; three turn the gate off. |
+| `src/display_timing.rs:93` | `TIMEOUTS` | counter | Total and consecutive gate waits that reached the 100 ms bound. The swapping thread updates both; three consecutive timeouts turn the gate off. The total is reported at teardown. |
 | `src/display_timing.rs:95` | `MAX_WAIT_US` | counter | Longest gate wait on the swapping thread, reported at teardown. |
 | `src/display_timing.rs:100` | `vsync_interval` | diagnostic | Foreign vitaGL global (`vgl.c:112`), written by `vglWaitVblankStart` on the game thread. The gate reads it before each gated swap and fails open unless it is 1. |
 | `src/hud.rs:544` | `ENABLED` | cache | Owner HUD tracing reads the cached host switch. Share its immutable value. See line 545. |

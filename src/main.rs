@@ -9,6 +9,8 @@ mod allocation_census;
 mod r13_survey;
 mod tls_count;
 mod gpu_timing;
+#[cfg(any(target_os = "vita", test))]
+mod display_gate;
 #[cfg(target_os = "vita")]
 mod display_timing;
 mod pass_clock;
