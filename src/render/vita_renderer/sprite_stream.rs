@@ -291,7 +291,7 @@ mod tests {
     /// The covering bounds hold every facing, locked and free, from many camera angles.
     #[test]
     fn covering_bounds_hold_every_facing() {
-        let quad = Quad {
+        let mut quad = Quad {
             ids: [0, 1, 2, 3],
             corners: [vec3(-2372., 2586., -470.), vec3(-2372., 2586., -400.),
                 vec3(-2372., 2658., -400.), vec3(-2372., 2658., -470.)],
@@ -299,7 +299,6 @@ mod tests {
             uvs: [vec2(1.99, 1.99), vec2(1.99, 0.99), vec2(0.99, 0.99), vec2(0.99, 1.99)],
         };
         for locked in [true, false] {
-            let mut quad = quad;
             quad.locked = locked;
             let (min, max) = covering_bounds(std::slice::from_ref(&quad), (Vec3::ZERO, Vec3::ZERO));
             for step in 0..24 {
