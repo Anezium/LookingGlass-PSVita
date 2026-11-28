@@ -23,8 +23,8 @@
 //! `actor_discard_free_shader` or `actor_cutout_discard_free` already send to the discard-free
 //! program, so it never widens the set of packets drawn without `discard`.
 //!
-//! `actor_fogfree_route` adds a twin of each unlit program without the `fogged` call (see
-//! `fog_free`).
+//! `actor_fogfree_route` adds a twin of each unlit program whose `fogged` returns its argument
+//! (see `fog_free_source` and `fog_free`).
 use super::*;
 
 pub(super) const NAMES: [&str; 6] = [
@@ -83,15 +83,17 @@ pub(super) fn sources() -> [String; 2] {
 pub(super) fn lit_source(discard_free: bool) -> String {
     crate::lighting::fragment_slots(&fragment(discard_free, true), 2)
 }
-/// `actor_fogfree_route`: an unlit lean source without its one fog call. The fog block
-/// becomes the bare `worldPosition` declaration, so the interpolants match the full
-/// program's. Every other line stays byte for byte.
+/// `actor_fogfree_route`: an unlit lean source whose fog block is only the `worldPosition`
+/// declaration (the interpolants match the full program's) and a `fogged` that returns its
+/// argument, as `simple_fog` does. `main` stays byte for byte, guarded call included: removing
+/// the call changed the host GPU's rounding on a few pixels (wchess1, 1/255) even with every
+/// fog term off, while this form drew the same pixels.
 pub(super) fn fog_free_source(discard_free: bool) -> String {
     let lean = fragment(discard_free, false);
-    let call = "\n if(FogMode>=0.0)rgb=fogged(rgb,FogMode);\n";
-    assert_eq!(lean.matches(call).count(), 1, "lean fog call");
-    lean.replacen(call, "\n", 1).replacen("// FOG", "varying highp vec3 worldPosition;", 1)
+    assert_eq!(lean.matches("// FOG").count(), 1, "lean fog block");
+    lean.replacen("// FOG", FOG_FREE_BLOCK, 1)
 }
+const FOG_FREE_BLOCK: &str = "varying highp vec3 worldPosition;\nvec3 fogged(vec3 rgb,float additive){return rgb;}";
 /// Every line the lean source leaves out is a no-op under payload `u`. Each test is the
 /// negation of the shader's own guard, so NaN fails the guard here as it does there.
 pub(super) fn admitted(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
@@ -463,11 +465,12 @@ mod tests {
             let lean = fragment(discard_free, false);
             let free = fog_free_source(discard_free);
             let gone: Vec<&str> = lean.lines().filter(|l| !free.lines().any(|kept| kept == *l)).collect();
-            assert_eq!(gone, ["// FOG", " if(FogMode>=0.0)rgb=fogged(rgb,FogMode);"]);
+            assert_eq!(gone, ["// FOG"]);
             let added: Vec<&str> = free.lines().filter(|l| !lean.lines().any(|kept| kept == *l)).collect();
-            assert_eq!(added, ["varying highp vec3 worldPosition;"]);
-            assert_eq!(free.lines().count() + 1, lean.lines().count());
-            for absent in ["fogged", "FogEye", "DistanceFog", "LiquidFog", "FogA", "FogB"] {
+            assert_eq!(added, ["varying highp vec3 worldPosition;", "vec3 fogged(vec3 rgb,float additive){return rgb;}"]);
+            assert_eq!(free.lines().count(), lean.lines().count() + 1);
+            assert_eq!(free.matches(" if(FogMode>=0.0)rgb=fogged(rgb,FogMode);").count(), 1, "the call stays");
+            for absent in ["FogEye", "DistanceFog", "LiquidFog", "FogA", "FogB", "length("] {
                 assert!(!free.contains(absent), "{absent}");
             }
             assert_eq!(crate::environment::fragment(&free), free, "no fog block left to expand");

@@ -401,7 +401,7 @@ pub(crate) enum Route {
     ActorLeanOpaque,
     ActorLeanLit,
     ActorLeanLitOpaque,
-    /// `actor_fogfree_route`: the twins of `ActorLean` and `ActorLeanOpaque` without the fog call.
+    /// `actor_fogfree_route`: the twins of `ActorLean` and `ActorLeanOpaque` with an identity `fogged`.
     ActorLeanFogFree,
     ActorLeanOpaqueFogFree,
 }

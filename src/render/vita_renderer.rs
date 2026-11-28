@@ -112,7 +112,7 @@ pub struct Config {
     pub actor_light_cull: bool,
     /// Use lean actor programs with the first two dynamic-light slots. Default off.
     pub actor_lean_lights: bool,
-    /// Draw an unlit lean actor packet with a twin program that has no fog call when a
+    /// Draw an unlit lean actor packet with a twin program whose fog is the identity when a
     /// conservative bound proves its fog factor is exactly zero. Needs `actor_lean_shader`. Default off.
     pub actor_fogfree_route: bool,
     /// Skip fully certified zero-RGB actor glow following opaque, depth-writing skin.
