@@ -1504,19 +1504,15 @@ impl Pvs {
     }
     fn compile(count: usize, list: impl Fn(Option<usize>) -> Lists) -> Self {
         let unknown = Arc::new(list(None));
-        let mut intern = BTreeMap::new();
+        // Interned by the shared list itself, so each distinct list is held once, not also as a key.
+        let mut intern: std::collections::BTreeSet<Arc<Lists>> = std::collections::BTreeSet::new();
         let clusters = (0..count)
             .map(|c| {
                 let l = list(Some(c));
-                intern
-                    .entry(l)
-                    .or_insert_with_key(|l| {
-                        Arc::new(Lists {
-                            opaque: l.opaque.clone(),
-                            alpha: l.alpha.clone(),
-                        })
-                    })
-                    .clone()
+                if let Some(shared) = intern.get(&l) { return shared.clone(); }
+                let shared = Arc::new(Lists { opaque: l.opaque.clone(), alpha: l.alpha.clone() });
+                intern.insert(shared.clone());
+                shared
             })
             .collect();
         Self { clusters, unknown }
@@ -1687,6 +1683,12 @@ impl Drop for ConstructionResources {
         for id in self.shaders.drain(..) { ctx.delete_shader(id); }
     }
 }
+/// A part cell as a map key, equal exactly when the cells' `{:?}` texts are equal: the bits
+/// tell -0.0 from 0.0 as the text does, and every NaN is one key as every NaN prints `NaN`.
+fn cell_key(cell: Vec3) -> [u32; 3] {
+    let bits = |v: f32| if v.is_nan() { f32::NAN.to_bits() } else { v.to_bits() };
+    [bits(cell.x), bits(cell.y), bits(cell.z)]
+}
 fn diagnostic_batch_skip(b: &super::Batch, scene: &Scene, c: &Config) -> bool {
     if c.diag_skip_alpha_world && b.transparent() { return true; }
     if !c.diag_skip_water && !c.diag_skip_decals { return false; }
@@ -1697,14 +1699,37 @@ fn diagnostic_batch_skip(b: &super::Batch, scene: &Scene, c: &Config) -> bool {
     })
 }
 impl Renderer {
-    pub(super) fn new(scene: &Scene, corpus: &str) -> Result<Self> {
+    /// `release[i]`: batch `i` is dropped after construction (`authored_sky::kept`), so its CPU
+    /// geometry is freed here as soon as its last reader is done. Only placement changes.
+    pub(super) fn new(scene: &mut Scene, corpus: &str, release: &[bool]) -> Result<Self> {
         crate::render_tail::install();
         let started=std::time::Instant::now();
         let c = config();
+        assert_eq!(release.len(), scene.batches.len());
+        // Buffer payload accounting, not allocator/driver/process high-water RAM. Taken before
+        // any release, so the reported bound keeps its meaning.
+        let old_scene_geometry_capacity_bytes: usize = scene.batches.iter().chain(&scene.sky_props).map(|b| {
+            (b.base.capacity() + b.mesh.vertices.capacity()) * std::mem::size_of::<Vertex>()
+            + (b.full_indices.capacity() + b.mesh.indices.capacity()) * 2
+            + b.normals.capacity() * std::mem::size_of::<Vec3>()
+            + b.detail.iter().map(|d| d.indices.capacity() * 2).sum::<usize>()
+            + b.animation.as_ref().map_or(0, |a| a.positions.iter().map(|f| f.capacity() * std::mem::size_of::<Vec3>()).sum::<usize>())
+        }).sum();
+        // Nothing below reads the legacy draw copy. The source arrays of a static batch stay
+        // until the sky room has packed it; the rest go once gathered.
+        for (b, &release) in scene.batches.iter_mut().zip(release) {
+            if release { b.release_draw_geometry(); }
+        }
+        let room = sky_room::reads_room_batches(scene);
         let mut pending: Vec<Pending> = Vec::new();
         let mut parameter_keys = BTreeMap::new();
         let mut parameter_recipes = Vec::new();
-        let mut keys: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        // Part key: (parameter, rank, cell). The parameter id stands for its signature string
+        // one to one, and the cell's bits for its `{:?}` text (all NaNs print alike).
+        let mut keys: BTreeMap<(usize, usize, [u32; 3]), Vec<usize>> = BTreeMap::new();
+        // Pending parts that took vertices from the current batch; their remaps are cleared
+        // after it, since a later batch never looks up this batch's vertices.
+        let mut touched: Vec<usize> = Vec::new();
         let mut recipes_ms=0.;let mut chunks_ms=0.;let mut source_chunks=0;
         let mut dropped_layers = 0;
         let mut diagnostic_batches = 0;
@@ -1713,7 +1738,8 @@ impl Renderer {
         let mut frozen_deforms = 0;
         let mut frozen_models = 0;
         let (mut wave_normal_layers, mut wave_normal_triangles, mut wave_normal_skipped) = (0, 0, 0);
-        for (bi, b) in scene.batches.iter().enumerate() {
+        for bi in 0..scene.batches.len() {
+            let b = &scene.batches[bi];
             if diagnostic_batch_skip(b, scene, c) { diagnostic_batches+=1; continue; }
             if b.sky {
                 continue;
@@ -1802,7 +1828,7 @@ impl Renderer {
                 );
                 // Match the existing immutable geometry merge signature. The
                 // cell/rank split affects ordering and visibility, not uniforms.
-                let parameter = *parameter_keys.entry(signature.clone()).or_insert_with(|| {
+                let parameter = *parameter_keys.entry(signature).or_insert_with(|| {
                     let id = parameter_recipes.len();
                     parameter_recipes.push(recipe.clone());
                     id
@@ -1820,7 +1846,7 @@ impl Renderer {
                 let mut chunk = 0u32;
                 for (face, range, center) in parts {
                     let cell = (center / c.cell_size).floor();
-                    let key = format!("{signature}|{}|{cell:?}", recipe.rank);
+                    let key = (parameter, recipe.rank, cell_key(cell));
                     let source = &b.full_indices[range];
                     let liquid = face.map_or(batch_liquid, |face| {
                         scene.map.shaders[scene.map.surfaces[face].shader].contents & crate::collision::LIQUID_MASK != 0
@@ -1828,7 +1854,7 @@ impl Renderer {
                     // Split unusually large parts on triangle boundaries as well as between faces.
                     for source in source.chunks(59997) {
                         source_chunks+=1;
-                        let candidates = keys.entry(key.clone()).or_default();
+                        let candidates = keys.entry(key).or_default();
                         let id = candidates
                             .iter()
                             .copied()
@@ -1846,29 +1872,33 @@ impl Renderer {
                                 id
                             });
                         pending[id].geometry.append(bi, b, source, face);
+                        touched.push(id);
                         if c.water_stage_merge != "off" { pending[id].origin.push((bi as u32, chunk)); }
                         chunk += 1;
                     }
                 }
                 chunks_ms+=chunks_started.elapsed().as_secs_f64()*1000.;
             }
+            for id in touched.drain(..) { pending[id].geometry.remap.clear(); }
+            if release[bi] && !(room && b.model.is_none()) { scene.batches[bi].release_source_geometry(); }
         }
+        drop(keys);
+        drop(parameter_keys);
         ensure!(
             !pending.is_empty(),
             "retained world has no drawable geometry"
         );
         if c.diag_skip_water || c.diag_skip_decals || c.diag_skip_alpha_world { println!("[lg/draw-diag] omitted_world_batches={diagnostic_batches} water={} decals={} alpha={}",c.diag_skip_water,c.diag_skip_decals,c.diag_skip_alpha_world); }
-        // Buffer payload accounting, not allocator/driver/process high-water RAM.
-        let old_scene_geometry_capacity_bytes: usize = scene.batches.iter().chain(&scene.sky_props).map(|b| {
-            (b.base.capacity() + b.mesh.vertices.capacity()) * std::mem::size_of::<Vertex>()
-            + (b.full_indices.capacity() + b.mesh.indices.capacity()) * 2
-            + b.normals.capacity() * std::mem::size_of::<Vec3>()
-            + b.detail.iter().map(|d| d.indices.capacity() * 2).sum::<usize>()
-            + b.animation.as_ref().map_or(0, |a| a.positions.iter().map(|f| f.capacity() * std::mem::size_of::<Vec3>()).sum::<usize>())
-        }).sum();
         let pending_geometry_capacity_bytes: usize = pending.iter().map(|p|
             p.geometry.vertices.capacity() * 52 + p.geometry.indices.capacity() * 2).sum();
         let pending_geometry_initial_capacity_bytes = pending_geometry_capacity_bytes;
+        // The parts grew by doubling. Trim them before packing copies them out, so the packed
+        // buffers do not sit on top of that slack; a shrink stays in place in newlib.
+        for p in &mut pending {
+            p.geometry.vertices.shrink_to_fit();
+            p.geometry.indices.shrink_to_fit();
+            p.geometry.faces.shrink_to_fit();
+        }
         let mut uploaded_geometry_bytes = 0;
         let mut construction_geometry_peak_bytes = old_scene_geometry_capacity_bytes + pending_geometry_capacity_bytes;
         let atlas = scene.atlas.raw_miniquad_id();
@@ -2155,6 +2185,10 @@ impl Renderer {
         resources.buffers.push(sky_bindings.index_buffer);
         let sky_surfaces = sky_surfaces::SkySurfaces::new(scene, ctx, &mut resources)?;
         let sky_room = sky_room::SkyRoom::new(scene, ctx, &mut resources, shader);
+        // The sky surfaces and the sky room were the last readers.
+        for (b, &release) in scene.batches.iter_mut().zip(release) {
+            if release { b.release_source_geometry(); }
+        }
         #[cfg(not(target_os = "vita"))]
         ensure!(std::env::var("LOOKING_GLASS_RETAINED_FAIL").as_deref() != Ok("after-upload"), "host diagnostic construction failure after upload");
         let upload_ms=upload_start.elapsed().as_secs_f64()*1000.;
@@ -6646,6 +6680,15 @@ mod tests {
                 + after.transform_vector3(ripple.extend(0.)).truncate();
             assert!(actual.distance(stage.uv(source, p, time)) < 0.00001);
         }
+    }
+    #[test]
+    fn cell_keys_match_exactly_when_the_debug_texts_match() {
+        let values = [0., -0., 1., -1., 0.5, 1e-45, -1e-45, f32::MAX, f32::MIN, f32::INFINITY, f32::NEG_INFINITY,
+            f32::NAN, -f32::NAN, f32::from_bits(0x7fc0_0001), f32::from_bits(0xffa0_0000), 12345.678, 3.0e38];
+        for &a in &values { for &b in &values { for &z in &[0_f32, -0.] {
+            let (x, y) = (Vec3::new(a, z, 1.), Vec3::new(b, z, 1.));
+            assert_eq!(cell_key(x) == cell_key(y), format!("{x:?}") == format!("{y:?}"), "{a:?} {b:?}");
+        } } }
     }
     #[test]
     fn packed_vertex_and_uniform_layout_match_shader_metadata() {

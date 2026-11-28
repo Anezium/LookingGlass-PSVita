@@ -93,6 +93,16 @@ fn f32_at(b: &[u8], o: usize) -> Result<f32> {
 fn vec_at(b: &[u8], o: usize) -> Result<Vec3> {
     Ok(vec3(f32_at(b, o)?, f32_at(b, o + 4)?, f32_at(b, o + 8)?))
 }
+/// `collect::<Result<Vec<_>>>()` without its doubling: that adapter hides the length, so the
+/// vector grows by reallocation and keeps up to twice its bytes for the level's lifetime.
+/// Same items, same first error.
+pub(crate) fn collect_exact<T>(items: impl ExactSizeIterator<Item = Result<T>>) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(item?);
+    }
+    Ok(out)
+}
 fn records(b: &[u8], stride: usize) -> Result<std::slice::ChunksExact<'_, u8>> {
     ensure!(
         b.len() % stride == 0,
@@ -132,7 +142,7 @@ impl Bsp {
             ranges.windows(2).all(|w| w[0].end <= w[1].start),
             "Overlapping BSP lumps"
         );
-        let shaders = records(lumps[0], 76)?
+        let shaders = collect_exact(records(lumps[0], 76)?
             .map(|s| {
                 let n = s[..64].iter().position(|&b| b == 0).unwrap_or(64);
                 Ok(Shader {
@@ -140,9 +150,8 @@ impl Bsp {
                     flags: i32_at(s, 64)?,
                     contents: i32_at(s, 68)?,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let vertices = records(lumps[4], 44)?
+            }))?;
+        let vertices = collect_exact(records(lumps[4], 44)?
             .map(|s| {
                 Ok(MapVertex {
                     position: vec_at(s, 0)?,
@@ -151,17 +160,15 @@ impl Bsp {
                     light_uv: vec2(f32_at(s, 20)?, f32_at(s, 24)?),
                     color: s[40..44].try_into()?,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let indices = records(lumps[5], 4)?
-            .map(|s| count(s, 0))
-            .collect::<Result<Vec<_>>>()?;
+            }))?;
+        let indices = collect_exact(records(lumps[5], 4)?
+            .map(|s| count(s, 0)))?;
         ensure!(
             lumps[2].len() % (128 * 128 * 3) == 0,
             "Invalid lightmap lump"
         );
         let lightmap_count = lumps[2].len() / (128 * 128 * 3);
-        let surfaces = records(lumps[3], 108)?
+        let surfaces = collect_exact(records(lumps[3], 108)?
             .map(|s| {
                 let surface = Surface {
                     shader: count(s, 0)?,
@@ -207,9 +214,8 @@ impl Bsp {
                     ensure!(surface.index_count % 3 == 0, "Incomplete surface triangle");
                 }
                 Ok(surface)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let planes = records(lumps[1], 16)?
+            }))?;
+        let planes = collect_exact(records(lumps[1], 16)?
             .map(|s| {
                 let normal = vec_at(s, 0)?;
                 let distance = f32_at(s, 12)?;
@@ -219,17 +225,15 @@ impl Bsp {
                     normal: normal / length,
                     distance: distance / length,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let side_planes = records(lumps[10], 8)?
+            }))?;
+        let side_planes = collect_exact(records(lumps[10], 8)?
             .map(|s| {
                 let plane = count(s, 0)?;
                 ensure!(plane < planes.len(), "Invalid brush side plane");
                 ensure!(count(s, 4)? < shaders.len(), "Invalid brush side material");
                 Ok(plane)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let brushes = records(lumps[11], 12)?
+            }))?;
+        let brushes = collect_exact(records(lumps[11], 12)?
             .map(|s| {
                 let shader = count(s, 8)?;
                 ensure!(shader < shaders.len(), "Invalid brush material");
@@ -239,9 +243,8 @@ impl Bsp {
                     "Invalid convex brush side count"
                 );
                 Ok(MapBrush { sides, shader })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let models = records(lumps[13], 40)?
+            }))?;
+        let models = collect_exact(records(lumps[13], 40)?
             .map(|m| {
                 let min = vec_at(m, 0)?;
                 let max = vec_at(m, 12)?;
@@ -252,14 +255,13 @@ impl Bsp {
                     surfaces: bounded(count(m, 24)?, count(m, 28)?, surfaces.len())?,
                     brushes: bounded(count(m, 32)?, count(m, 36)?, brushes.len())?,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }))?;
         let world = models.first().context("Missing world model")?;
         let world_surfaces = world.surfaces.clone();
         let world_brushes = world.brushes.clone();
         let world_min = world.min;
         let world_max = world.max;
-        let fogs = records(lumps[12], 72)?
+        let fogs = collect_exact(records(lumps[12], 72)?
             .map(|f| {
                 let end = f[..64].iter().position(|&v| v == 0).unwrap_or(64);
                 let brush = count(f, 64)?;
@@ -273,8 +275,7 @@ impl Bsp {
                     shader: std::str::from_utf8(&f[..end])?.to_ascii_lowercase(),
                     brush,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }))?;
         let entity_text = std::str::from_utf8(lumps[14])?.trim_end_matches('\0');
         let entity_start = std::time::Instant::now();
         let entities = parse_entities(entity_text)?;
@@ -494,6 +495,18 @@ mod tests {
         b[12 + 13 * 8..16 + 13 * 8].copy_from_slice(&172i32.to_le_bytes());
         b[16 + 13 * 8..20 + 13 * 8].copy_from_slice(&40i32.to_le_bytes());
         b
+    }
+    #[test]
+    fn collect_exact_reserves_the_length_and_stops_at_the_first_error() {
+        let items = (0..1000_u32).map(|i| Ok::<_, anyhow::Error>(i * 3));
+        let v = collect_exact(items).unwrap();
+        assert_eq!((v.len(), v.capacity()), (1000, 1000));
+        assert!(v.iter().enumerate().all(|(i, &x)| x == i as u32 * 3));
+        let seen = std::cell::Cell::new(0);
+        let failing = (0..10_u32).map(|i| { seen.set(i); if i >= 4 { anyhow::bail!("bad {i}") } Ok(i) });
+        assert_eq!(collect_exact(failing).unwrap_err().to_string(), "bad 4");
+        assert_eq!(seen.get(), 4, "nothing after the first error is evaluated");
+        assert_eq!(collect_exact(std::iter::empty::<Result<u8>>()).unwrap().capacity(), 0);
     }
     #[test]
     fn valid_empty_map() {

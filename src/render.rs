@@ -810,6 +810,21 @@ fn world_stages(spec: Option<&texture::MaterialSpec>) -> Vec<Stage> {
     stages
 }
 impl Batch {
+    /// Retained construction: the legacy draw copy and its detail levels, which nothing reads
+    /// once the retained renderer takes over.
+    #[cfg(feature = "vita_renderer")]
+    fn release_draw_geometry(&mut self) {
+        self.mesh.vertices = Vec::new();
+        self.mesh.indices = Vec::new();
+        self.detail = Vec::new();
+    }
+    /// Retained construction: the source vertices and indices, after their last reader.
+    #[cfg(feature = "vita_renderer")]
+    fn release_source_geometry(&mut self) {
+        self.base = Vec::new();
+        self.normals = Vec::new();
+        self.full_indices = Vec::new();
+    }
     fn prepare_visibility(&mut self) {
         self.visibility_work.invalidate();
         self.visibility_work.pvs_parts.reserve(self.parts.len());
@@ -2240,7 +2255,16 @@ impl Scene {
         };
         #[cfg(feature = "vita_renderer")]
         if retained_world {
-            let retained = assets.fingerprint().and_then(|corpus| vita_renderer::Renderer::new(&scene, &corpus));
+            let c = vita_renderer::config();
+            // `sky_cube` keeps the same legacy sky geometry until its first capture.
+            let cube = c.sky_cube && !c.authored_sky;
+            let has_origin = scene.sky_origin.is_some();
+            // The batches `retain_geometry` drops below: the renderer frees their CPU geometry
+            // as soon as it has read it, so it is not held through the whole construction.
+            let release = authored_sky::kept(c.authored_sky || cube, c.sky, has_origin,
+                &scene.batches, &scene.sky_props, |b| (b.sky, b.model.is_none()))
+                .into_iter().map(|kept| !kept).collect::<Vec<_>>();
+            let retained = assets.fingerprint().and_then(|corpus| vita_renderer::Renderer::new(&mut scene, &corpus, &release));
             match retained {
                 Ok(renderer) => scene.retained = Some(Box::new(renderer)),
                 Err(error) => {
@@ -2253,12 +2277,9 @@ impl Scene {
             }
             // The retained path owns its immutable buffers and material recipes.
             // Release the old CPU geometry and unused Macroquad world materials.
-            let c = vita_renderer::config();
-            // `sky_cube` keeps the same legacy sky geometry until its first capture.
-            let cube = c.sky_cube && !c.authored_sky;
             let legacy = authored_sky::retain_geometry(
                 c.authored_sky || cube, c.sky,
-                scene.sky_origin.is_some(), &mut scene.batches, &mut scene.sky_props,
+                has_origin, &mut scene.batches, &mut scene.sky_props,
                 |b| (b.sky, b.model.is_none()));
             scene.authored_sky = legacy && !cube;
             if legacy && cube {
