@@ -401,6 +401,9 @@ pub(crate) enum Route {
     ActorLeanOpaque,
     ActorLeanLit,
     ActorLeanLitOpaque,
+    /// `actor_fogfree_route`: the twins of `ActorLean` and `ActorLeanOpaque` without the fog call.
+    ActorLeanFogFree,
+    ActorLeanOpaqueFogFree,
 }
 
 impl Route {
@@ -423,6 +426,15 @@ fn actor_lean_route(base: Route, programs: [bool; 2], lit: bool, admitted: impl 
         Route::CorpseOpaque if programs[1] && admitted() => {
             if lit { Route::ActorLeanLitOpaque } else { Route::ActorLeanOpaque }
         }
+        other => other,
+    }
+}
+/// `actor_fogfree_route`: the fog-free twin of an unlit lean route (`programs`: the two twins'
+/// pipelines for this key), when the packet's fog is certified zero. `certified` runs only then.
+fn fog_free_route(route: Route, programs: [bool; 2], certified: impl Fn() -> bool) -> Route {
+    match route {
+        Route::ActorLean if programs[0] && certified() => Route::ActorLeanFogFree,
+        Route::ActorLeanOpaque if programs[1] && certified() => Route::ActorLeanOpaqueFogFree,
         other => other,
     }
 }
@@ -455,6 +467,8 @@ fn submit_key(key: (usize, bool), route: Route, depth_write: bool) -> (usize, bo
         Route::ActorLeanOpaque => 6 * crate::render::BLEND_COUNT,
         Route::ActorLeanLit => 7 * crate::render::BLEND_COUNT,
         Route::ActorLeanLitOpaque => 8 * crate::render::BLEND_COUNT,
+        Route::ActorLeanFogFree => 9 * crate::render::BLEND_COUNT,
+        Route::ActorLeanOpaqueFogFree => 10 * crate::render::BLEND_COUNT,
     };
     (key.0 + offset, key.1, depth_write)
 }
@@ -468,8 +482,9 @@ pub(crate) struct Gpu {
     corpse_opaque: Option<Lite>,
     /// `fx_add_lean` and `fx_add_fog_free`: the two additive effect programs.
     fx_add: [Option<Lite>; 2],
-    /// `actor_lean_shader`: the unlit and lit actor programs and their discard-free twins.
-    actor_lean: [Option<Lite>; 4],
+    /// `actor_lean_shader`: the unlit and lit actor programs and their discard-free twins,
+    /// then the two `actor_fogfree_route` twins of the unlit pair.
+    actor_lean: [Option<Lite>; 6],
     buffers: Vec<Buffers>,
     white: Texture2D,
     ring_frame: usize,
@@ -490,9 +505,10 @@ pub(crate) struct Gpu {
     puff_batches: [world_puffs::Bank; 2],
     bounds: packet_cull::Bounds,
     /// Frozen after prewarm: for each pipeline key (blend, depth-equal) the
-    /// availability of the four actor-lean banks, `[unlit, unlit-opaque, lit,
-    /// lit-opaque]`, read per draw instead of walking the pipeline maps.
-    lean_routes: Box<[[bool; 4]]>,
+    /// availability of the six actor-lean banks, `[unlit, unlit-opaque, lit,
+    /// lit-opaque, unlit fog-free, unlit-opaque fog-free]`, read per draw instead
+    /// of walking the pipeline maps.
+    lean_routes: Box<[[bool; 6]]>,
     /// GPU-skin support of the two lit variants, read per draw.
     lit_skin: [bool; 2],
 }
@@ -507,9 +523,9 @@ fn emit_actor_geometry(zero_glow: bool) -> bool {
 }
 
 /// The specialized program bank of a route: 0 lean/unlit-exact, 1 corpse, 2 and 3 additive,
-/// 4 and 5 lean actor. It borrows only the bank fields, so the full program's caches stay usable.
+/// 4 to 9 lean actor. It borrows only the bank fields, so the full program's caches stay usable.
 fn program_bank<'a>(lite: &'a mut Option<Lite>, corpse: &'a mut Option<Lite>, fx_add: &'a mut [Option<Lite>; 2],
-    actor_lean: &'a mut [Option<Lite>; 4], bank: Option<usize>) -> Option<&'a mut Lite> {
+    actor_lean: &'a mut [Option<Lite>; 6], bank: Option<usize>) -> Option<&'a mut Lite> {
     match bank? {
         0 => lite.as_mut(),
         1 => corpse.as_mut(),
@@ -597,9 +613,11 @@ impl Gpu {
         }).flatten().map(|shader| Lite { uniforms: UniformCache::default(), shader, pipelines: BTreeMap::new(), fields: crate::render::uniform_fields::Cache::new(meta()) }));
         let sources = actor_lean::sources();
         let lit_variant = c.actor_lean_lights || c.actor_light_cull && c.actor_lean_shader;
-        let actor_fragments = [0, 1, 2, 3].map(|i| {
-            (if i < 2 { c.actor_lean_shader } else { lit_variant }).then(|| {
-                let source = if i < 2 { sources[i].clone() } else { actor_lean::lit_source(i == 3) };
+        let actor_fragments = [0, 1, 2, 3, 4, 5].map(|i| {
+            (match i { 0 | 1 => c.actor_lean_shader, 2 | 3 => lit_variant, _ => c.actor_lean_shader && c.actor_fogfree_route })
+                .then(|| {
+                let source = match i { 0 | 1 => sources[i].clone(), 2 | 3 => actor_lean::lit_source(i == 3),
+                    _ => actor_lean::fog_free_source(i == 5) };
                 crate::environment::fragment(&source)
             })
         });
@@ -660,7 +678,7 @@ impl Gpu {
         // Every pipeline key is prewarmed once, so the bank maps are frozen
         // from here: snapshot each key's actor-lean availability, and the
         // GPU-skin support of the two lit variants, for the per-draw checks.
-        let mut lean_routes = vec![[false; 4]; crate::render::BLEND_COUNT * 2];
+        let mut lean_routes = vec![[false; 6]; crate::render::BLEND_COUNT * 2];
         for blend in 0..crate::render::BLEND_COUNT {
             for equal in [false, true] {
                 let key = (blend, equal);
@@ -683,8 +701,8 @@ impl Gpu {
     }
     /// Bank availability for one draw key. An authored factor blend outside the
     /// table stays on the full route exactly as a missing pipeline did.
-    fn lean_routes(&self, key: (usize, bool)) -> [bool; 4] {
-        self.lean_routes.get(key.0 * 2 + usize::from(key.1)).copied().unwrap_or([false; 4])
+    fn lean_routes(&self, key: (usize, bool)) -> [bool; 6] {
+        self.lean_routes.get(key.0 * 2 + usize::from(key.1)).copied().unwrap_or([false; 6])
     }
     fn upload(&mut self, slot: usize, p: &Pass, leaves: &mut crate::phase_census::FinishLeaves) -> Result<usize> {
         crate::game_thread::assert_current();
@@ -892,9 +910,23 @@ impl Gpu {
         if !p.effect && c.spike_log_ms > 0. {
             crate::spike_log::actor_routes(culled_to_zero, actual.is_lean_lit(), actual == Route::Full);
         }
-        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
-        actor_lean::census(p, u, depth_write, actual, culled_to_zero);
         let subset = subset.and_then(|(previous, subset)| (actual == previous).then_some(subset));
+        // `actor_fogfree_route` changes only the program that draws: counters, the glow
+        // decisions and the route returned for the next layer keep the lean route.
+        let drawn = if c.actor_fogfree_route && p.gpu_skin.is_none() && !zero_glow && subset.is_none() {
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            let test_started = std::time::Instant::now();
+            let drawn = fog_free_route(actual, [lean[4], lean[5]], || actor_lean::fog_free(p, u));
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            if matches!(actual, Route::ActorLean | Route::ActorLeanOpaque) {
+                count("vita_actor_fog_free_tests", 1);
+                count("vita_actor_fog_free_test_ns", test_started.elapsed().as_nanos() as u64);
+            }
+            drawn
+        } else { actual };
+        if drawn != actual { count("vita_actor_lean_fog_free_draws", 1); }
+        #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+        actor_lean::census(p, u, depth_write, drawn, culled_to_zero);
         let lite = program == Route::Lite;
         if lite { count(if crate::render::vita_renderer::config().fx_unlit_exact {
             "vita_fx_unlit_exact_draws"
@@ -928,7 +960,7 @@ impl Gpu {
         // This draw applies another program's state: the next skin draw reapplies its own.
         if let Some(skin) = &mut self.skin { skin.interrupt_state(); }
         // The specialized bank this draw uses; `None` is the full program.
-        let bank = match program {
+        let bank = match drawn {
             Route::Full => None,
             Route::Lite => Some(0),
             Route::CorpseOpaque => Some(1),
@@ -938,6 +970,8 @@ impl Gpu {
             Route::ActorLeanOpaque => Some(5),
             Route::ActorLeanLit => Some(6),
             Route::ActorLeanLitOpaque => Some(7),
+            Route::ActorLeanFogFree => Some(8),
+            Route::ActorLeanOpaqueFogFree => Some(9),
         };
         let pipeline = *match bank {
             None => self.pipelines.get(&key),
@@ -958,7 +992,7 @@ impl Gpu {
             |subset| subset.draw_count(b.index_buffer));
         let apply = if c.fx_submit_state_cache {
             // The lean program's pipelines are other state: offset its key past every blend.
-            self.submit_cache.observe(submit_key(key, program, depth_write),
+            self.submit_cache.observe(submit_key(key, drawn, depth_write),
                 (self.buffers[slot].vertex, index, [b.images[0], b.images[1], b.images[2]]), u)
         } else { [true; 3] };
         let skin_clock = (!p.effect).then(|| crate::character::skinning::timing::leaf("state"));
@@ -2091,9 +2125,29 @@ mod tests {
         assert_eq!(actor_lean_route(Route::Full, [false, true], false, || true), Route::Full);
     }
     #[test]
+    fn the_fog_free_route_replaces_only_the_unlit_lean_programs() {
+        let calls = std::cell::Cell::new(0);
+        let yes = || { calls.set(calls.get() + 1); true };
+        assert_eq!(fog_free_route(Route::ActorLean, [true, true], yes), Route::ActorLeanFogFree);
+        assert_eq!(fog_free_route(Route::ActorLeanOpaque, [true, true], yes), Route::ActorLeanOpaqueFogFree);
+        assert_eq!(calls.get(), 2);
+        for other in [Route::Full, Route::Lite, Route::CorpseOpaque, Route::AddLean, Route::AddFogFree,
+            Route::ActorLeanLit, Route::ActorLeanLitOpaque, Route::ActorLeanFogFree, Route::ActorLeanOpaqueFogFree] {
+            assert_eq!(fog_free_route(other, [true, true], yes), other);
+        }
+        assert_eq!(calls.get(), 2, "other routes never ask");
+        // A missing twin pipeline is decided before the payload is read.
+        assert_eq!(fog_free_route(Route::ActorLean, [false, true], yes), Route::ActorLean);
+        assert_eq!(fog_free_route(Route::ActorLeanOpaque, [true, false], yes), Route::ActorLeanOpaque);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fog_free_route(Route::ActorLean, [true, true], || false), Route::ActorLean);
+        assert_eq!(fog_free_route(Route::ActorLeanOpaque, [true, true], || false), Route::ActorLeanOpaque);
+    }
+    #[test]
     fn every_program_owns_its_submit_cache_slots_and_the_lean_blends_are_the_named_ones() {
         let routes = [Route::Full, Route::Lite, Route::CorpseOpaque, Route::AddLean, Route::AddFogFree,
-            Route::ActorLean, Route::ActorLeanOpaque, Route::ActorLeanLit, Route::ActorLeanLitOpaque];
+            Route::ActorLean, Route::ActorLeanOpaque, Route::ActorLeanLit, Route::ActorLeanLitOpaque,
+            Route::ActorLeanFogFree, Route::ActorLeanOpaqueFogFree];
         let mut keys = std::collections::BTreeSet::new();
         for route in routes {
             for blend in [0, 1, crate::render::BLEND_COUNT - 1] {
@@ -2830,7 +2884,8 @@ mod tests {
         sequence.push(harmless);
         let counts = sequence.iter().fold([0u64; 3], |mut counts, p| {
             counts[match route(p, false, true) { Route::Full => 0, Route::Lite => 1, Route::CorpseOpaque => 2,
-                Route::AddLean | Route::AddFogFree | Route::ActorLean | Route::ActorLeanOpaque | Route::ActorLeanLit | Route::ActorLeanLitOpaque =>
+                Route::AddLean | Route::AddFogFree | Route::ActorLean | Route::ActorLeanOpaque | Route::ActorLeanLit | Route::ActorLeanLitOpaque
+                | Route::ActorLeanFogFree | Route::ActorLeanOpaqueFogFree =>
                     unreachable!("route never returns an additive or a lean actor program") }] += 1;
             counts
         });

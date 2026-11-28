@@ -112,6 +112,9 @@ pub struct Config {
     pub actor_light_cull: bool,
     /// Use lean actor programs with the first two dynamic-light slots. Default off.
     pub actor_lean_lights: bool,
+    /// Draw an unlit lean actor packet with a twin program that has no fog call when a
+    /// conservative bound proves its fog factor is exactly zero. Needs `actor_lean_shader`. Default off.
+    pub actor_fogfree_route: bool,
     /// Skip fully certified zero-RGB actor glow following opaque, depth-writing skin.
     pub actor_zero_glow: bool,
     pub actor_glow_subset: bool,
@@ -672,6 +675,7 @@ impl Default for Config {
             actor_lean_shader: false,
             actor_light_cull: false,
             actor_lean_lights: false,
+            actor_fogfree_route: false,
             actor_zero_glow: false,
             actor_glow_subset: false,
             actor_glow_subset_maps: None,
@@ -1019,6 +1023,7 @@ impl Config {
             "world_adjacent_batch requires world_list_submit and world_shared_buffers");
         ensure!(self.world_gxm=="off" || self.gpu_mask.is_empty(),"world_gxm excludes gpu_mask: a masked draw captures nothing");
         ensure!(!self.fx_add_fog_free || self.fx_add_lean,"fx_add_fog_free requires fx_add_lean");
+        ensure!(!self.actor_fogfree_route || (self.actor_lean_shader && self.msaa_samples==1),"actor_fogfree_route requires actor_lean_shader and msaa_samples=1");
         ensure!(!self.skin_stream || (self.skin_overlap && self.actor_single_prepare && !self.actor_layer_reuse),"skin_stream requires skin_overlap and actor_single_prepare, and excludes actor_layer_reuse");
         ensure!(self.spike_log_ms.is_finite() && (0. ..=10000.).contains(&self.spike_log_ms),"spike_log_ms must be 0 (off) to 10000");
         ensure!(self.actor_near_cull.is_finite() && (0. ..=1000.).contains(&self.actor_near_cull),"actor_near_cull must be 0 (off) to 1000");
@@ -4069,6 +4074,15 @@ mod tests {
         assert!(serde_json::from_value::<Config>(serde_json::json!({"spike_log_first_frame":20,"spike_log_last_frame":10})).unwrap().validate().is_err());
     }
     #[test]
+    fn actor_fogfree_route_defaults_off_is_strict_and_needs_the_lean_programs() {
+        assert!(!Config::default().actor_fogfree_route);
+        assert!(!serde_json::from_str::<Config>("{}").unwrap().actor_fogfree_route);
+        assert!(serde_json::from_str::<Config>(r#"{"actor_fogfree_route":1}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"actor_fogfree_route":true}"#).unwrap().validate().is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"actor_fogfree_route":true,"actor_lean_shader":true}"#).unwrap().validate().is_ok());
+        assert!(serde_json::from_str::<Config>(r#"{"actor_fogfree_route":true,"actor_lean_shader":true,"msaa_samples":2,"render_scale":1.0}"#).unwrap().validate().is_err());
+    }
+    #[test]
     fn nav_sweep_cache_defaults_off_and_requires_a_boolean() {
         assert!(!Config::default().nav_sweep_cache);
         assert!(!serde_json::from_str::<Config>("{}").unwrap().nav_sweep_cache);
@@ -4535,7 +4549,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache" | "actor_fogfree_route") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);

@@ -22,11 +22,15 @@
 //! The second program also drops the two cutout lines. It serves only packets that
 //! `actor_discard_free_shader` or `actor_cutout_discard_free` already send to the discard-free
 //! program, so it never widens the set of packets drawn without `discard`.
+//!
+//! `actor_fogfree_route` adds a twin of each unlit program without the `fogged` call (see
+//! `fog_free`).
 use super::*;
 
-pub(super) const NAMES: [&str; 4] = [
+pub(super) const NAMES: [&str; 6] = [
     "retained-actor-lean", "retained-actor-lean-opaque",
     "retained-actor-lean-lit", "retained-actor-lean-lit-opaque",
+    "retained-actor-lean-fog-free", "retained-actor-lean-opaque-fog-free",
 ];
 
 // Offsets into the retained uniform block (`UNIFORM_FIELDS`).
@@ -78,6 +82,15 @@ pub(super) fn sources() -> [String; 2] {
 
 pub(super) fn lit_source(discard_free: bool) -> String {
     crate::lighting::fragment_slots(&fragment(discard_free, true), 2)
+}
+/// `actor_fogfree_route`: an unlit lean source without its one fog call. The fog block
+/// becomes the bare `worldPosition` declaration, so the interpolants match the full
+/// program's. Every other line stays byte for byte.
+pub(super) fn fog_free_source(discard_free: bool) -> String {
+    let lean = fragment(discard_free, false);
+    let call = "\n if(FogMode>=0.0)rgb=fogged(rgb,FogMode);\n";
+    assert_eq!(lean.matches(call).count(), 1, "lean fog call");
+    lean.replacen(call, "\n", 1).replacen("// FOG", "varying highp vec3 worldPosition;", 1)
 }
 /// Every line the lean source leaves out is a no-op under payload `u`. Each test is the
 /// negation of the shader's own guard, so NaN fails the guard here as it does there.
@@ -161,6 +174,67 @@ pub(super) fn bounded_glow_lights(u: &[f32; UNIFORM_FLOATS]) -> bool {
     u[LIGHTS..LIGHTS + 16].chunks_exact(8).all(|slot| {
         slot[7] <= 0.5 || (slot[..7].iter().all(|x| x.abs() <= 8192.) && slot[3] > 0.)
     })
+}
+
+// More offsets into the retained uniform block: the fog terms after `Model` (0..16).
+const EYE: usize = 116;
+const DISTANCE: usize = 119;
+const LIQUID_W: usize = 126;
+const FOG_A_W: usize = 136;
+const FOG_B_W: usize = 146;
+/// Same coordinate limit as `outside_light`.
+const FOG_LIMIT: f32 = 8192.;
+
+/// `actor_fogfree_route`: `fogged(rgb,FogMode)` returns `rgb` for every fragment of this
+/// packet under payload `u`, so the fog-free twin draws the same pixels. Decided per draw
+/// from the payload words the program reads; nothing is kept across draws.
+///
+/// The call runs only for `FogMode >= 0`. Each fog term has its own `if(X.w>0.0)` guard,
+/// and NaN fails the guard here as it does there. With the liquid and both volume terms off
+/// and distance fog off, `fogged` changes nothing. With distance fog on, the factor is
+/// `clamp((dist-0.35w)/(0.65w),0,1)`: it is +0 once `dist < 0.35w`, and then
+/// `mix(rgb,c,0)` returns `rgb` for a finite `rgb` (finite gain, `lean_material`) and a
+/// finite fog colour `c` (checked here).
+///
+/// `dist` is `length(worldPosition-FogEye)`. The vertex program writes `worldPosition` as
+/// `Model*position`, and `Model` must be the identity, so it is the uploaded vertex position.
+/// `Pass::geometry` holds the vertices the draw uploads: final world positions for static and
+/// CPU-skinned packets, the same assumption `cull_lights` makes. On a single-sample target
+/// (the key requires `msaa_samples=1`) a fragment's `worldPosition` is a convex combination of
+/// its triangle's vertices, and distance is convex, so no fragment is farther from the eye
+/// than the packet's farthest vertex. Every vertex is scanned. A GPU-skinned packet has only
+/// placeholder geometry on the CPU and is refused.
+///
+/// The threshold is `0.35*w` in f32 from the live word. `dist` is mediump (`render.rs`): a
+/// backend that keeps half precision rounds it by 0.25 at 630. The margin `2 + s/4096`
+/// (s: largest coordinate of the eye and the vertices) covers that and the f32 interpolation
+/// and `length` rounding, so a packet never sits on the cutoff.
+pub(super) fn fog_free(p: &Pass, u: &[f32; UNIFORM_FLOATS]) -> bool {
+    if p.gpu_skin.is_some() || u[..16] != Mat4::IDENTITY.to_cols_array() { return false; }
+    if !(u[FOG_MODE] >= 0.) { return true; }
+    if u[LIQUID_W] > 0. || u[FOG_A_W] > 0. || u[FOG_B_W] > 0. { return false; }
+    let w = u[DISTANCE + 3];
+    if !(w > 0.) { return true; }
+    let bounded = |values: &[f32]| values.iter().all(|x| x.abs() <= FOG_LIMIT);
+    if !(w >= 1. && w <= 65504. && u[FOG_MODE] <= 3.5 && bounded(&u[DISTANCE..DISTANCE + 3])
+        && bounded(&u[GAIN..GAIN + 4]) && bounded(&u[EYE..EYE + 3])) {
+        return false;
+    }
+    let eye = Vec3::from_slice(&u[EYE..EYE + 3]);
+    let limit = f64::from(0.35f32 * w) - 2.;
+    let eye_d = eye.as_dvec3();
+    let mut scale = eye.abs().max_element();
+    let mut far = 0f64;
+    let vertices = &p.geometry().vertices;
+    for vertex in vertices {
+        let pos = vertex.position;
+        if !(pos.is_finite() && pos.abs().max_element() <= FOG_LIMIT) { return false; }
+        far = far.max(pos.as_dvec3().distance(eye_d));
+        // One vertex beyond the limit decides, whatever the final scale.
+        if !(far < limit) { return false; }
+        scale = scale.max(pos.abs().max_element());
+    }
+    !vertices.is_empty() && far + f64::from(scale) / 4096. < limit
 }
 
 /// Host census line for one actor draw: the payload facts the selector reads and the route.
@@ -376,6 +450,94 @@ mod tests {
         assert!(admitted_lit(&p, &u, true));
     }
 
+    fn fogged_payload(p: &Pass, eye: Vec3, w: f32) -> [f32; UNIFORM_FLOATS] {
+        let mut u = payload(p);
+        u[..16].copy_from_slice(&Mat4::IDENTITY.to_cols_array());
+        u[EYE..EYE + 3].copy_from_slice(&eye.to_array());
+        u[DISTANCE..DISTANCE + 4].copy_from_slice(&[0.3, 0.2, 0.1, w]);
+        u
+    }
+    #[test]
+    fn the_fog_free_sources_are_the_unlit_lean_sources_without_the_fog_call() {
+        let full = crate::environment::fragment(crate::render::FRAGMENT);
+        let varyings = |source: &str| source.split(';').map(str::trim).filter(|d| d.contains("varying "))
+            .map(|d| d.rsplit(' ').next().unwrap().to_owned()).collect::<Vec<_>>();
+        for discard_free in [false, true] {
+            let lean = fragment(discard_free, false);
+            let free = fog_free_source(discard_free);
+            let gone: Vec<&str> = lean.lines().filter(|l| !free.lines().any(|kept| kept == *l)).collect();
+            assert_eq!(gone, ["// FOG", " if(FogMode>=0.0)rgb=fogged(rgb,FogMode);"]);
+            let added: Vec<&str> = free.lines().filter(|l| !lean.lines().any(|kept| kept == *l)).collect();
+            assert_eq!(added, ["varying highp vec3 worldPosition;"]);
+            assert_eq!(free.lines().count() + 1, lean.lines().count());
+            for absent in ["fogged", "FogEye", "DistanceFog", "LiquidFog", "FogA", "FogB"] {
+                assert!(!free.contains(absent), "{absent}");
+            }
+            assert_eq!(crate::environment::fragment(&free), free, "no fog block left to expand");
+            assert_eq!(varyings(&free), varyings(&full));
+            assert_eq!(free.matches("discard;").count(), lean.matches("discard;").count());
+        }
+    }
+    #[test]
+    fn fog_free_needs_every_vertex_inside_the_zero_fog_radius_with_a_margin() {
+        let mut p = pass();
+        p.mesh.vertices[1].position = Vec3::new(10., 0., 0.);
+        p.mesh.vertices[2].position = Vec3::new(0., 10., 0.);
+        let at = |x: f32| fogged_payload(&p, Vec3::new(-x, 0., 0.), 1800.);
+        // Zero-fog radius 630 (0.35f32*1800 rounds to exactly 630). Farthest vertex (10,0,0).
+        assert_eq!(0.35f32 * 1800., 630.);
+        assert!(fog_free(&p, &at(617.)), "627 plus margin 2.15");
+        // Inside the radius, but not by the margin: the packet keeps its fog.
+        assert!(!fog_free(&p, &at(618.)));
+        assert!(!fog_free(&p, &at(640.)));
+        // The vertices, not their box: the corner (100,100,0) is no vertex and is 636 away.
+        let mut r = pass();
+        r.mesh.vertices[1].position = Vec3::new(100., 0., 0.);
+        r.mesh.vertices[2].position = Vec3::new(0., 100., 0.);
+        let eye = Vec3::new(-350., -350., 0.);
+        assert!(Vec3::new(100., 100., 0.).distance(eye) > 630.);
+        assert!(fog_free(&r, &fogged_payload(&r, eye, 1800.)), "farthest vertex 570.1");
+        // Any vertex beyond the limit decides, wherever it is in the list.
+        let mut q = pass();
+        q.mesh.vertices[2].position = Vec3::new(700., 0., 0.);
+        assert!(!fog_free(&q, &fogged_payload(&q, Vec3::ZERO, 1800.)));
+        q.mesh.vertices[2].position = Vec3::new(600., 0., 0.);
+        assert!(fog_free(&q, &fogged_payload(&q, Vec3::ZERO, 1800.)));
+        for (name, adjust) in [
+            ("liquid fog", (|u: &mut [f32; UNIFORM_FLOATS]| u[LIQUID_W] = 1.) as fn(&mut [f32; UNIFORM_FLOATS])),
+            ("first fog volume", |u| u[FOG_A_W] = 1.),
+            ("second fog volume", |u| u[FOG_B_W] = 1.),
+            ("moved model", |u| u[12] = 1.),
+            ("non-finite eye", |u| u[EYE] = f32::NAN),
+            ("non-finite fog colour", |u| u[DISTANCE] = f32::INFINITY),
+            ("non-finite gain", |u| u[GAIN] = f32::INFINITY),
+            ("tiny fog distance", |u| u[DISTANCE + 3] = 0.5),
+            ("source-colour fog", |u| u[FOG_MODE] = 4.),
+        ] {
+            let mut u = at(600.);
+            assert!(fog_free(&p, &u), "control for {name}");
+            adjust(&mut u);
+            assert!(!fog_free(&p, &u), "{name}");
+        }
+        let mut q = pass();
+        q.mesh.vertices[1].position.y = f32::NAN;
+        assert!(!fog_free(&q, &fogged_payload(&q, Vec3::new(-100., 0., 0.), 1800.)), "non-finite vertex");
+        q.mesh.vertices[1].position.y = 9000.;
+        assert!(!fog_free(&q, &fogged_payload(&q, Vec3::new(-100., 0., 0.), 1800.)), "unbounded vertex");
+        q.mesh.vertices.clear();
+        assert!(!fog_free(&q, &fogged_payload(&q, Vec3::new(-100., 0., 0.), 1800.)), "no vertex");
+        // `fogged` changes nothing when no term is on, or is not called: no bound is needed.
+        let far = |w: f32| fogged_payload(&p, Vec3::new(-5000., 0., 0.), w);
+        assert!(!fog_free(&p, &far(1800.)));
+        assert!(fog_free(&p, &far(0.)));
+        assert!(fog_free(&p, &far(f32::NAN)), "NaN fails the shader's guard too");
+        let mut u = far(1800.);
+        u[LIQUID_W] = 1.;
+        u[FOG_MODE] = -1.;
+        assert!(fog_free(&p, &u), "no fog call at all");
+        u[FOG_MODE] = f32::NAN;
+        assert!(fog_free(&p, &u), "NaN fails the call's guard");
+    }
     #[test]
     fn the_key_is_off_by_default_and_strict() {
         let c = crate::render::vita_renderer::Config::default();
