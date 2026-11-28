@@ -53,6 +53,7 @@ struct Frame {
     number: u64,
     worker: bool,
     flight_work: [u32;6],
+    mover_colliders: [u32; 3],
     begin: Option<Instant>,
     render: Option<Instant>,
     hud: Option<Instant>,
@@ -232,6 +233,10 @@ impl Frame {
             let [calls,tests,traversals,witnesses,short,free]=self.flight_work;
             let _=write!(out," flight_work={calls}/{tests}/{traversals}/{witnesses}/{short}/{free}");
         }
+        if self.mover_colliders[0] > 0 {
+            let [built, cached, spikes] = self.mover_colliders;
+            let _ = write!(out, " mover_colliders={built}/{cached}/{spikes}");
+        }
         for (name, (calls, ms, expanded, tests)) in PLANNERS.iter().zip(self.planners) {
             if calls > 0 { let _ = write!(out, " {name}={calls}/{ms:.2}/{expanded}/{tests}"); }
         }
@@ -282,6 +287,7 @@ pub(crate) struct WorkerRow {
     npc: Vec<Npc>,
     planners: [(u32, f64, u32, u32); 2],
     flight_work: [u32; 6],
+    mover_colliders: [u32; 3],
 }
 
 pub(crate) fn setup_worker() {
@@ -305,7 +311,7 @@ pub(crate) fn worker_finish() -> (WorkerRow, WorkerLateLines) {
             sim_ms: std::array::from_fn(|i| (SIM[i], frame.sim_ms[i])),
             late_calls: frame.calls, late_ms: frame.ms,
             npc: frame.npc.into_iter().flatten().collect(),
-            planners: frame.planners, flight_work: frame.flight_work,
+            planners: frame.planners, flight_work: frame.flight_work, mover_colliders: frame.mover_colliders,
         }
     });
     (row, lines)
@@ -419,6 +425,12 @@ pub(crate) fn npc(name: &'static str, updated: u64, ms: [f64; 4]) {
 pub(crate) fn flight_work(work: [u32;6]) {
     if !on() { return; }
     FRAME.with(|f| { for (a,b) in f.borrow_mut().flight_work.iter_mut().zip(work) { *a+=b; } });
+}
+/// Pale Realm and Pool of Tears mover colliders rebuilt this frame: all, how many of them
+/// `mover_hull_cache` placed from cached shapes, and the Pale Realm lesson spikes' share.
+pub(crate) fn mover_colliders(work: [u32; 3]) {
+    if !on() { return; }
+    FRAME.with(|f| { for (a, b) in f.borrow_mut().mover_colliders.iter_mut().zip(work) { *a += b; } });
 }
 pub(crate) const NAV_PLAN: usize = 0;
 pub(crate) const FLIGHT_ROUTE: usize = 1;

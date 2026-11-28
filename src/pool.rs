@@ -466,11 +466,16 @@ impl Pool {
                 o.pose = (p, r);
                 #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
                 crate::sim_maps::probe::mover_pose(&o.name, p, r);
-                o.collider = if crate::sim_maps::mover_hull_cache() {
+                let cached = crate::sim_maps::mover_hull_cache();
+                o.collider = if cached {
                     Collider::model_from(map, o.model, p, r, true, &mut o.shape)?
                 } else {
                     Collider::model(map, o.model, p, r, true)?
                 };
+                if crate::spike_log::on() {
+                    let cached = cached && o.shape.as_ref().is_some_and(|s| s.fits(o.model, true));
+                    crate::spike_log::mover_colliders([1, u32::from(cached), 0]);
+                }
             }
         }
         Ok(())

@@ -391,7 +391,8 @@ impl Realm {
                 }
                 #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
                 crate::sim_maps::probe::mover_pose(&o.name, o.pose.translation, o.pose.rotation);
-                if crate::sim_maps::mover_hull_cache() {
+                let cached = crate::sim_maps::mover_hull_cache();
+                if cached {
                     let [solid, volume] = &mut o.shapes;
                     let (at, rotation) = (o.pose.translation, o.pose.rotation);
                     o.collider = Collider::model_from(map, o.model, at, rotation, true, solid)?;
@@ -401,6 +402,13 @@ impl Realm {
                         Collider::model(map, o.model, o.pose.translation, o.pose.rotation, true)?;
                     o.volume =
                         Collider::model(map, o.model, o.pose.translation, o.pose.rotation, false)?;
+                }
+                if crate::spike_log::on() {
+                    let cached = o.shapes.iter().zip([true, false]).filter(|(s, solids)| {
+                        cached && s.as_ref().is_some_and(|s| s.fits(o.model, *solids))
+                    });
+                    let spike = n.starts_with("bsspike") || n.starts_with("knspike");
+                    crate::spike_log::mover_colliders([2, cached.count() as u32, if spike { 2 } else { 0 }]);
                 }
             } else {
                 crate::sim_maps::count("mover_pose_rows_unchanged", 1);
