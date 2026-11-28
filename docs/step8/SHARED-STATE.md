@@ -54,6 +54,8 @@ The step 7c owner-fence analysis supplies the routes for graphics caches, probe 
 | `src/campaign.rs:216` | `KEYS` | cache | Campaign progression, story dispatch or save/restore reads authored visit data. Share immutable tables. See line 217. |
 | `src/campaign_chain/graph.rs:118` | `ROWS` | state | Campaign progression, story dispatch or save/restore reads authored visit data. Share immutable tables. See line 754. |
 | `src/campaign_route.rs:38` | `LEGS` | state | Campaign progression, story dispatch or save/restore reads authored visit data. Share immutable tables. See line 172. |
+| `src/camera.rs:182` | `ON` | diagnostic | Follow camera log switch, read once from `LOOKING_GLASS_CAMERA_LOG` on the sim step. Off by default; immutable after first read. See line 183. |
+| `src/camera.rs:198` | `STEP` | diagnostic | Follow camera log line counter, sim step only, behind the same switch. Relaxed increment; never read by game state. See line 199. |
 | `src/character/skinning/census.rs:6` | `FRAMES` | cache | Actor draw enters skin gather, prepare and collect. Keep scratch, workers and draw scopes with the gather owner. See line 7. |
 | `src/character/skinning/census.rs:15` | `thread_local!` | cache | TLS block. Actor draw enters skin gather, prepare and collect. Keep scratch, workers and draw scopes with the gather owner. |
 | `src/character/skinning/census.rs:16` | `CURRENT` | cache | Actor draw enters skin gather, prepare and collect. Keep scratch, workers and draw scopes with the gather owner. See line 20. |
