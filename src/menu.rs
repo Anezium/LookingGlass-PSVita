@@ -262,6 +262,8 @@ pub struct Menu {
     /// Save-screen page, 0-based; stays 0 without `save_pages`.
     save_page: usize,
     delete_opened: f64,
+    #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+    probe: save_screen::Probe,
     controls_pad: bool,
     controls_page: usize,
     using_pad: bool,
@@ -425,6 +427,8 @@ impl Menu {
             save_keys,
             save_page: 0,
             delete_opened: 0.,
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            probe: Default::default(),
             controls_pad: false,
             controls_page: 0,
             using_pad: false,
@@ -1652,6 +1656,8 @@ impl Menu {
             let buttons = self.buttons(page);
             self.selected = self.selected.min(buttons.len().saturating_sub(1));
             self.draw(page, &buttons);
+            #[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+            self.probe_menu(page);
             if focused {
                 self.ui.cursor();
             }

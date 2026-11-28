@@ -352,6 +352,56 @@ impl Menu {
     }
 }
 
+/// Host proof only: `LOOKING_GLASS_MENU_SHOTS=<dir>` prints every menu state change and saves one
+/// PNG per page state once its shutters have settled.
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+#[derive(Default)]
+pub(super) struct Probe {
+    state: String,
+    since: f64,
+    shot: bool,
+    shots: u32,
+    line: String,
+}
+#[cfg(all(feature = "sim_maps_probe", not(target_os = "vita")))]
+impl Menu {
+    pub(super) fn probe_menu(&mut self, page: Page) {
+        let Some(dir) = std::env::var_os("LOOKING_GLASS_MENU_SHOTS") else {
+            return;
+        };
+        let now = get_time();
+        let state = format!("{page:?}-page{}", self.save_page + 1);
+        let line = format!(
+            "MENU_STATE state={state} selected={} save_selected={} message={:?}",
+            self.selected, self.save_selected, self.message
+        );
+        if line != self.probe.line {
+            println!("{line}");
+            self.probe.line = line;
+        }
+        if state != self.probe.state {
+            self.probe.state = state;
+            self.probe.since = now;
+            self.probe.shot = false;
+        }
+        if !self.probe.shot && now - self.probe.since >= 0.8 {
+            self.probe.shot = true;
+            self.probe.shots += 1;
+            let name: String = self
+                .probe
+                .state
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+                .collect();
+            let path = std::path::Path::new(&dir).join(format!("{:02}-{name}.png", self.probe.shots));
+            match crate::viewer::save_capture(&path) {
+                Ok(()) => println!("MENU_SHOT {}", path.display()),
+                Err(e) => println!("MENU_SHOT failed {e:#}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
