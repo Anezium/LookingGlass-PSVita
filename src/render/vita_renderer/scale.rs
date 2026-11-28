@@ -293,6 +293,7 @@ varying mediump vec2 uv; uniform sampler2D Texture;
 void main(){gl_FragColor=vec4(texture2D(Texture,vec2(uv.x,1.-uv.y)).rgb,1.);}"#;
 
 const GAMMA_FRAGMENT: &str = r#"#version 100
+precision mediump float;
 varying mediump vec2 uv;
 uniform sampler2D Texture;
 uniform mediump float Gamma;
