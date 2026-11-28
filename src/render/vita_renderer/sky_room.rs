@@ -88,6 +88,9 @@ struct Set {
     buffers: Vec<(BufferId, BufferId)>,
     stream: Option<Stream>,
     clips: Vec<Clip>,
+    /// `autosprite_live`: the set's re-faced sprite quads, riding the same stream as the
+    /// vertex-animated props.
+    sprite_quads: Vec<sprite_stream::Quad>,
     opaque: Vec<Batch>,
     alpha: Vec<Batch>,
     layers: Vec<Layer>,
@@ -356,6 +359,7 @@ impl SkyRoom {
         let mut pipelines: BTreeMap<(Program, usize, usize, bool), Pipeline> = BTreeMap::new();
         let mut sets = Vec::new();
         let (mut vertices, mut triangles, mut animated, mut sprites, mut gpu_bytes) = (0, 0, 0, 0, 0);
+        let mut sprites_streamed = 0;
         // Host experiment: take every static model and every batch that cannot be culled, as the
         // legacy pass does when it skips their PVS test, instead of only those the camera can see.
         #[cfg(not(target_os = "vita"))]
@@ -367,7 +371,7 @@ impl SkyRoom {
             let mut packing = Packing::default();
             let mut moving = (Vec::new(), Vec::new());
             let mut set = Set { origin, cluster, buffers: Vec::new(), stream: None, clips: Vec::new(),
-                opaque: Vec::new(), alpha: Vec::new(), layers: Vec::new(), logged: false };
+                sprite_quads: Vec::new(), opaque: Vec::new(), alpha: Vec::new(), layers: Vec::new(), logged: false };
             let room = scene.batches.iter().filter(|b| !b.sky && b.model.is_none()).map(|b| (b, false));
             for (b, prop) in room.chain(scene.sky_props.iter().map(|b| (b, true))) {
                 let whole = b.deforms.iter().any(Deform::moves_vertices) || b.motion.is_some();
@@ -376,6 +380,16 @@ impl SkyRoom {
                     selection(&parts, b.full_indices.len(), whole, mask.as_deref(),
                         b.parts.is_empty() && scene.map.visibility.bounds(cluster, b.bounds.0, b.bounds.1))
                 };
+                // `autosprite_live`: a sprite batch the stream can re-face exactly. The
+                // rewrite poses the corners to world, faces them to the camera, and poses
+                // them back, so a scripted motion or model matrix - which the shader would
+                // apply after the billboard - and vertex animation keep their own paths.
+                let sprite_locked = c.autosprite_live.then(|| {
+                    b.deforms.iter().find_map(|d| if let Deform::Sprite(lock) = d { Some(*lock) } else { None })
+                }).flatten().filter(|_| {
+                    b.animation.is_none() && b.motion.is_none() && b.model.is_none()
+                        && !b.deforms.iter().any(|d| matches!(d, Deform::Wave(..) | Deform::Move(..) | Deform::Bulge(..)))
+                });
                 // A vertex-animated batch goes to the set's stream; its bounds cover every frame.
                 let (slot, base_element, indices, min, max) = if let Some(animation) = &b.animation {
                     let first = moving.0.len();
@@ -385,6 +399,15 @@ impl SkyRoom {
                         transform: animation.transform, scale: animation.scale } });
                     animated += 1;
                     (STREAM, base_element, indices, b.bounds.0, b.bounds.1)
+                } else if let Some(locked) = sprite_locked {
+                    // A re-faced sprite rides the same stream; its bounds cover every facing.
+                    let first = moving.0.len();
+                    let Some((base_element, indices, _, _, source)) = pack(&mut moving, b, &ranges) else { continue };
+                    let quads = sprite_stream::quads_of_batch(b, locked, first, &source);
+                    let (min, max) = sprite_stream::covering_bounds(&quads, b.bounds);
+                    set.sprite_quads.extend(quads);
+                    sprites_streamed += 1;
+                    (STREAM, base_element, indices, min, max)
                 } else {
                     let Some(packed) = packing.append(b, &ranges) else { continue };
                     packed
@@ -441,6 +464,9 @@ impl SkyRoom {
             println!("[lg/sky-live] set={} origin={:?} cluster={:?} opaque_batches={} alpha_batches={} layers={} buffers={} animated_props={} stream_vertices={}",
                 sets.len(), origin.to_array(), cluster, set.opaque.len(), set.alpha.len(), set.layers.len(), set.buffers.len(),
                 set.clips.len(), set.stream.as_ref().map_or(0, |s| s.template.len()));
+            if c.autosprite_live {
+                println!("[lg/sky-live] set={} autosprite_quads={}", sets.len(), set.sprite_quads.len());
+            }
             sets.push(set);
         }
         // Sky shader faces: one batch per shader, every stage, in the legacy stage order.
@@ -523,6 +549,10 @@ impl SkyRoom {
         println!("[lg/sky-live] map_props={} sets={} vertices={vertices} layer_triangles={triangles} gpu_bytes={gpu_bytes} pipelines={} animated_props={animated} frozen_sprites={sprites} face_shaders={} alpha={} scale={} copy_program={} lite_program={}",
             scene.sky_props.len(), sets.len(), pipelines.len(), faces.as_ref().map_or(0, |f| f.batches.len()),
             c.sky_live_alpha, c.sky_live_scale, copy.is_some(), lite.is_some());
+        if c.autosprite_live {
+            let quads: usize = sets.iter().map(|s| s.sprite_quads.len()).sum();
+            println!("[lg/sky-live] autosprite_live streamed_batches={sprites_streamed} quads={quads} frozen={}", sprites - sprites_streamed);
+        }
         Some(Self { sets, faces, pipelines, copy, lite, atlas: scene.atlas.raw_miniquad_id(), current: None })
     }
     pub(super) fn delete(&mut self, ctx: &mut dyn RenderingBackend) {
@@ -616,6 +646,18 @@ impl Renderer {
                 for clip in &set.clips {
                     for (k, &source) in clip.source.iter().enumerate() {
                         stream.template[clip.first + k].position = clip.frames.position(source as usize, time).to_array();
+                    }
+                }
+                // `autosprite_live`: this frame's facings, posed to world, faced to the
+                // camera, posed back, as the desktop portal transform did before its billboard.
+                if !set.sprite_quads.is_empty() {
+                    let inverse = pose.inverse();
+                    for quad in &set.sprite_quads {
+                        let uvs = quad.ids.map(|id| Vec2::from_array(stream.template[id as usize].uv));
+                        for (id, position) in quad.ids.iter().zip(
+                            sprite_stream::reface_through(quad, &uvs, eye, pose, inverse)) {
+                            stream.template[*id as usize].position = position.to_array();
+                        }
                     }
                 }
                 ctx.buffer_update(stream.vertex, BufferSource::slice(&stream.template));

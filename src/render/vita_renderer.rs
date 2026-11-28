@@ -16,6 +16,7 @@ mod draw_cuts;
 mod alpha_fill;
 mod sky_surfaces;
 mod sky_room;
+mod sprite_stream;
 mod water_join;
 mod water_probe;
 #[cfg(not(target_os = "vita"))]
@@ -391,6 +392,15 @@ pub struct Config {
     /// gain, and the same with the alpha test) instead of the world program. The sky is fullbright
     /// and unfogged, so they compute what the world program computes there. Default on.
     pub sky_live_lite: bool,
+    /// Draw autosprite and autosprite2 world and sky-room surfaces facing the camera, as the
+    /// desktop renderer does every frame, instead of their load-time facing (the hatter1 torch
+    /// collapses to a sliver, the jlair2 flames hang at their authored angle). Their groups keep
+    /// the same (parameter, rank, cell) split - draw count unchanged - but the geometry moves
+    /// from the immutable world buffers into one small stream rewritten each frame with the
+    /// desktop billboard math. A picture change (owner approval 2026-11-28). Batches whose
+    /// deforms also move vertices, or that ride a model matrix, scripted motion or vertex
+    /// animation, stay frozen and are counted at load. Default off.
+    pub autosprite_live: bool,
     pub cell_size: f32,
     /// Compare grouped actor/world alpha to the milestone-2 bridge.
     pub alpha_interop: bool,
@@ -779,6 +789,7 @@ impl Default for Config {
             sky_live_alpha: true,
             sky_live_scale: 1.,
             sky_live_lite: true,
+            autosprite_live: false,
             cell_size: 256.,
             alpha_interop: true,
             actor_max_layers: 2,
@@ -1382,6 +1393,10 @@ impl Geometry {
             self.indices.push(id);
         }
     }
+    /// The packed vertex id of `batch`'s source vertex, if this geometry holds it.
+    fn packed(&self, batch: usize, source: u16) -> Option<u16> {
+        self.remap.get(&(batch, source)).copied()
+    }
 }
 #[derive(Clone)]
 struct Recipe {
@@ -1407,6 +1422,9 @@ struct Pending {
     origin: Vec<(u32, u32)>,
     /// The part's shader carries a liquid contents bit, as `diag_skip_water` tests it.
     liquid: bool,
+    /// `autosprite_live`: this pending holds re-faced sprite quads, packed into the map's
+    /// sprite stream instead of the immutable buffers.
+    sprite: Option<sprite_stream::PendingSprites>,
 }
 struct Group {
     base_element: i32,
@@ -1574,6 +1592,8 @@ pub struct Renderer {
     field_uniforms: [super::uniform_fields::Cache; 3],
     pvs: Pvs,
     water_join: Option<water_join::State>,
+    /// `autosprite_live`: the map's world autosprite stream, source of its groups' vertices.
+    sprites: Option<sprite_stream::SpriteStream>,
     pipelines: Vec<Pipeline>,
     shader: ShaderId,
     low_shader:Option<ShaderId>,
@@ -1737,6 +1757,7 @@ impl Renderer {
         let mut exact_blends: Vec<Blend> = Vec::new();
         let mut frozen_deforms = 0;
         let mut frozen_models = 0;
+        let (mut autosprite_streamed, mut autosprite_frozen) = (0, 0);
         let (mut wave_normal_layers, mut wave_normal_triangles, mut wave_normal_skipped) = (0, 0, 0);
         for bi in 0..scene.batches.len() {
             let b = &scene.batches[bi];
@@ -1751,6 +1772,20 @@ impl Renderer {
                 .filter(|d| matches!(d, Deform::Sprite(_) | Deform::WaveNormal(..)))
                 .count()
                 + b.deforms.len().saturating_sub(1);
+            // `autosprite_live`: a batch this stream can re-face exactly. The billboard runs
+            // on the authored corners, so anything that moves vertices on the CPU or rides a
+            // matrix would compose differently (the shader would move the billboarded
+            // positions; the desktop moves before the billboard): those stay frozen.
+            let sprite_locked = c.autosprite_live.then(|| {
+                b.deforms.iter().find_map(|d| if let Deform::Sprite(lock) = d { Some(*lock) } else { None })
+            }).flatten().filter(|_| {
+                b.animation.is_none() && b.motion.is_none() && b.model.is_none()
+                    && !b.deforms.iter().any(|d| matches!(d, Deform::Wave(..) | Deform::Move(..) | Deform::Bulge(..)))
+            });
+            let sprite = sprite_locked.is_some();
+            if c.autosprite_live && b.deforms.iter().any(|d| matches!(d, Deform::Sprite(_))) {
+                if sprite { autosprite_streamed += 1; } else { autosprite_frozen += 1; }
+            }
             let batch_liquid = b.parts.iter().any(|part| {
                 scene.map.shaders[scene.map.surfaces[part.face].shader].contents & crate::collision::LIQUID_MASK != 0
             });
@@ -1867,11 +1902,19 @@ impl Renderer {
                                     recipe: recipe.clone(),
                                     origin: Vec::new(),
                                     liquid,
+                                    sprite: sprite.then(sprite_stream::PendingSprites::default),
                                 });
                                 candidates.push(id);
                                 id
                             });
-                        pending[id].geometry.append(bi, b, source, face);
+                        {
+                            let p = &mut pending[id];
+                            p.geometry.append(bi, b, source, face);
+                            if let Some(sprites) = &mut p.sprite {
+                                sprite_stream::record_part(&mut sprites.quads, &p.geometry,
+                                    bi, b, source, sprite_locked.unwrap_or(false));
+                            }
+                        }
                         touched.push(id);
                         if c.water_stage_merge != "off" { pending[id].origin.push((bi as u32, chunk)); }
                         chunk += 1;
@@ -2068,20 +2111,45 @@ impl Renderer {
         let fog_bounds = if fog_free.is_some() && volume_slots > 0 {
             pending.iter().map(|p| low_fog::bounds(&p.recipe, &p.geometry)).collect()
         } else { Vec::new() };
-        let (packed, allocations) = world_list::pack(pending.iter_mut().map(|p| {
+        // `autosprite_live`: sprite pendings pack into the map's one sprite stream instead
+        // of the immutable buffers; every other pending packs exactly as before. Group
+        // ids and order stay those of the pending flow, so PVS lists and the sort
+        // orders that break ties by id are unchanged.
+        let is_sprite: Vec<bool> = pending.iter().map(|p| p.sprite.is_some()).collect();
+        let pack_ids: Vec<usize> = (0..pending.len()).filter(|&i| !is_sprite[i]).collect();
+        let (packed, packed_allocations) = world_list::pack(pack_ids.iter().map(|&i| {
+            let p = &mut pending[i];
             let key = (c.world_static_merge && submit::static_opaque(&p.recipe)).then_some((p.parameter,p.recipe.rank));
             (key, &mut p.geometry.vertices, &mut p.geometry.indices)
-        }), c.world_shared_buffers);
+        }).collect::<Vec<_>>().into_iter(), c.world_shared_buffers);
+        let (sprites, sprite_allocations) = sprite_stream::build(ctx, &mut resources, &mut pending)?;
+        let mut allocations = vec![(usize::MAX, 0, 0); pending.len()];
+        let mut sprite_bounds = vec![(Vec3::ZERO, Vec3::ZERO); pending.len()];
+        for (n, &id) in pack_ids.iter().enumerate() { allocations[id] = packed_allocations[n]; }
+        for (id, allocated) in sprite_allocations.iter().enumerate() {
+            if let Some((base, count, min, max)) = allocated {
+                allocations[id] = (usize::MAX, *base, *count);
+                sprite_bounds[id] = (*min, *max);
+            }
+        }
         // Host proof: each draw's range in its shared buffer resolves to the bytes its group had.
         #[cfg(all(feature="sim_maps_probe",not(target_os="vita")))]
         if crate::sim_maps::probe::world_packets_active() && !world_list::negative("world-pack-wrong-vertex-offset") {
             use sha2::{Digest, Sha256};
             for (group,&(slot,base,count)) in allocations.iter().enumerate() {
-                let (_,v,i)=&packed[slot];
                 let mut h = Sha256::new();
-                for &index in &i[base as usize..(base+count) as usize] {
-                    let vertex = &v[index as usize];
-                    h.update(unsafe { std::slice::from_raw_parts((vertex as *const WorldVertex).cast::<u8>(), std::mem::size_of::<WorldVertex>()) });
+                if slot == usize::MAX {
+                    let sprites = sprites.as_ref().expect("a sprite group without its stream");
+                    for &index in &sprites.indices[base as usize..(base+count) as usize] {
+                        let vertex = &sprites.template[index as usize];
+                        h.update(unsafe { std::slice::from_raw_parts((vertex as *const WorldVertex).cast::<u8>(), std::mem::size_of::<WorldVertex>()) });
+                    }
+                } else {
+                    let (_,v,i)=&packed[slot];
+                    for &index in &i[base as usize..(base+count) as usize] {
+                        let vertex = &v[index as usize];
+                        h.update(unsafe { std::slice::from_raw_parts((vertex as *const WorldVertex).cast::<u8>(), std::mem::size_of::<WorldVertex>()) });
+                    }
                 }
                 assert_eq!(format!("{:x}", h.finalize()), crate::sim_maps::probe::world_geometry_hash(group), "group {group} resolves to other bytes in its buffer");
             }
@@ -2090,7 +2158,7 @@ impl Renderer {
         crate::sim_maps::probe::world_ranges(allocations.iter().map(|&(_,base,count)|(base,count)).collect());
         let water_indices: Vec<Option<Vec<u16>>> = if c.water_draw_join {
             pending.iter().zip(&allocations).map(|(p, &(slot, base, count))| {
-                (p.liquid && !p.recipe.opaque).then(|| {
+                (p.liquid && !p.recipe.opaque && slot != usize::MAX).then(|| {
                     let (_, _, indices) = &packed[slot];
                     indices[base as usize..(base + count) as usize].to_vec()
                 })
@@ -2110,6 +2178,7 @@ impl Renderer {
             }
         } else { None };
         let packing_capacity_bytes: usize = packed.iter().map(|(_,v,i)|v.capacity()*52+i.capacity()*2).sum();
+        if let Some(sprites) = &sprites { uploaded_geometry_bytes += sprites.bytes(); }
         let buffers = packed.into_iter().map(|(_,v,i)| {
             let vertex = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&v));
             let index = ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(&i));
@@ -2119,10 +2188,20 @@ impl Renderer {
         }).collect::<Vec<_>>();
         construction_geometry_peak_bytes = construction_geometry_peak_bytes.max(
             old_scene_geometry_capacity_bytes + pending_geometry_capacity_bytes + packing_capacity_bytes + uploaded_geometry_bytes);
+        let sprite_buffers = sprites.as_ref().map(|s| s.buffers());
         let mut groups = Vec::new();
-        for (((p, texture), (slot, base_element, indices)), material_key) in pending.into_iter().zip(first_textures).zip(allocations).zip(material_keys_by_group) {
+        for ((((p, texture), (slot, base_element, indices)), material_key), id) in pending.into_iter().zip(first_textures).zip(allocations).zip(material_keys_by_group).enumerate() {
             let extent = deform_extent(&p.recipe.deform);
-            let (vertex,index) = buffers[slot];
+            let (vertex,index) = if slot == usize::MAX {
+                sprite_buffers.expect("a sprite group without its stream")
+            } else { buffers[slot] };
+            // A sprite group's quads turn to the camera each frame: bounds that cover
+            // every facing, in place of the authored box the static path keeps.
+            let (min, max) = if slot == usize::MAX {
+                sprite_bounds[id]
+            } else {
+                (p.geometry.min - extent, p.geometry.max + extent)
+            };
             groups.push(Group {
                 base_element, material_order: material_order[&material_key],
                 parameter: p.parameter,
@@ -2132,13 +2211,20 @@ impl Renderer {
                     images: vec![texture, atlas],
                 },
                 indices,
-                min: p.geometry.min - extent,
-                max: p.geometry.max + extent,
-                center: (p.geometry.min + p.geometry.max) * 0.5,
+                min,
+                max,
+                center: (min + max) * 0.5,
                 recipe: p.recipe,
                 faces: p.geometry.faces,
                 liquid: p.liquid,
             });
+        }
+        if c.autosprite_live {
+            let sprite_groups = sprite_allocations.iter().filter(|a| a.is_some()).count();
+            println!("[lg/vita-renderer] autosprite_live streamed_batches={autosprite_streamed} frozen_batches={autosprite_frozen} groups={sprite_groups} quads={} vertices={} stream_bytes={}",
+                sprites.as_ref().map_or(0, |s| s.quads()),
+                sprites.as_ref().map_or(0, |s| s.vertices()),
+                sprites.as_ref().map_or(0, |s| s.bytes()));
         }
         crate::frame_profile::shader_creation();
         let shader_timing = crate::startup::WorkTimer::new(crate::startup::Work::ShaderCreation);
@@ -2287,6 +2373,7 @@ impl Renderer {
             groups,
             pvs,
             water_join,
+            sprites,
             pipelines,
             shader, low_shader, low_pipelines, fog_free, fog_bounds,
             sky_pipeline,
@@ -2705,6 +2792,18 @@ impl Renderer {
             count("vita_world_parameter_reuses", self.alpha_order.len() as u64 - builds);
         }
         water_probe::add(|f| &mut f.parameter_time, probe_parameters);
+        // `autosprite_live`: re-face the sprite quads and upload the stream once per frame;
+        // the alpha pass of the same frame reuses the upload (and, when the FX pipeline
+        // holds the alpha draws, that upload is what its later submission reads).
+        if let Some(sprites) = self.sprites.as_mut() {
+            let started = MetricInstant::now();
+            let bytes = {
+                let gl = unsafe { get_internal_gl() };
+                sprites.rewrite(gl.quad_context, eye, time)
+            };
+            count("vita_world_autosprite_rewrite_ns", started.elapsed().as_nanos() as u64);
+            if bytes > 0 { count("vita_world_autosprite_upload_bytes", bytes as u64); }
+        }
         // Uniform values are program storage. These programs are private to
         // this Renderer; sky, FX and HUD use other programs. Alpha uses this same
         // cache, including interleaved callbacks, so every write stays observed.
@@ -3484,6 +3583,7 @@ impl Drop for Renderer {
             ctx.delete_buffer(vertex); ctx.delete_buffer(index);
         }
         if let Some(join) = self.water_join.take() { ctx.delete_buffer(join.buffer); }
+        if let Some(sprites) = &mut self.sprites { sprites.delete(ctx); }
         for p in &self.pipelines {
             ctx.delete_pipeline(*p);
         }
@@ -4535,7 +4635,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "autosprite_live" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);

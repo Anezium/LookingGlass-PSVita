@@ -851,20 +851,34 @@ impl Batch {
 }
 // Autosprite2 turns around the quad's long axis, preserving its two edge
 // midpoints. UVs may be offset/tiled/animated and must never drive geometry.
+// The positions math is shared with the retained renderer's `autosprite_live`
+// stream, so the two paths cannot drift apart.
 fn axial_billboard(quad: &mut [Vertex], camera: Vec3) {
-    let first = if quad[0].position.distance_squared(quad[1].position)
-        <= quad[1].position.distance_squared(quad[2].position)
+    let corners = [
+        quad[0].position,
+        quad[1].position,
+        quad[2].position,
+        quad[3].position,
+    ];
+    for (v, position) in quad.iter_mut().zip(axial_positions(&corners, camera)) {
+        v.position = position;
+    }
+}
+/// Autosprite2 in authored corner order. A degenerate axis leaves the quad as it is.
+pub(crate) fn axial_positions(corners: &[Vec3; 4], camera: Vec3) -> [Vec3; 4] {
+    let first = if corners[0].distance_squared(corners[1])
+        <= corners[1].distance_squared(corners[2])
     {
         0
     } else {
         1
     };
     let ids = [first, (first + 1) % 4, (first + 2) % 4, (first + 3) % 4];
-    let [a, b, c, d] = ids.map(|i| quad[i].position);
+    let [a, b, c, d] = ids.map(|i| corners[i]);
     let lower = (a + b) * 0.5;
     let upper = (c + d) * 0.5;
     let Some(axis) = (upper - lower).try_normalize() else {
-        return;
+        return *corners;
     };
     let authored_right = (b - a).normalize_or_zero();
     let mut right = axis
@@ -880,14 +894,33 @@ fn axial_billboard(quad: &mut [Vertex], camera: Vec3) {
     }
     let low_radius = a.distance(b) * 0.5;
     let high_radius = c.distance(d) * 0.5;
+    let mut out = *corners;
     for (i, position) in ids.into_iter().zip([
         lower - right * low_radius,
         lower + right * low_radius,
         upper + right * high_radius,
         upper - right * high_radius,
     ]) {
-        quad[i].position = position;
+        out[i] = position;
     }
+    out
+}
+/// The free autosprite: the quad turns to face the camera, its new corners placed by UV
+/// from the center the authored corners define. Also shared with `autosprite_live`; UVs
+/// may be offset or tiled and never drove geometry.
+pub(crate) fn facing_positions(corners: &[Vec3; 4], uvs: &[Vec2; 4], camera: Vec3) -> [Vec3; 4] {
+    let center = corners.iter().map(|&p| p).sum::<Vec3>() / 4.;
+    let direction = (camera - center).normalize_or_zero();
+    let right = Vec3::Z.cross(direction).try_normalize().unwrap_or(Vec3::X);
+    let up = direction.cross(right).normalize_or_zero();
+    let radius = corners[0].distance(center) * 0.70710677;
+    let mut out = [Vec3::ZERO; 4];
+    for (position, uv) in out.iter_mut().zip(uvs) {
+        *position = center
+            + right * ((uv.x - 0.5) * 2. * radius)
+            + up * ((0.5 - uv.y) * 2. * radius);
+    }
+    out
 }
 
 // The production callbacks use the current projection. Tests supply the same
@@ -1139,15 +1172,15 @@ fn draw_batch(
                 axial_billboard(quad, camera);
                 continue;
             }
-            let center = quad.iter().map(|v| v.position).sum::<Vec3>() / 4.;
-            let direction = (camera - center).normalize_or_zero();
-            let right = Vec3::Z.cross(direction).try_normalize().unwrap_or(Vec3::X);
-            let up = direction.cross(right).normalize_or_zero();
-            let radius = quad[0].position.distance(center) * 0.70710677;
-            for v in quad {
-                v.position = center
-                    + right * ((v.uv.x - 0.5) * 2. * radius)
-                    + up * ((0.5 - v.uv.y) * 2. * radius);
+            let corners = [
+                quad[0].position,
+                quad[1].position,
+                quad[2].position,
+                quad[3].position,
+            ];
+            let uvs = [quad[0].uv, quad[1].uv, quad[2].uv, quad[3].uv];
+            for (v, position) in quad.iter_mut().zip(facing_positions(&corners, &uvs, camera)) {
+                v.position = position;
             }
         }
     }
