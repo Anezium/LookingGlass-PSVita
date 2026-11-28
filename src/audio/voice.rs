@@ -52,6 +52,12 @@ const WAV_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "vita_renderer")]
 fn decode(bytes: Vec<u8>, reserve: impl FnOnce(usize) -> bool) -> Option<Pcm> {
+    decode_with(bytes, reserve, super::block::settings().wav_direct)
+}
+
+/// `direct` fills the same samples from an 8/16-bit integer PCM WAV without the rodio iterator.
+#[cfg(feature = "vita_renderer")]
+pub(super) fn decode_with(bytes: Vec<u8>, reserve: impl FnOnce(usize) -> bool, direct: bool) -> Option<Pcm> {
     let header = hound::WavReader::new(Cursor::new(bytes.as_slice())).ok()?;
     let spec = header.spec();
     if spec.channels == 0
@@ -68,6 +74,24 @@ fn decode(bytes: Vec<u8>, reserve: impl FnOnce(usize) -> bool) -> Option<Pcm> {
     if size == 0 || size > PCM_BYTES {
         return None;
     }
+    if let Some(wav) = direct.then(|| super::wav::parse(&bytes)).flatten() {
+        // rodio's WAV source duration, from the same header fields.
+        let duration = Duration::from_micros(
+            (1_000_000 * count as u64) / (spec.sample_rate as u64 * spec.channels as u64),
+        );
+        if !reserve(size) {
+            return None;
+        }
+        let mut samples = Vec::with_capacity(count);
+        samples.extend(wav.samples());
+        return Some(Pcm {
+            samples: Arc::new(samples),
+            index: 0,
+            channels: spec.channels,
+            rate: spec.sample_rate,
+            duration,
+        });
+    }
     let decoder = rodio::Decoder::new_wav(Cursor::new(bytes)).ok()?;
     let duration = decoder.total_duration()?;
     if !reserve(size) {
@@ -81,6 +105,14 @@ fn decode(bytes: Vec<u8>, reserve: impl FnOnce(usize) -> bool) -> Option<Pcm> {
         channels: spec.channels,
         rate: spec.sample_rate,
         duration,
+    })
+}
+
+/// Samples, channels, rate, duration and reserved capacity of a decode, for exactness tests.
+#[cfg(all(test, feature = "vita_renderer"))]
+pub(super) fn decoded(bytes: Vec<u8>, direct: bool) -> Option<(Vec<i16>, u16, u32, Duration, usize)> {
+    decode_with(bytes, |_| true, direct).map(|p| {
+        (p.samples.to_vec(), p.channels, p.rate, p.duration, p.samples.capacity())
     })
 }
 

@@ -519,6 +519,10 @@ pub struct Config {
     /// Decode Alice's measured global player cues once into a resident cache
     /// that survives map loads.
     pub audio_player_prefetch: bool,
+    /// Read 8/16-bit integer PCM WAVs straight into the decoded sample buffers instead of
+    /// through rodio's per-sample iterator. Same samples bit for bit; other files keep the
+    /// rodio path. Off by default.
+    pub wav_direct_decode: bool,
     pub audio_block_mix: bool,
     pub audio_preresample: bool,
     pub audio_block_parameters: bool,
@@ -810,6 +814,7 @@ impl Default for Config {
             audio_voice_prefetch: false,
             audio_named_prefetch: false,
             audio_player_prefetch: false,
+            wav_direct_decode: false,
             audio_block_mix: false,
             audio_preresample: false,
             audio_block_parameters: false,
@@ -4453,6 +4458,14 @@ mod tests {
         assert!(serde_json::from_str::<Config>(r#"{"audio_named_prefetch":"true"}"#).is_err());
     }
     #[test]
+    fn wav_direct_decode_is_opt_in() {
+        for json in ["{}", r#"{"wav_direct_decode":false}"#] {
+            assert!(!serde_json::from_str::<Config>(json).unwrap().wav_direct_decode);
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"wav_direct_decode":true}"#).unwrap().wav_direct_decode);
+        assert!(serde_json::from_str::<Config>(r#"{"wav_direct_decode":1}"#).is_err());
+    }
+    #[test]
     fn audio_player_prefetch_is_opt_in() {
         for json in ["{}", r#"{"audio_player_prefetch":false}"#] {
             assert!(!serde_json::from_str::<Config>(json).unwrap().audio_player_prefetch);
@@ -4535,7 +4548,7 @@ mod tests {
     /// Keys added after every frozen era file. Those files stay valid unchanged; an
     /// omitted opt-in reads as an explicit off, and `audio_stats_log` keeps its
     /// default-on release behaviour until a config turns it off.
-    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache") }
+    fn later_opt_in_key(k: &str) -> bool { matches!(k, "shader_cache_namespace" | "water_draw_join" | "alpha_model_pvs" | "fx_unlit_exact" | "sim_snark_move_skip" | "sim_snark_sight_blocked" | "sim_pool_name_match" | "audio_stats_log" | "audio_loop_resident" | "audio_cue_prefetch" | "audio_level_cues_extra" | "audio_voice_prefetch" | "audio_named_prefetch" | "audio_player_prefetch" | "capture_frames" | "capture_tag" | "sky_live" | "sky_live_alpha" | "sky_live_scale" | "sky_live_lite" | "actor_lean_shader" | "actor_zero_glow" | "actor_glow_subset" | "actor_light_cull" | "actor_lean_lights" | "low_fog_skip" | "low_fog_cheaper" | "low_fog_per_vertex" | "mover_shape_reuse" | "phase_census_window" | "finale_checkpoint_background" | "eager_level_gpu" | "nav_sweep_cache" | "wav_direct_decode") }
     #[test]
     fn gpu_skin_keys_are_explicitly_default_off_and_strict_booleans() {
         let c=Config::default();assert!(!c.gpu_skin_ants && !c.gpu_skin_actors && !c.gpu_skin_capture);

@@ -17,6 +17,7 @@ mod reaction;
 pub mod regression;
 pub mod world;
 pub(crate) mod voice;
+mod wav;
 use crate::{assets::Assets, bsp::Bsp, collision::{AcousticView, StaticGeometry, Trace, World}};
 use anyhow::{ensure, Context, Result};
 use macroquad::prelude::{vec3, Vec3};
@@ -1348,7 +1349,30 @@ fn looping_clip(
     Some(clip)
 }
 fn decode_clip(data: Vec<u8>) -> Result<Clip> {
+    decode_clip_with(data, block::settings().wav_direct)
+}
+/// `direct` reads 8/16-bit integer PCM WAVs without the per-sample rodio iterator. It only
+/// takes files the rodio path decodes successfully, and yields the same samples bit for bit.
+fn decode_clip_with(data: Vec<u8>, direct: bool) -> Result<Clip> {
     let _r13_memory = crate::allocation_census::Scope::new(7);
+    let fast = direct.then(|| wav::parse(&data)).flatten().filter(|w| {
+        (1..=2).contains(&w.channels) && (8000..=96000).contains(&w.rate)
+            && w.len() != 0 && w.len() <= MAX_PCM
+    }).map(|w| (w.mono(), w.rate));
+    let (mono, rate) = match fast {
+        Some(clip) => clip,
+        None => rodio_mono(data)?,
+    };
+    // Integer-ratio clips stay at their native rate in the level cache; the block
+    // effect interpolates them on the fly with the same arithmetic as below.
+    let (mono, rate) = if block::settings().preresample && block::step(rate).is_none() {
+        let n = ((mono.len() as u64 * 44100 / rate as u64) as usize).max(1);
+        ensure!(n <= MAX_PCM, "Resampled sound too large");
+        (resample_linear(&mono, rate), 44100)
+    } else {(mono,rate)};
+    Ok(Clip { samples: mono.into(), rate })
+}
+fn rodio_mono(data: Vec<u8>) -> Result<(Vec<f32>, u32)> {
     let decoder = Decoder::new(Cursor::new(data))?;
     let channels = decoder.channels() as usize;
     let rate = decoder.sample_rate();
@@ -1372,14 +1396,7 @@ fn decode_clip(data: Vec<u8>) -> Result<Clip> {
         .chunks_exact(channels)
         .map(|s| s.iter().sum::<f32>() / channels as f32)
         .collect::<Vec<_>>();
-    // Integer-ratio clips stay at their native rate in the level cache; the block
-    // effect interpolates them on the fly with the same arithmetic as below.
-    let (mono, rate) = if block::settings().preresample && block::step(rate).is_none() {
-        let n = ((mono.len() as u64 * 44100 / rate as u64) as usize).max(1);
-        ensure!(n <= MAX_PCM, "Resampled sound too large");
-        (resample_linear(&mono, rate), 44100)
-    } else {(mono,rate)};
-    Ok(Clip { samples: mono.into(), rate })
+    Ok((mono, rate))
 }
 /// Character voices placed as map speakers (idle chatter such as the Queen's
 /// `q2_idle.wav`) are speech, never ambience the voice cap may cull.
@@ -3290,6 +3307,32 @@ mod tests {
         }
         println!("AUDIO_PRELOAD_SUMMARY maps={} limit_rejects={overflow}", maps.len());
         ensure!(overflow == 0, "level preload exceeded the audio cache");
+        Ok(())
+    }
+    /// Wall time of one level's audio load (default hedge3, LOOKING_GLASS_TEST_MAP), minimum and
+    /// median of seven loads, under the config named by LOOKING_GLASS_TEST_AUDIO_CONFIG. Run once
+    /// with `wav_direct_decode` off and once on to compare the decode share of the load.
+    #[test]
+    #[ignore = "requires LOOKING_GLASS_TEST_DATA and an idle timing host"]
+    fn level_load_time() -> Result<()> {
+        #[cfg(feature="native_timing")]
+        let _music_serial=output::native_music_test_guard();
+        let root = PathBuf::from(std::env::var("LOOKING_GLASS_TEST_DATA")?);
+        let name = std::env::var("LOOKING_GLASS_TEST_MAP").unwrap_or_else(|_| "hedge3".into());
+        let mut assets = Assets::open(&root)?;
+        let map = Bsp::parse(&assets.read(&format!("maps/{name}.bsp"))?)?;
+        let mut times = Vec::new();
+        for _ in 0..7 {
+            let mut audio = Audio::new(true, None);
+            let (mixer, _source) = output::mixer();
+            audio.playback = Some(Playback { _stream: None, mixer, _worker: None });
+            let started = std::time::Instant::now();
+            audio.load(&mut assets, &name, &map, false);
+            times.push(started.elapsed().as_secs_f64() * 1000.);
+        }
+        times.sort_by(f64::total_cmp);
+        println!("LEVEL_LOAD map={name} wav_direct={} min_ms={:.1} median_ms={:.1} max_ms={:.1}",
+            block::settings().wav_direct, times[0], times[3], times[6]);
         Ok(())
     }
     /// A reissued looping cue (the measured cards_loop1 pattern: 33 new loop
